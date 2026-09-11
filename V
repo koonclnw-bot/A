@@ -1,4 +1,4 @@
--- The Veil Hub v6.4.19 Menu Aim Up
+-- The Veil Hub v6.4.20 Native NPC Interaction
 -- Upload this entire file to your public GitHub "V" file.
 -- The short public GitHub loadstring remains unchanged.
 
@@ -284,6 +284,8 @@ local Config = {
     CELL_DAILY_REWARD_CLOSE_INTERVAL = 0.20,
 
     CELL_CRADLE_DIALOG_ATTEMPTS = 4,
+    CELL_CRADLE_NATIVE_SCAN_WAIT = 3.0,
+    CELL_CRADLE_NATIVE_RETRY_DELAY = 0.35,
     CELL_CRADLE_PREP_E_HOLD = 0.08,
     CELL_CRADLE_PREP_E_DELAY = 0.35,
     CELL_CRADLE_DIALOG_VISIBLE_WAIT = 5.00,
@@ -331,7 +333,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.4.19 Menu Aim Up",
+    HUB_VERSION = "v6.4.20 Native NPC Interaction",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -725,6 +727,10 @@ local State = {
         dailyRewardStatus = "Not checked",
         cradleTravelInput = "OFF",
         dialogStartSent = false,
+        npcInteractionFunctionFound = false,
+        npcInteractionCallOk = false,
+        npcInteractionMethod = "None",
+        npcInteractionSource = "None",
         dialogUiConfirmed = false,
         dialogReleaseVisible = false,
         dialogOptionSent = false,
@@ -16402,6 +16408,366 @@ function F.getCellRemotes()
     }
 end
 
+function F.getCellFunctionDebugName(fn)
+    if type(fn) ~= "function" then
+        return ""
+    end
+
+    local name = ""
+
+    pcall(function()
+        if debug
+            and type(debug.info) == "function"
+        then
+            name =
+                tostring(
+                    debug.info(
+                        fn,
+                        "n"
+                    )
+                    or ""
+                )
+        elseif debug
+            and type(debug.getinfo) == "function"
+        then
+            local info =
+                debug.getinfo(
+                    fn
+                )
+
+            name =
+                tostring(
+                    info
+                    and info.name
+                    or ""
+                )
+        end
+    end)
+
+    return name
+end
+
+function F.getCellFunctionDebugSource(fn)
+    if type(fn) ~= "function" then
+        return ""
+    end
+
+    local source = ""
+
+    pcall(function()
+        if debug
+            and type(debug.info) == "function"
+        then
+            source =
+                tostring(
+                    debug.info(
+                        fn,
+                        "s"
+                    )
+                    or ""
+                )
+        elseif debug
+            and type(debug.getinfo) == "function"
+        then
+            local info =
+                debug.getinfo(
+                    fn
+                )
+
+            source =
+                tostring(
+                    info
+                    and (
+                        info.source
+                        or info.short_src
+                    )
+                    or ""
+                )
+        end
+    end)
+
+    return source
+end
+
+function F.scoreTryStartNPCInteraction(fn, npcCradle)
+    if type(fn) ~= "function" then
+        return -1, "not a function"
+    end
+
+    local score = 0
+
+    local name =
+        string.lower(
+            F.getCellFunctionDebugName(
+                fn
+            )
+        )
+
+    local source =
+        string.lower(
+            F.getCellFunctionDebugSource(
+                fn
+            )
+        )
+
+    if name ==
+        "trystartnpcinteraction"
+    then
+        score = score + 12
+    elseif string.find(
+        name,
+        "npcinteraction",
+        1,
+        true
+    ) then
+        score = score + 4
+    end
+
+    if string.find(
+        source,
+        "npcinputhandler",
+        1,
+        true
+    ) then
+        score = score + 10
+    end
+
+    -- getfenv(script) gives another strong source check on many executors.
+    if type(getfenv) == "function" then
+        pcall(function()
+            local env =
+                getfenv(
+                    fn
+                )
+
+            local scriptObject =
+                env
+                and env.script
+
+            if scriptObject
+                and tostring(
+                    scriptObject.Name
+                ) == "NPCInputHandler"
+            then
+                score = score + 8
+            end
+        end)
+    end
+
+    -- Confirm constants from the Function Info supplied by the user when
+    -- the executor exposes getconstants.
+    if type(getconstants) == "function" then
+        pcall(function()
+            local constants =
+                getconstants(
+                    fn
+                )
+
+            local wanted = {
+                RegisterNPCInteraction = false,
+                DialogPart = false,
+                start = false,
+            }
+
+            for _, value in ipairs(
+                constants
+            ) do
+                if type(value) == "string"
+                    and wanted[value] ~= nil
+                then
+                    wanted[value] = true
+                end
+            end
+
+            if wanted.RegisterNPCInteraction then
+                score = score + 4
+            end
+
+            if wanted.DialogPart then
+                score = score + 2
+            end
+
+            if wanted.start then
+                score = score + 1
+            end
+        end)
+    end
+
+    -- The supplied trace showed workspace.NPCs["The Cradle"] among the
+    -- upvalues. Use that only as confirmation, never as a hard requirement.
+    if npcCradle
+        and type(getupvalues) == "function"
+    then
+        pcall(function()
+            local upvalues =
+                getupvalues(
+                    fn
+                )
+
+            for _, value in pairs(
+                upvalues
+            ) do
+                if value == npcCradle then
+                    score = score + 8
+                    break
+                end
+            end
+        end)
+    end
+
+    return
+        score,
+        (
+            F.getCellFunctionDebugName(fn)
+            .. " | "
+            .. F.getCellFunctionDebugSource(fn)
+        )
+end
+
+function F.findTryStartNPCInteraction(npcCradle)
+    if type(getgc) ~= "function" then
+        return nil, "getgc unavailable", -1
+    end
+
+    local ok,
+        objects =
+            pcall(
+                getgc,
+                true
+            )
+
+    if not ok
+        or type(objects) ~= "table"
+    then
+        return nil, "getgc scan failed", -1
+    end
+
+    local bestFn = nil
+    local bestDetail = "No candidate"
+    local bestScore = -1
+
+    for _, object in ipairs(
+        objects
+    ) do
+        if type(object) == "function" then
+            local score,
+                detail =
+                    F.scoreTryStartNPCInteraction(
+                        object,
+                        npcCradle
+                    )
+
+            if score > bestScore then
+                bestScore = score
+                bestFn = object
+                bestDetail = detail
+            end
+        end
+    end
+
+    -- Require strong evidence. Exact function name + source already scores
+    -- 22, while weak unrelated functions remain below this threshold.
+    if bestFn
+        and bestScore >= 18
+    then
+        return
+            bestFn,
+            bestDetail,
+            bestScore
+    end
+
+    return
+        nil,
+        bestDetail,
+        bestScore
+end
+
+function F.callNativeCradleInteraction(
+    token,
+    npcCradle
+)
+    if not F.isCellFarmActive(token) then
+        return false, "farm stopped"
+    end
+
+    local deadline =
+        os.clock()
+        + Config.CELL_CRADLE_NATIVE_SCAN_WAIT
+
+    local fn = nil
+    local detail = "Not found"
+    local score = -1
+
+    repeat
+        fn,
+        detail,
+        score =
+            F.findTryStartNPCInteraction(
+                npcCradle
+            )
+
+        if fn then
+            break
+        end
+
+        task.wait(
+            Config.CELL_CRADLE_NATIVE_RETRY_DELAY
+        )
+    until os.clock() >= deadline
+        or not F.isCellFarmActive(token)
+
+    State.cellFarm.npcInteractionFunctionFound =
+        fn ~= nil
+
+    State.cellFarm.npcInteractionSource =
+        tostring(detail)
+        .. " | score="
+        .. tostring(score)
+
+    if not fn then
+        State.cellFarm.npcInteractionCallOk =
+            false
+
+        State.cellFarm.npcInteractionMethod =
+            "Direct DialogEvent fallback"
+
+        return
+            false,
+            "tryStartNPCInteraction not found"
+    end
+
+    State.cellFarm.npcInteractionMethod =
+        "NPCInputHandler.tryStartNPCInteraction"
+
+    -- The user's captured Function Info reports these exact invocation
+    -- arguments. Extra arguments are harmless in Luau if this build ignores
+    -- some of them.
+    local ok,
+        result =
+            pcall(
+                fn,
+                "start",
+                npcCradle,
+                10
+            )
+
+    State.cellFarm.npcInteractionCallOk =
+        ok == true
+
+    if ok then
+        State.movementTelemetry.lastAction =
+            "Called native tryStartNPCInteraction"
+
+        return
+            true,
+            tostring(result)
+    end
+
+    return
+        false,
+        tostring(result)
+end
+
 function F.getCellCradleDialogueEvidence()
     local playerGui =
         LocalPlayer:FindFirstChildOfClass(
@@ -17409,8 +17775,8 @@ function F.summonCellBoss(token)
             false
 
         F.setCellFarmStage(
-            "DIALOG START SENT",
-            "Sending start and waiting for real Release UI "
+            "NATIVE NPC INTERACTION",
+            "Calling the game's tryStartNPCInteraction "
                 .. tostring(attempt)
                 .. "/"
                 .. tostring(
@@ -17418,25 +17784,54 @@ function F.summonCellBoss(token)
                 )
         )
 
-        local startOk =
-            pcall(function()
-                remotes.Dialog:FireServer(
-                    "start",
-                    npcCradle,
-                    10
+        local nativeOk,
+            nativeDetail =
+                F.callNativeCradleInteraction(
+                    token,
+                    npcCradle
                 )
-            end)
 
-        State.cellFarm.dialogStartSent =
-            startOk == true
+        local startOk =
+            nativeOk
 
-        if not startOk then
-            F.recordCellFailure(
-                "Cradle DialogEvent start failed"
-            )
+        if nativeOk then
+            State.cellFarm.dialogStartSent =
+                true
+
+            State.cellFarm.status =
+                "Native NPC interaction called; waiting for Release UI"
         else
-            State.movementTelemetry.lastRemote =
-                'DialogEvent("start", workspace.NPCs["The Cradle"], 10)'
+            -- Compatibility fallback for executors that do not expose getgc
+            -- or debug metadata. This is the exact Cobalt-proven remote.
+            F.setCellFarmStage(
+                "DIALOG START FALLBACK",
+                "Native function unavailable; sending exact DialogEvent start"
+            )
+
+            startOk =
+                pcall(function()
+                    remotes.Dialog:FireServer(
+                        "start",
+                        npcCradle,
+                        10
+                    )
+                end)
+
+            State.cellFarm.dialogStartSent =
+                startOk == true
+
+            if startOk then
+                State.movementTelemetry.lastRemote =
+                    'DialogEvent("start", workspace.NPCs["The Cradle"], 10)'
+            else
+                F.recordCellFailure(
+                    "Cradle native interaction and DialogEvent start both failed"
+                )
+            end
+
+            State.cellFarm.status =
+                "Native interaction unavailable: "
+                .. tostring(nativeDetail)
         end
 
         if F.updateCellFarmUI then
@@ -17490,7 +17885,11 @@ function F.summonCellBoss(token)
         then
             F.setCellFarmStage(
                 "DIALOG NOT CONFIRMED",
-                "Start was sent but Release UI did not appear"
+                (
+                    State.cellFarm.npcInteractionFunctionFound
+                    and "Native NPC interaction ran but Release UI did not appear"
+                    or "Dialog start fallback ran but Release UI did not appear"
+                )
             )
 
             if attempt
@@ -22322,6 +22721,12 @@ function F.updateCellFarmUI()
         .. tostring(State.cellFarm.dailyRewardStatus or "Not checked")
         .. "\nLast callback: "
         .. tostring(State.cellFarm.menuLastCallback or "None")
+        .. "\nNPC interact: "
+        .. tostring(State.cellFarm.npcInteractionMethod or "None")
+        .. " | found="
+        .. tostring(State.cellFarm.npcInteractionFunctionFound == true)
+        .. " call="
+        .. tostring(State.cellFarm.npcInteractionCallOk == true)
         .. "\nDialog: start="
         .. tostring(State.cellFarm.dialogStartSent == true)
         .. " ui="
@@ -22816,6 +23221,10 @@ function F.startCellFarm(resumed)
         State.cellFarm.lastBossHealthState = "WAITING"
         State.cellFarm.lastBossHealthUIAt = 0
         State.cellFarm.dialogStartSent = false
+        State.cellFarm.npcInteractionFunctionFound = false
+        State.cellFarm.npcInteractionCallOk = false
+        State.cellFarm.npcInteractionMethod = "None"
+        State.cellFarm.npcInteractionSource = "None"
         State.cellFarm.dialogUiConfirmed = false
         State.cellFarm.dialogReleaseVisible = false
         State.cellFarm.dialogOptionSent = false
@@ -26783,7 +27192,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics 30 FPS / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("Drops v6.4.19: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
+print("Drops v6.4.20: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -26803,14 +27212,14 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.4.19.")
+    warn("[The Veil Hub] loadstring is required to launch v6.4.20.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.4.19 compile failed:", compileError)
+    warn("[The Veil Hub] v6.4.20 compile failed:", compileError)
     return
 end
 
