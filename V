@@ -1,4 +1,4 @@
--- The Veil Hub v6.4.10 Reward Chest E Only
+-- The Veil Hub v6.4.11 Protection Wait + Physical Menu
 -- Upload this entire file to your public GitHub "V" file.
 -- Your short loadstring loader remains unchanged.
 
@@ -271,6 +271,17 @@ local Config = {
     CELL_MENU_BOOT_GRACE = 6.00,
     CELL_GAMEPLAY_READY_STABLE = 2.00,
     CELL_MENU_CONNECTION_WAIT = 3.00,
+    CELL_MENU_PHYSICAL_RETRIES = 5,
+    CELL_MENU_PHYSICAL_VERIFY = 1.10,
+    CELL_MENU_PHYSICAL_RETRY_DELAY = 0.30,
+
+    -- After entering gameplay the server gives the player a short spawn
+    -- protection bubble. Interaction with The Cradle is blocked until it is
+    -- gone. Wake the character with normal movement input and wait it out.
+    CELL_SPAWN_PROTECTION_WAKE_HOLD = 0.35,
+    CELL_SPAWN_PROTECTION_WAKE_SETTLE = 1.20,
+    CELL_SPAWN_PROTECTION_CLEAR_STABLE = 0.75,
+    CELL_SPAWN_PROTECTION_MAX_WAIT = 20.0,
     CELL_MENU_PROTOCOL_ATTEMPTS = 5,
     CELL_MENU_PROTOCOL_INTERVAL = 1.35,
     CELL_WEAPON_WAIT_TIMEOUT = 12,
@@ -298,7 +309,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.4.10 Reward Chest E Only",
+    HUB_VERSION = "v6.4.11 Protection Wait + Physical Menu",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -4707,7 +4718,7 @@ State.cellFarmSection = F.createSection(State.cellFarmBody)
 State.cellFarmToggle = F.createToggle(
     State.cellFarmSection,
     "Full Auto The Cell Of Life",
-    "Cradle -> Dialog start/option -> fight -> wait death animation -> fly to 5 reward chests and press E -> wait drops stable -> collect -> Bundles -> filter/sell -> delayed hop -> resume.",
+    "Menu physical click -> wait spawn protection clear -> Cradle Dialog start/option -> fight -> 5 reward chests with E -> wait drops stable -> collect -> Bundles -> filter/sell -> hop.",
     false
 )
 
@@ -15898,6 +15909,237 @@ function F.requestCellCradleStreaming()
     return true
 end
 
+function F.findCellSpawnProtectionMarker()
+    local character =
+        LocalPlayer.Character
+
+    if not character
+        or not character.Parent
+    then
+        return nil
+    end
+
+    -- Roblox's normal spawn protection is represented by a ForceField and
+    -- visually appears as a blue-ish bubble. Prefer that exact signal.
+    local forceField =
+        character:FindFirstChildWhichIsA(
+            "ForceField",
+            true
+        )
+
+    if forceField then
+        return forceField
+    end
+
+    -- Conservative fallback for a custom game-side bubble. Avoid generic
+    -- combat StatusEffects (e.g. OceanShield) so the farm cannot deadlock on
+    -- a legitimate buff.
+    for _, object in ipairs(
+        character:GetDescendants()
+    ) do
+        local parent =
+            object.Parent
+
+        local insideStatusEffects =
+            false
+
+        while parent
+            and parent ~= character
+        do
+            if parent.Name == "StatusEffects" then
+                insideStatusEffects = true
+                break
+            end
+
+            parent = parent.Parent
+        end
+
+        if not insideStatusEffects then
+            local lowered =
+                string.lower(
+                    tostring(
+                        object.Name
+                    )
+                )
+
+            if string.find(
+                lowered,
+                "spawnprotection",
+                1,
+                true
+            )
+                or string.find(
+                    lowered,
+                    "spawn protection",
+                    1,
+                    true
+                )
+                or string.find(
+                    lowered,
+                    "protectionbubble",
+                    1,
+                    true
+                )
+                or string.find(
+                    lowered,
+                    "spawnshield",
+                    1,
+                    true
+                )
+            then
+                return object
+            end
+        end
+    end
+
+    return nil
+end
+
+function F.wakeCellCharacterFromSpawnProtection(token)
+    if not F.isCellFarmActive(token) then
+        return false
+    end
+
+    F.setCellFarmStage(
+        "SPAWN PROTECTION",
+        "Sending normal movement input"
+    )
+
+    local moved =
+        F.pressVirtualKey(
+            Enum.KeyCode.W,
+            0x57,
+            Config.CELL_SPAWN_PROTECTION_WAKE_HOLD,
+            "Spawn protection wake: W"
+        )
+
+    if not moved then
+        local humanoid =
+            F.getHumanoid()
+
+        if humanoid then
+            pcall(function()
+                humanoid:Move(
+                    Vector3.new(
+                        0,
+                        0,
+                        -1
+                    ),
+                    true
+                )
+            end)
+
+            task.wait(
+                Config.CELL_SPAWN_PROTECTION_WAKE_HOLD
+            )
+
+            pcall(function()
+                humanoid:Move(
+                    Vector3.zero,
+                    false
+                )
+            end)
+
+            moved = true
+        end
+    end
+
+    return moved
+end
+
+function F.waitForCellSpawnProtectionClear(token)
+    if not F.isCellFarmActive(token) then
+        return false
+    end
+
+    F.setCellFarmStage(
+        "SPAWN PROTECTION",
+        "Waiting for blue protection bubble to clear"
+    )
+
+    -- Always perform one normal movement action. The user confirmed the
+    -- protection may remain until the character actually moves/acts.
+    F.wakeCellCharacterFromSpawnProtection(
+        token
+    )
+
+    if not F.cellFarmWait(
+        token,
+        Config.CELL_SPAWN_PROTECTION_WAKE_SETTLE
+    ) then
+        return false
+    end
+
+    local started =
+        os.clock()
+
+    local clearSince = nil
+    local lastWakeAt = os.clock()
+
+    while F.isCellFarmActive(token)
+        and os.clock() - started
+            < Config.CELL_SPAWN_PROTECTION_MAX_WAIT
+    do
+        local marker =
+            F.findCellSpawnProtectionMarker()
+
+        if marker then
+            clearSince = nil
+
+            State.cellFarm.status =
+                "Spawn protection active: "
+                .. tostring(
+                    marker.ClassName
+                )
+                .. " "
+                .. tostring(
+                    marker.Name
+                )
+
+            if os.clock() - lastWakeAt
+                >= Config.CELL_SPAWN_PROTECTION_WAKE_SETTLE
+            then
+                F.wakeCellCharacterFromSpawnProtection(
+                    token
+                )
+
+                lastWakeAt =
+                    os.clock()
+            end
+        else
+            if not clearSince then
+                clearSince =
+                    os.clock()
+            elseif os.clock() - clearSince
+                >= Config.CELL_SPAWN_PROTECTION_CLEAR_STABLE
+            then
+                F.setCellFarmStage(
+                    "PROTECTION CLEAR",
+                    "Interaction unlocked"
+                )
+
+                return true
+            end
+        end
+
+        task.wait(0.10)
+    end
+
+    -- If the game uses a server-only protection marker that is not replicated
+    -- to the client, we already performed real movement and waited the full
+    -- protection window. Continue without attempting to bypass the game state.
+    if F.isCellFarmActive(token) then
+        F.setCellFarmStage(
+            "PROTECTION WAIT COMPLETE",
+            "Protection marker not visible; continuing after movement/wait"
+        )
+
+        return true
+    end
+
+    return false
+end
+
 function F.flyToCellCradle(token)
     if not F.isCellFarmActive(token) then
         return false
@@ -17773,6 +18015,179 @@ function F.clickGuiButtonPhysical(button)
     return sent
 end
 
+function F.setCellMenuHubHidden(hidden)
+    if not screenGui
+        or not screenGui.Parent
+    then
+        return
+    end
+
+    if hidden then
+        if State.cellFarm.menuHubPreviousEnabled == nil then
+            State.cellFarm.menuHubPreviousEnabled =
+                screenGui.Enabled
+        end
+
+        screenGui.Enabled = false
+    else
+        local previous =
+            State.cellFarm.menuHubPreviousEnabled
+
+        State.cellFarm.menuHubPreviousEnabled = nil
+
+        if previous == nil then
+            previous = true
+        end
+
+        screenGui.Enabled = previous
+    end
+end
+
+function F.clickGuiButtonVirtualUser(button)
+    if not button
+        or not button.Parent
+        or not F.isGuiObjectActuallyVisible(
+            button
+        )
+    then
+        return false
+    end
+
+    local center =
+        button.AbsolutePosition
+        + button.AbsoluteSize / 2
+
+    local sent = false
+
+    pcall(function()
+        local virtualUser =
+            game:GetService(
+                "VirtualUser"
+            )
+
+        virtualUser:CaptureController()
+        virtualUser:ClickButton1(
+            center
+        )
+
+        sent = true
+    end)
+
+    return sent
+end
+
+function F.runPhysicalCellMenuStep(
+    token,
+    button,
+    signalName,
+    sourceNeedle,
+    verifyCallback,
+    statusText
+)
+    if not F.isCellFarmActive(token)
+        or not button
+        or not button.Parent
+    then
+        return false
+    end
+
+    State.cellFarm.menuPhase =
+        tostring(
+            statusText
+            or "Menu physical click"
+        )
+
+    -- Wait until the game's real menu handler exists, but DO NOT call the
+    -- connection directly. Earlier builds could partially trip the game's
+    -- debounce without producing a real UI transition.
+    State.cellFarm.menuLastMethod =
+        "Waiting handler before physical click"
+
+    F.waitForExactGuiConnection(
+        token,
+        button,
+        signalName,
+        sourceNeedle,
+        Config.CELL_MENU_CONNECTION_WAIT
+    )
+
+    for attempt = 1,
+        Config.CELL_MENU_PHYSICAL_RETRIES
+    do
+        if not F.isCellFarmActive(token)
+            or not button.Parent
+        then
+            return false
+        end
+
+        local center =
+            button.AbsolutePosition
+            + button.AbsoluteSize / 2
+
+        State.cellFarm.menuInputAttempts =
+            (State.cellFarm.menuInputAttempts or 0)
+            + 1
+
+        State.cellFarm.menuLastMethod =
+            "Physical click "
+            .. tostring(attempt)
+            .. "/"
+            .. tostring(
+                Config.CELL_MENU_PHYSICAL_RETRIES
+            )
+            .. " @ "
+            .. tostring(
+                math.floor(center.X)
+            )
+            .. ","
+            .. tostring(
+                math.floor(center.Y)
+            )
+
+        F.clickGuiButtonPhysical(
+            button
+        )
+
+        if F.waitCellMenuCondition(
+            token,
+            verifyCallback,
+            Config.CELL_MENU_PHYSICAL_VERIFY
+        ) then
+            return true
+        end
+
+        if not F.isCellFarmActive(token)
+            or not button.Parent
+        then
+            return false
+        end
+
+        -- A second real-input implementation is useful on executors where
+        -- VirtualInputManager accepts the call but Roblox does not route it
+        -- through the menu's normal mouse path.
+        F.clickGuiButtonVirtualUser(
+            button
+        )
+
+        if F.waitCellMenuCondition(
+            token,
+            verifyCallback,
+            0.65
+        ) then
+            return true
+        end
+
+        if not F.cellFarmWait(
+            token,
+            Config.CELL_MENU_PHYSICAL_RETRY_DELAY
+        ) then
+            return false
+        end
+    end
+
+    return false
+end
+
 function F.isCellServerMenuVisible()
     return
         F.findVisibleGuiTextObject(
@@ -17806,8 +18221,25 @@ function F.bootstrapCellMenu(token)
     State.cellFarm.menuProtocolAttempts = 0
     State.cellFarm.menuCallbackAttempts = 0
     State.cellFarm.menuInputAttempts = 0
-    State.cellFarm.menuLastCallback = "None"
+    State.cellFarm.menuLastCallback = "Physical-only"
     State.cellFarm.menuLastMethod = "None"
+
+    F.setCellMenuHubHidden(
+        true
+    )
+
+    local function finish(result, method)
+        if method then
+            State.cellFarm.menuLastMethod =
+                method
+        end
+
+        F.setCellMenuHubHidden(
+            false
+        )
+
+        return result
+    end
 
     F.setCellFarmStage(
         "MENU BOOTSTRAP",
@@ -17823,19 +18255,22 @@ function F.bootstrapCellMenu(token)
         State.cellFarm.menuPhase =
             "Gameplay"
 
-        State.cellFarm.menuLastMethod =
+        return finish(
+            true,
             "Boot guard confirmed gameplay"
-
-        return true
+        )
     end
 
     if not F.isCellFarmActive(token) then
-        return false
+        return finish(
+            false,
+            "Cancelled"
+        )
     end
 
     F.setCellFarmStage(
         "MENU BOOTSTRAP",
-        "THE VEIL menu detected"
+        "Physical menu input only"
     )
 
     local deadline =
@@ -17850,23 +18285,25 @@ function F.bootstrapCellMenu(token)
         if F.isCellGameplayReady() then
             State.cellFarm.menuPhase =
                 "Gameplay"
-            State.cellFarm.menuLastMethod =
-                "Complete"
-            return true
+
+            return finish(
+                true,
+                "Physical menu sequence complete"
+            )
         end
 
-        -- STEP 1: THE VEIL -> Endure.
+        -- STEP 1: Main THE VEIL Endure.
         local mainEndure =
             F.getMainMenuEndureButton()
 
         if mainEndure then
             F.setCellFarmStage(
                 "MENU BOOTSTRAP",
-                "Main Endure"
+                "Physical click: Main Endure"
             )
 
             local changed =
-                F.runVerifiedCellMenuStep(
+                F.runPhysicalCellMenuStep(
                     token,
                     mainEndure,
                     "MouseButton1Click",
@@ -17878,32 +18315,31 @@ function F.bootstrapCellMenu(token)
                             and F.getSlotOneEndureButtonExact()
                                 ~= nil
                     end,
-                    1.35,
                     "Main Endure"
                 )
 
             if not changed then
                 State.cellFarm.menuLastMethod =
-                    "Main Endure did not transition"
-                task.wait(0.20)
+                    "Main Endure physical click did not transition"
+
+                task.wait(0.25)
             end
 
             continue
         end
 
-        -- STEP 2: Save slot screen. The trace proves Slot 1's Endure
-        -- itself is the actionable button; there is no separate Slot 1 click.
+        -- STEP 2: Slot 1's own Endure button.
         local slotEndure =
             F.getSlotOneEndureButtonExact()
 
         if slotEndure then
             F.setCellFarmStage(
                 "MENU BOOTSTRAP",
-                "Slot 1 Endure"
+                "Physical click: Slot 1 Endure"
             )
 
             local changed =
-                F.runVerifiedCellMenuStep(
+                F.runPhysicalCellMenuStep(
                     token,
                     slotEndure,
                     "MouseButton1Click",
@@ -17914,21 +18350,20 @@ function F.bootstrapCellMenu(token)
                                 == nil
                             and F.isCellServerMenuVisible()
                     end,
-                    1.85,
                     "Slot 1 Endure"
                 )
 
             if not changed then
                 State.cellFarm.menuLastMethod =
-                    "Slot 1 Endure did not transition"
-                task.wait(0.20)
+                    "Slot 1 Endure physical click did not transition"
+
+                task.wait(0.25)
             end
 
             continue
         end
 
-        -- STEP 3: Current Server card. Request the list only to populate
-        -- cards; the actual traced Current Server GUI callback enters play.
+        -- STEP 3: click the Current Server card with real input.
         if F.isCellServerMenuVisible() then
             local currentServer =
                 F.getCurrentServerMenuButton()
@@ -17965,11 +18400,11 @@ function F.bootstrapCellMenu(token)
 
             F.setCellFarmStage(
                 "MENU BOOTSTRAP",
-                "Current Server"
+                "Physical click: Current Server"
             )
 
             local changed =
-                F.runVerifiedCellMenuStep(
+                F.runPhysicalCellMenuStep(
                     token,
                     currentServer,
                     "Activated",
@@ -17978,20 +18413,21 @@ function F.bootstrapCellMenu(token)
                         return
                             F.isCellGameplayReady()
                     end,
-                    4.0,
                     "Current Server"
                 )
 
             if changed then
                 State.cellFarm.menuPhase =
                     "Gameplay"
-                State.cellFarm.menuLastMethod =
-                    "Complete"
-                return true
+
+                return finish(
+                    true,
+                    "Physical Current Server complete"
+                )
             end
 
             State.cellFarm.menuLastMethod =
-                "Current Server did not transition"
+                "Current Server physical click did not transition"
 
             task.wait(0.25)
             continue
@@ -18006,7 +18442,10 @@ function F.bootstrapCellMenu(token)
     State.cellFarm.menuPhase =
         "Timeout"
 
-    return F.isCellGameplayReady()
+    return finish(
+        F.isCellGameplayReady(),
+        "Menu bootstrap timeout"
+    )
 end
 
 function F.getCellBossHealth(boss)
@@ -18711,6 +19150,12 @@ function F.fightCellBoss(token, boss)
                     >= respawnDeadline
 
             if not F.getCharacterRoot() then
+                return false
+            end
+
+            if not F.waitForCellSpawnProtectionClear(
+                token
+            ) then
                 return false
             end
 
@@ -20508,6 +20953,17 @@ function F.runCellFarm(token, resumed)
             token,
             "World readiness timeout"
         )
+    end
+
+    F.setCellFarmStage(
+        "SPAWN PROTECTION",
+        "Preparing interaction state"
+    )
+
+    if not F.waitForCellSpawnProtectionClear(
+        token
+    ) then
+        return false
     end
 
     State.cellFarm.runs =
@@ -24778,7 +25234,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics 30 FPS / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("Drops v6.4.10: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
+print("Drops v6.4.11: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -24798,14 +25254,14 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.4.10.")
+    warn("[The Veil Hub] loadstring is required to launch v6.4.11.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.4.10 compile failed:", compileError)
+    warn("[The Veil Hub] v6.4.11 compile failed:", compileError)
     return
 end
 
