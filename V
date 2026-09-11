@@ -1,6 +1,6 @@
--- The Veil Hub v6.4.6 Cradle Dialog Start + Option
+-- The Veil Hub v6.4.10 Reward Chest E Only
 -- Upload this entire file to your public GitHub "V" file.
--- Your short loadstring loader can remain unchanged.
+-- Your short loadstring loader remains unchanged.
 
 local runtimeSource = [==============[
 -- =========================================================
@@ -241,7 +241,25 @@ local Config = {
     CELL_PRE_HOP_DELAY = 4.00,
     CELL_INVENTORY_STABLE_WINDOW = 1.50,
     CELL_FIGHT_TIMEOUT = 420,
+    CELL_BOSS_HP_UI_INTERVAL = 0.20,
     CELL_RESPAWN_WAIT = 22,
+
+    -- Cell death/reward sequence. The Cell does not award loot at HP 0;
+    -- five World Boss reward chests appear after its death animation.
+    CELL_REWARD_CHEST_EXPECTED = 5,
+    CELL_REWARD_CHEST_RADIUS = 280,
+    CELL_REWARD_CHEST_FIRST_BATCH_WAIT = 8.0,
+    CELL_REWARD_CHEST_RETRY_NOTICE = 45.0,
+    CELL_REWARD_CHEST_OPEN_DISTANCE = 4.5,
+    CELL_REWARD_CHEST_E_HOLD = 0.08,
+    CELL_REWARD_CHEST_AFTER_E_DELAY = 0.20,
+    CELL_REWARD_CHEST_OPEN_RETRIES = 3,
+    CELL_REWARD_CHEST_OPEN_CONFIRM = 6.0,
+    CELL_REWARD_CHEST_BETWEEN = 0.55,
+    CELL_REWARD_CHEST_NO_NEW_WINDOW = 4.0,
+    CELL_REWARD_DROP_STABLE_WINDOW = 4.0,
+    CELL_REWARD_DROP_NOTICE = 30.0,
+
     CELL_DROP_DISCOVERY_SECONDS = 5.0,
     CELL_DROP_RADIUS = 260,
     CELL_MAX_LOOT_PER_RUN = 90,
@@ -250,6 +268,9 @@ local Config = {
     CELL_BUNDLE_SETTLE = 0.35,
     CELL_SELL_RETRIES = 2,
     CELL_MENU_BOOTSTRAP_TIMEOUT = 55,
+    CELL_MENU_BOOT_GRACE = 6.00,
+    CELL_GAMEPLAY_READY_STABLE = 2.00,
+    CELL_MENU_CONNECTION_WAIT = 3.00,
     CELL_MENU_PROTOCOL_ATTEMPTS = 5,
     CELL_MENU_PROTOCOL_INTERVAL = 1.35,
     CELL_WEAPON_WAIT_TIMEOUT = 12,
@@ -277,7 +298,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.4.6 Cradle Dialog Start + Option",
+    HUB_VERSION = "v6.4.10 Reward Chest E Only",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -671,6 +692,8 @@ local State = {
         runs = 0,
         kills = 0,
         lootCollected = 0,
+        rewardChestsFound = 0,
+        rewardChestsOpened = 0,
         bundlesOpened = 0,
         itemsSold = 0,
         hops = 0,
@@ -678,6 +701,9 @@ local State = {
         lastFailure = "None",
         lastBossHealth = 0,
         lastBossMaxHealth = 0,
+        lastBossHealthPercent = 0,
+        lastBossHealthState = "WAITING",
+        lastBossHealthUIAt = 0,
         lastBossPosition = nil,
         startedAt = 0,
     },
@@ -4681,7 +4707,7 @@ State.cellFarmSection = F.createSection(State.cellFarmBody)
 State.cellFarmToggle = F.createToggle(
     State.cellFarmSection,
     "Full Auto The Cell Of Life",
-    "Cradle -> hold still 1s -> Dialog start -> Dialog option -> wait Cell -> fight -> collect -> open Bundles -> keep Legendary/Mythic + whitelist -> sell -> verify -> delayed hop -> resume.",
+    "Cradle -> Dialog start/option -> fight -> wait death animation -> fly to 5 reward chests and press E -> wait drops stable -> collect -> Bundles -> filter/sell -> delayed hop -> resume.",
     false
 )
 
@@ -4802,7 +4828,7 @@ State.cellStopButton = F.createActionRow(
     "STOP NOW"
 )
 
-State.cellStatusCard = F.createCard(State.cellFarmSection, 230)
+State.cellStatusCard = F.createCard(State.cellFarmSection, 274)
 State.cellStatusLabel = F.createTextLabel(
     State.cellStatusCard,
     "Cell Farm: OFF",
@@ -14039,10 +14065,14 @@ function F.buildDiagnosticsReport()
             .. " | Stage " .. tostring(State.cellFarm.stage)
             .. " | Boss HP " .. tostring(math.floor(tonumber(State.cellFarm.lastBossHealth) or 0))
             .. "/" .. tostring(math.floor(tonumber(State.cellFarm.lastBossMaxHealth) or 0))
+            .. " (" .. string.format("%.1f", tonumber(State.cellFarm.lastBossHealthPercent) or 0) .. "%)"
+            .. " " .. tostring(State.cellFarm.lastBossHealthState or "WAITING")
             .. " | Runs/Kills " .. tostring(State.cellFarm.runs) .. "/" .. tostring(State.cellFarm.kills)
             .. " | Weapon " .. tostring(State.cellFarm.selectedWeaponName ~= "" and State.cellFarm.selectedWeaponName or "AUTO")
             .. " | Menu " .. tostring(State.cellFarm.menuPhase),
         "Cell Stats: Loot " .. tostring(State.cellFarm.lootCollected)
+            .. " | Reward Chests " .. tostring(State.cellFarm.rewardChestsOpened or 0)
+            .. "/" .. tostring(State.cellFarm.rewardChestsFound or 0)
             .. " | Bundles " .. tostring(State.cellFarm.bundlesOpened)
             .. " | Sold " .. tostring(State.cellFarm.itemsSold)
             .. " | Hops " .. tostring(State.cellFarm.hops)
@@ -16891,6 +16921,219 @@ function F.waitCellMenuCondition(token, predicate, timeout)
     return ok and result == true
 end
 
+function F.hasExactGuiConnection(button, signalName, sourceNeedle)
+    if not button
+        or not button.Parent
+        or type(getconnections) ~= "function"
+    then
+        return false
+    end
+
+    local signal =
+        button[signalName]
+
+    if not signal then
+        return false
+    end
+
+    local ok, connections =
+        pcall(
+            getconnections,
+            signal
+        )
+
+    if not ok
+        or type(connections) ~= "table"
+    then
+        return false
+    end
+
+    local wanted =
+        string.lower(
+            tostring(
+                sourceNeedle
+                or ""
+            )
+        )
+
+    for _, connection in ipairs(connections) do
+        local fn = nil
+
+        pcall(function()
+            fn = connection.Function
+        end)
+
+        local source =
+            string.lower(
+                F.getGuiConnectionSource(
+                    fn
+                )
+            )
+
+        if wanted ~= ""
+            and source ~= ""
+            and string.find(
+                source,
+                wanted,
+                1,
+                true
+            )
+        then
+            return true
+        end
+    end
+
+    return false
+end
+
+function F.waitForExactGuiConnection(
+    token,
+    button,
+    signalName,
+    sourceNeedle,
+    timeout
+)
+    local deadline =
+        os.clock()
+        + math.max(
+            0.10,
+            tonumber(timeout)
+                or Config.CELL_MENU_CONNECTION_WAIT
+        )
+
+    while F.isCellFarmActive(token)
+        and button
+        and button.Parent
+        and os.clock() < deadline
+    do
+        if F.hasExactGuiConnection(
+            button,
+            signalName,
+            sourceNeedle
+        ) then
+            return true
+        end
+
+        task.wait(0.05)
+    end
+
+    return F.hasExactGuiConnection(
+        button,
+        signalName,
+        sourceNeedle
+    )
+end
+
+function F.isAnyCellMenuStageVisible()
+    if F.getMainMenuEndureButton() then
+        return true
+    end
+
+    if F.getSlotOneEndureButtonExact() then
+        return true
+    end
+
+    if F.isCellServerMenuVisible() then
+        return true
+    end
+
+    return false
+end
+
+function F.waitForCellResumeBootState(token)
+    local started =
+        os.clock()
+
+    local graceDeadline =
+        started
+        + Config.CELL_MENU_BOOT_GRACE
+
+    local gameplayStableSince = nil
+
+    State.cellFarm.menuPhase =
+        "Waiting menu boot"
+
+    State.cellFarm.menuLastMethod =
+        "Resume boot guard"
+
+    while F.isCellFarmActive(token)
+        and os.clock()
+            < graceDeadline
+    do
+        if F.isAnyCellMenuStageVisible() then
+            State.cellFarm.menuPhase =
+                "Menu detected"
+
+            return "menu"
+        end
+
+        -- Character and world can exist before the menu controllers have
+        -- finished creating their UI. Never accept that transient state as
+        -- gameplay immediately after a hop.
+        if F.isCellGameplayReady() then
+            if not gameplayStableSince then
+                gameplayStableSince =
+                    os.clock()
+            end
+        else
+            gameplayStableSince = nil
+        end
+
+        task.wait(0.05)
+    end
+
+    if F.isAnyCellMenuStageVisible() then
+        return "menu"
+    end
+
+    -- Only accept gameplay if the no-menu state stays valid continuously.
+    gameplayStableSince = nil
+
+    local stableDeadline =
+        os.clock()
+        + Config.CELL_GAMEPLAY_READY_STABLE
+        + 1.50
+
+    while F.isCellFarmActive(token)
+        and os.clock() < stableDeadline
+    do
+        if F.isAnyCellMenuStageVisible() then
+            return "menu"
+        end
+
+        if F.isCellGameplayReady() then
+            if not gameplayStableSince then
+                gameplayStableSince =
+                    os.clock()
+            elseif os.clock()
+                - gameplayStableSince
+                >= Config.CELL_GAMEPLAY_READY_STABLE
+            then
+                State.cellFarm.menuPhase =
+                    "Gameplay stable"
+
+                State.cellFarm.menuLastMethod =
+                    "Stable gameplay confirmation"
+
+                return "gameplay"
+            end
+        else
+            gameplayStableSince = nil
+        end
+
+        task.wait(0.05)
+    end
+
+    if F.isAnyCellMenuStageVisible() then
+        return "menu"
+    end
+
+    return
+        F.isCellGameplayReady()
+        and "gameplay"
+        or "unknown"
+end
+
 function F.runVerifiedCellMenuStep(
     token,
     button,
@@ -16915,6 +17158,23 @@ function F.runVerifiedCellMenuStep(
 
     State.cellFarm.menuPhase =
         tostring(statusText or "Menu step")
+
+    State.cellFarm.menuLastMethod =
+        "Waiting game menu handler"
+
+    F.waitForExactGuiConnection(
+        token,
+        button,
+        signalName,
+        sourceNeedle,
+        Config.CELL_MENU_CONNECTION_WAIT
+    )
+
+    if not F.isCellFarmActive(token)
+        or not button.Parent
+    then
+        return false
+    end
 
     -- Attempt 1: invoke the exact game callback found by the tracer.
     local callbackFired, callbackSource =
@@ -17543,10 +17803,6 @@ function F.isCellGameplayReady()
 end
 
 function F.bootstrapCellMenu(token)
-    if F.isCellGameplayReady() then
-        return true
-    end
-
     State.cellFarm.menuProtocolAttempts = 0
     State.cellFarm.menuCallbackAttempts = 0
     State.cellFarm.menuInputAttempts = 0
@@ -17555,7 +17811,31 @@ function F.bootstrapCellMenu(token)
 
     F.setCellFarmStage(
         "MENU BOOTSTRAP",
-        "Waiting for THE VEIL menu"
+        "Waiting for menu controllers to initialize"
+    )
+
+    local bootState =
+        F.waitForCellResumeBootState(
+            token
+        )
+
+    if bootState == "gameplay" then
+        State.cellFarm.menuPhase =
+            "Gameplay"
+
+        State.cellFarm.menuLastMethod =
+            "Boot guard confirmed gameplay"
+
+        return true
+    end
+
+    if not F.isCellFarmActive(token) then
+        return false
+    end
+
+    F.setCellFarmStage(
+        "MENU BOOTSTRAP",
+        "THE VEIL menu detected"
     )
 
     local deadline =
@@ -17749,6 +18029,68 @@ function F.getCellBossHealth(boss)
     return
         tonumber(info.Current) or 0,
         tonumber(info.Maximum) or 0
+end
+
+function F.updateCellBossHealthSnapshot(boss)
+    local hp = 0
+    local maxHp = 0
+    local stateText = "WAITING"
+
+    if boss
+        and boss.Parent
+    then
+        hp, maxHp =
+            F.getCellBossHealth(
+                boss
+            )
+
+        hp =
+            math.max(
+                0,
+                tonumber(hp) or 0
+            )
+
+        maxHp =
+            math.max(
+                0,
+                tonumber(maxHp) or 0
+            )
+
+        if maxHp > 0 then
+            if hp > 0 then
+                stateText = "ALIVE"
+            else
+                stateText = "DEFEATED"
+            end
+        else
+            stateText = "DETECTED"
+        end
+    elseif (State.cellFarm.lastBossMaxHealth or 0) > 0
+        and (State.cellFarm.lastBossHealth or 0) <= 0
+    then
+        hp = 0
+        maxHp =
+            State.cellFarm.lastBossMaxHealth
+        stateText = "DEFEATED"
+    end
+
+    local percent = 0
+
+    if maxHp > 0 then
+        percent =
+            math.clamp(
+                (hp / maxHp) * 100,
+                0,
+                100
+            )
+    end
+
+    State.cellFarm.lastBossHealth = hp
+    State.cellFarm.lastBossMaxHealth = maxHp
+    State.cellFarm.lastBossHealthPercent = percent
+    State.cellFarm.lastBossHealthState = stateText
+
+    return hp, maxHp, percent, stateText
 end
 
 function F.captureCellDropSnapshot()
@@ -18306,9 +18648,47 @@ function F.fightCellBoss(token, boss)
         State.cellFarm.lastBossMaxHealth =
             maxHealth
 
+        local healthPercent = 0
+
+        if maxHealth > 0 then
+            healthPercent =
+                math.clamp(
+                    (currentHealth / maxHealth) * 100,
+                    0,
+                    100
+                )
+        end
+
+        State.cellFarm.lastBossHealthPercent =
+            healthPercent
+        State.cellFarm.lastBossHealthState =
+            currentHealth > 0
+            and "ALIVE"
+            or "DEFEATED"
+
+        if os.clock()
+            - (State.cellFarm.lastBossHealthUIAt or 0)
+            >= Config.CELL_BOSS_HP_UI_INTERVAL
+        then
+            State.cellFarm.lastBossHealthUIAt =
+                os.clock()
+
+            if F.updateCellFarmUI then
+                F.updateCellFarmUI()
+            end
+        end
+
         if currentHealth <= 0
             and maxHealth > 0
         then
+            State.cellFarm.lastBossHealth = 0
+            State.cellFarm.lastBossHealthPercent = 0
+            State.cellFarm.lastBossHealthState = "DEFEATED"
+
+            if F.updateCellFarmUI then
+                F.updateCellFarmUI()
+            end
+
             return true
         end
 
@@ -18527,6 +18907,832 @@ function F.collectCellDropConfirmed(drop, token)
     )
 
     return false
+end
+
+function F.getCellRewardChestRoot(object)
+    if not object
+        or not object.Parent
+    then
+        return nil
+    end
+
+    local function textLooksLikeChest(text)
+        local lowered =
+            string.lower(
+                F.trimText(
+                    tostring(text or "")
+                )
+            )
+
+        return
+            string.find(
+                lowered,
+                "chest",
+                1,
+                true
+            ) ~= nil
+            or string.find(
+                lowered,
+                "crate",
+                1,
+                true
+            ) ~= nil
+            or string.find(
+                lowered,
+                "reward box",
+                1,
+                true
+            ) ~= nil
+            or string.find(
+                lowered,
+                "loot box",
+                1,
+                true
+            ) ~= nil
+            or string.find(
+                lowered,
+                "world boss",
+                1,
+                true
+            ) ~= nil
+    end
+
+    if (
+        object:IsA("Model")
+        or object:IsA("BasePart")
+    )
+        and textLooksLikeChest(
+            object.Name
+        )
+    then
+        return object
+    end
+
+    if object:IsA("ProximityPrompt") then
+        local promptLooksRight =
+            textLooksLikeChest(
+                object.ObjectText
+            )
+            or textLooksLikeChest(
+                object.ActionText
+            )
+            or string.find(
+                string.lower(
+                    tostring(
+                        object.ActionText
+                        or ""
+                    )
+                ),
+                "open",
+                1,
+                true
+            ) ~= nil
+
+        if promptLooksRight then
+            local current =
+                object.Parent
+
+            for _ = 1, 6 do
+                if not current
+                    or current == workspace
+                then
+                    break
+                end
+
+                if current:IsA("Model") then
+                    return current
+                end
+
+                if current:IsA("BasePart")
+                    and current.Parent == workspace
+                then
+                    return current
+                end
+
+                current = current.Parent
+            end
+        end
+    end
+
+    if object:IsA("ClickDetector") then
+        local parent =
+            object.Parent
+
+        if parent
+            and (
+                parent:IsA("BasePart")
+                or parent:IsA("Model")
+            )
+        then
+            return parent
+        end
+    end
+
+    return nil
+end
+
+function F.isCellRewardChestNearBoss(chest)
+    if not chest
+        or not chest.Parent
+        or not chest:IsDescendantOf(workspace)
+    then
+        return false
+    end
+
+    local chestCFrame =
+        F.getDropCFrame(
+            chest
+        )
+
+    if not chestCFrame then
+        return false
+    end
+
+    local bossPosition =
+        State.cellFarm.lastBossPosition
+
+    if not bossPosition then
+        return true
+    end
+
+    return
+        (
+            chestCFrame.Position
+            - bossPosition
+        ).Magnitude
+        <= Config.CELL_REWARD_CHEST_RADIUS
+end
+
+function F.collectCellRewardChestCandidates(beforeSnapshot)
+    local result = {}
+    local seen = {}
+
+    for _, object in ipairs(
+        workspace:GetDescendants()
+    ) do
+        local chest =
+            F.getCellRewardChestRoot(
+                object
+            )
+
+        if chest
+            and chest.Parent
+            and not seen[chest]
+            and (
+                not beforeSnapshot
+                or not beforeSnapshot[chest]
+            )
+            and F.isCellRewardChestNearBoss(
+                chest
+            )
+        then
+            seen[chest] = true
+            table.insert(
+                result,
+                chest
+            )
+        end
+    end
+
+    return result
+end
+
+function F.captureCellRewardChestSnapshot()
+    local snapshot = {}
+
+    for _, chest in ipairs(
+        F.collectCellRewardChestCandidates(
+            nil
+        )
+    ) do
+        snapshot[chest] = true
+    end
+
+    return snapshot
+end
+
+function F.countCellRewardDrops(beforeSnapshot)
+    local count = 0
+
+    local folder =
+        State.dropsFolder
+        or (
+            F.findDropsFolder
+            and F.findDropsFolder()
+        )
+
+    if not folder then
+        return 0
+    end
+
+    for _, drop in ipairs(
+        F.collectDropObjects(
+            folder
+        )
+    ) do
+        if not beforeSnapshot[drop] then
+            local include = true
+
+            local cf =
+                F.getDropCFrame(
+                    drop
+                )
+
+            if State.cellFarm.lastBossPosition
+                and cf
+            then
+                include =
+                    (
+                        cf.Position
+                        - State.cellFarm.lastBossPosition
+                    ).Magnitude
+                    <= Config.CELL_DROP_RADIUS
+            end
+
+            if include then
+                count = count + 1
+            end
+        end
+    end
+
+    return count
+end
+
+function F.isCellRewardChestOpened(chest)
+    if not chest
+        or not chest.Parent
+    then
+        return true
+    end
+
+    for _, attributeName in ipairs({
+        "Opened",
+        "Open",
+        "IsOpened",
+        "Claimed",
+        "Used",
+    }) do
+        local ok, value =
+            pcall(function()
+                return chest:GetAttribute(
+                    attributeName
+                )
+            end)
+
+        if ok and value == true then
+            return true
+        end
+    end
+
+    for _, valueName in ipairs({
+        "Opened",
+        "Open",
+        "IsOpened",
+        "Claimed",
+        "Used",
+    }) do
+        local value =
+            chest:FindFirstChild(
+                valueName,
+                true
+            )
+
+        if value
+            and value:IsA("BoolValue")
+            and value.Value == true
+        then
+            return true
+        end
+    end
+
+    local prompt =
+        chest:FindFirstChildWhichIsA(
+            "ProximityPrompt",
+            true
+        )
+
+    if prompt
+        and prompt.Enabled == false
+    then
+        return true
+    end
+
+    return false
+end
+
+function F.stopCellRewardMovement()
+    F.stopLootLock(
+        "CELL"
+    )
+    F.stopMovementFlight(
+        "CELL"
+    )
+    F.stopMovementFlight(
+        "MONSTER_LOCK"
+    )
+    F.releaseMovement(
+        "CELL"
+    )
+    F.releaseMovement(
+        "MONSTER_LOCK"
+    )
+
+    local root =
+        F.getCharacterRoot()
+
+    if root then
+        pcall(function()
+            root.AssemblyLinearVelocity =
+                Vector3.zero
+
+            root.AssemblyAngularVelocity =
+                Vector3.zero
+        end)
+    end
+end
+
+function F.openCellRewardChest(chest, token, beforeDropSnapshot)
+    if not F.isCellFarmActive(token) then
+        return false
+    end
+
+    if not chest
+        or not chest.Parent
+    then
+        return true
+    end
+
+    local chestCFrame =
+        F.getDropCFrame(
+            chest
+        )
+
+    if chestCFrame then
+        F.setCellFarmStage(
+            "OPENING REWARD CHEST",
+            "Flying to "
+                .. tostring(
+                    chest.Name
+                )
+                .. " for E interaction"
+        )
+
+        local reached =
+            F.flyToCFrame(
+                chestCFrame,
+                "CELL",
+                Config.CELL_REWARD_CHEST_OPEN_DISTANCE,
+                45,
+                "Cell"
+            )
+
+        if not reached
+            and not F.isCellFarmActive(token)
+        then
+            return false
+        end
+    end
+
+    F.stopCellRewardMovement()
+
+    -- The live Cell reward chest is opened by the player's normal E input.
+    -- Do not fire ProximityPrompt / ClickDetector directly here.
+    for attempt = 1,
+        Config.CELL_REWARD_CHEST_OPEN_RETRIES
+    do
+        if not F.isCellFarmActive(token) then
+            return false
+        end
+
+        if not chest.Parent
+            or F.isCellRewardChestOpened(
+                chest
+            )
+        then
+            return true
+        end
+
+        local dropsBefore =
+            F.countCellRewardDrops(
+                beforeDropSnapshot
+            )
+
+        F.setCellFarmStage(
+            "OPENING REWARD CHEST",
+            "Pressing E on chest "
+                .. tostring(attempt)
+                .. "/"
+                .. tostring(
+                    Config.CELL_REWARD_CHEST_OPEN_RETRIES
+                )
+        )
+
+        State.movementTelemetry.lastAction =
+            "Reward chest: physical E "
+            .. tostring(attempt)
+
+        local pressed =
+            F.pressVirtualKey(
+                Enum.KeyCode.E,
+                0x45,
+                Config.CELL_REWARD_CHEST_E_HOLD,
+                "Reward chest: E"
+            )
+
+        if not pressed then
+            F.recordCellFailure(
+                "Could not send E to Cell reward chest"
+            )
+        end
+
+        if not F.cellFarmWait(
+            token,
+            Config.CELL_REWARD_CHEST_AFTER_E_DELAY
+        ) then
+            return false
+        end
+
+        local deadline =
+            os.clock()
+            + Config.CELL_REWARD_CHEST_OPEN_CONFIRM
+
+        while F.isCellFarmActive(token)
+            and os.clock() < deadline
+        do
+            if not chest.Parent
+                or F.isCellRewardChestOpened(
+                    chest
+                )
+            then
+                return true
+            end
+
+            local dropsNow =
+                F.countCellRewardDrops(
+                    beforeDropSnapshot
+                )
+
+            if dropsNow > dropsBefore then
+                return true
+            end
+
+            task.wait(0.12)
+        end
+
+        if not F.cellFarmWait(
+            token,
+            0.35
+        ) then
+            return false
+        end
+    end
+
+    return
+        not chest.Parent
+        or F.isCellRewardChestOpened(
+            chest
+        )
+end
+
+function F.waitForCellRewardDropsStable(token, beforeDropSnapshot)
+    F.setCellFarmStage(
+        "WAITING REWARD DROPS",
+        "Waiting until chest loot stops spawning"
+    )
+
+    local lastCount =
+        F.countCellRewardDrops(
+            beforeDropSnapshot
+        )
+
+    local stableSince =
+        os.clock()
+
+    local lastNotice =
+        os.clock()
+
+    while F.isCellFarmActive(token) do
+        task.wait(0.15)
+
+        local currentCount =
+            F.countCellRewardDrops(
+                beforeDropSnapshot
+            )
+
+        if currentCount ~= lastCount then
+            lastCount = currentCount
+            stableSince = os.clock()
+
+            State.cellFarm.status =
+                "Chest loot spawning: "
+                .. tostring(currentCount)
+                .. " drops"
+
+            if F.updateCellFarmUI then
+                F.updateCellFarmUI()
+            end
+        elseif currentCount > 0
+            and os.clock() - stableSince
+                >= Config.CELL_REWARD_DROP_STABLE_WINDOW
+        then
+            return true, currentCount
+        end
+
+        if os.clock() - lastNotice
+            >= Config.CELL_REWARD_DROP_NOTICE
+        then
+            lastNotice = os.clock()
+
+            if currentCount == 0 then
+                F.recordCellFailure(
+                    "Reward chests opened but no drops detected yet; still waiting instead of hopping"
+                )
+            end
+        end
+    end
+
+    return false, lastCount
+end
+
+function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapshot)
+    if not F.isCellFarmActive(token) then
+        return false
+    end
+
+    F.stopCellRewardMovement()
+
+    State.lockedMonster = nil
+    State.cellFarm.rewardChestsFound = 0
+    State.cellFarm.rewardChestsOpened = 0
+
+    F.setCellFarmStage(
+        "WAITING REWARD CHESTS",
+        "Waiting for The Cell Of Life death animation"
+    )
+
+    local discovered = {}
+    local discoveredOrder = {}
+    local opened = {}
+
+    local firstChestAt = nil
+    local lastNewChestAt = os.clock()
+    local lastNotice = os.clock()
+
+    local function registerCandidate(object)
+        if not object
+            or not object.Parent
+        then
+            return
+        end
+
+        local chest =
+            F.getCellRewardChestRoot(
+                object
+            )
+
+        if not chest
+            or not chest.Parent
+            or beforeChestSnapshot[chest]
+            or discovered[chest]
+            or not F.isCellRewardChestNearBoss(
+                chest
+            )
+        then
+            return
+        end
+
+        discovered[chest] = true
+        table.insert(
+            discoveredOrder,
+            chest
+        )
+
+        firstChestAt =
+            firstChestAt
+            or os.clock()
+
+        lastNewChestAt =
+            os.clock()
+
+        State.cellFarm.rewardChestsFound =
+            #discoveredOrder
+
+        State.cellFarm.status =
+            "Reward chests found: "
+            .. tostring(
+                #discoveredOrder
+            )
+            .. "/"
+            .. tostring(
+                Config.CELL_REWARD_CHEST_EXPECTED
+            )
+
+        if F.updateCellFarmUI then
+            F.updateCellFarmUI()
+        end
+    end
+
+    for _, chest in ipairs(
+        F.collectCellRewardChestCandidates(
+            beforeChestSnapshot
+        )
+    ) do
+        registerCandidate(
+            chest
+        )
+    end
+
+    local descendantConnection =
+        workspace.DescendantAdded:Connect(
+            function(object)
+                task.defer(
+                    registerCandidate,
+                    object
+                )
+            end
+        )
+
+    local function disconnectWatcher()
+        if descendantConnection then
+            pcall(function()
+                descendantConnection:Disconnect()
+            end)
+
+            descendantConnection = nil
+        end
+    end
+
+    -- Do not leave this server while the death/reward sequence has not
+    -- produced either reward chests or actual new drops.
+    while F.isCellFarmActive(token) do
+        local newDropCount =
+            F.countCellRewardDrops(
+                beforeDropSnapshot
+            )
+
+        if #discoveredOrder
+            >= Config.CELL_REWARD_CHEST_EXPECTED
+        then
+            break
+        end
+
+        if newDropCount > 0
+            and #discoveredOrder == 0
+        then
+            -- Compatibility path if a future game update auto-opens the
+            -- reward containers. We still wait for drop stability below.
+            break
+        end
+
+        if firstChestAt
+            and os.clock() - firstChestAt
+                >= Config.CELL_REWARD_CHEST_FIRST_BATCH_WAIT
+            and #discoveredOrder > 0
+        then
+            -- Open the chests we have instead of waiting forever for a
+            -- replication-delayed fifth chest. The watcher remains active
+            -- while opening, so a late chest is still captured.
+            break
+        end
+
+        if os.clock() - lastNotice
+            >= Config.CELL_REWARD_CHEST_RETRY_NOTICE
+        then
+            lastNotice = os.clock()
+
+            F.recordCellFailure(
+                "Still waiting for Cell reward chests; hop is blocked to protect loot"
+            )
+
+            State.cellFarm.status =
+                "Waiting for reward chests - no hop"
+        end
+
+        task.wait(0.15)
+    end
+
+    if not F.isCellFarmActive(token) then
+        disconnectWatcher()
+        return false
+    end
+
+    local index = 1
+    local noNewDeadline = nil
+
+    while F.isCellFarmActive(token) do
+        local chest =
+            discoveredOrder[index]
+
+        if chest then
+            if not opened[chest] then
+                local success =
+                    F.openCellRewardChest(
+                        chest,
+                        token,
+                        beforeDropSnapshot
+                    )
+
+                if success then
+                    opened[chest] = true
+
+                    State.cellFarm.rewardChestsOpened =
+                        State.cellFarm.rewardChestsOpened
+                        + 1
+
+                    if F.updateCellFarmUI then
+                        F.updateCellFarmUI()
+                    end
+                else
+                    -- Keep it in the queue and try it again. Never hop past
+                    -- a known unopened reward chest.
+                    task.wait(0.45)
+                    continue
+                end
+            end
+
+            index = index + 1
+
+            if not F.cellFarmWait(
+                token,
+                Config.CELL_REWARD_CHEST_BETWEEN
+            ) then
+                disconnectWatcher()
+                return false
+            end
+
+            noNewDeadline = nil
+        else
+            if State.cellFarm.rewardChestsOpened
+                >= Config.CELL_REWARD_CHEST_EXPECTED
+            then
+                break
+            end
+
+            local newDropCount =
+                F.countCellRewardDrops(
+                    beforeDropSnapshot
+                )
+
+            if newDropCount > 0
+                and State.cellFarm.rewardChestsOpened > 0
+            then
+                if not noNewDeadline then
+                    noNewDeadline =
+                        os.clock()
+                        + Config.CELL_REWARD_CHEST_NO_NEW_WINDOW
+                elseif os.clock()
+                    >= noNewDeadline
+                then
+                    -- If the game produced fewer than five replicated
+                    -- chest instances but loot is already spawning, stop
+                    -- waiting for another chest and wait for loot stability.
+                    break
+                end
+            else
+                noNewDeadline = nil
+            end
+
+            task.wait(0.15)
+        end
+    end
+
+    disconnectWatcher()
+
+    if not F.isCellFarmActive(token) then
+        return false
+    end
+
+    State.cellFarm.status =
+        "Reward chests opened: "
+        .. tostring(
+            State.cellFarm.rewardChestsOpened
+        )
+        .. "/"
+        .. tostring(
+            math.max(
+                Config.CELL_REWARD_CHEST_EXPECTED,
+                State.cellFarm.rewardChestsFound
+            )
+        )
+
+    if F.updateCellFarmUI then
+        F.updateCellFarmUI()
+    end
+
+    local stable,
+        finalDropCount =
+            F.waitForCellRewardDropsStable(
+                token,
+                beforeDropSnapshot
+            )
+
+    if stable then
+        State.cellFarm.status =
+            "Reward drops stable: "
+            .. tostring(finalDropCount)
+    end
+
+    return stable
 end
 
 function F.collectCellBossLoot(token, beforeSnapshot)
@@ -19151,15 +20357,13 @@ function F.updateCellFarmUI()
     local boss =
         F.getCellBoss()
 
-    if boss then
-        local hp, maxHp =
-            F.getCellBossHealth(
+    local bossHp,
+        bossMaxHp,
+        bossPercent,
+        bossState =
+            F.updateCellBossHealthSnapshot(
                 boss
             )
-
-        State.cellFarm.lastBossHealth = hp
-        State.cellFarm.lastBossMaxHealth = maxHp
-    end
 
     label.Text =
         "Cell Farm: "
@@ -19184,10 +20388,15 @@ function F.updateCellFarmUI()
         .. tostring(State.cellFarm.menuLastCallback or "None")
         .. "\nWeapon: "
         .. tostring(State.cellFarm.weaponStatus)
+        .. "\nBoss: The Cell Of Life | "
+        .. tostring(bossState)
         .. "\nBoss HP: "
-        .. tostring(math.floor(State.cellFarm.lastBossHealth or 0))
-        .. "/"
-        .. tostring(math.floor(State.cellFarm.lastBossMaxHealth or 0))
+        .. string.format(
+            "%.0f / %.0f (%.1f%%)",
+            bossHp,
+            bossMaxHp,
+            bossPercent
+        )
         .. " | Height: "
         .. tostring(State.cellFarm.fightHeight)
         .. " | Travel: "
@@ -19198,6 +20407,10 @@ function F.updateCellFarmUI()
         .. tostring(State.cellFarm.kills)
         .. " | Loot: "
         .. tostring(State.cellFarm.lootCollected)
+        .. "\nChests: "
+        .. tostring(State.cellFarm.rewardChestsOpened or 0)
+        .. "/"
+        .. tostring(State.cellFarm.rewardChestsFound or 0)
         .. " | Bundles: "
         .. tostring(State.cellFarm.bundlesOpened)
         .. "\nSold: "
@@ -19346,6 +20559,12 @@ function F.runCellFarm(token, resumed)
     local dropSnapshot =
         F.captureCellDropSnapshot()
 
+    local rewardChestSnapshot =
+        F.captureCellRewardChestSnapshot()
+
+    State.cellFarm.rewardChestsFound = 0
+    State.cellFarm.rewardChestsOpened = 0
+
     local fought =
         F.fightCellBoss(
             token,
@@ -19369,12 +20588,40 @@ function F.runCellFarm(token, resumed)
     State.cellFarm.kills =
         State.cellFarm.kills + 1
     State.cellFarm.lastBossHealth = 0
+    State.cellFarm.lastBossHealthPercent = 0
+    State.cellFarm.lastBossHealthState = "DEFEATED"
     F.markConfigDirty()
+
+    if F.updateCellFarmUI then
+        F.updateCellFarmUI()
+    end
 
     F.setCellFarmStage(
         "DEFEATED",
-        "CREATION UNDONE"
+        "CREATION UNDONE - waiting for reward chests"
     )
+
+    local rewardsReady =
+        F.processCellRewardChests(
+            token,
+            rewardChestSnapshot,
+            dropSnapshot
+        )
+
+    if not F.isCellFarmActive(token) then
+        return false
+    end
+
+    if not rewardsReady then
+        -- processCellRewardChests only returns false on cancellation.
+        -- Keeping this guard prevents accidental hop if future edits add
+        -- another failure path.
+        F.setCellFarmStage(
+            "REWARD WAIT",
+            "Reward sequence incomplete - hop blocked"
+        )
+        return false
+    end
 
     F.collectCellBossLoot(
         token,
@@ -19565,11 +20812,18 @@ function F.startCellFarm(resumed)
         State.cellFarm.runs = 0
         State.cellFarm.kills = 0
         State.cellFarm.lootCollected = 0
+        State.cellFarm.rewardChestsFound = 0
+        State.cellFarm.rewardChestsOpened = 0
         State.cellFarm.bundlesOpened = 0
         State.cellFarm.itemsSold = 0
         State.cellFarm.hops = 0
         State.cellFarm.failures = 0
         State.cellFarm.lastFailure = "None"
+        State.cellFarm.lastBossHealth = 0
+        State.cellFarm.lastBossMaxHealth = 0
+        State.cellFarm.lastBossHealthPercent = 0
+        State.cellFarm.lastBossHealthState = "WAITING"
+        State.cellFarm.lastBossHealthUIAt = 0
         State.cellFarm.startedAt = os.clock()
     end
 
@@ -23498,7 +24752,7 @@ if globalEnv.__TheVeilHub_CellResume == true then
     globalEnv.__TheVeilHub_CellResume = false
 
     task.defer(function()
-        task.wait(0.25)
+        task.wait(1.00)
 
         if State.loopRunning
             and F.startCellFarm
@@ -23518,13 +24772,13 @@ end)
 
 print("==========================================")
 print(Config.HUB_NAME, Config.HUB_VERSION)
-print("Cell Farm v6.4.1: fixed Endure/Slot 1 bootstrap + Cradle summon / fight / loot / sell / queued resume")
+print("Cell Farm v6.4.8: hop resume waits for menu boot before Endure/Slot 1/Current Server automation")
 print("Goal Farm: Bestiary targets / live monster drop intelligence / coordinated combat + loot")
 print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics 30 FPS / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("Drops v6.4.6: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
+print("Drops v6.4.10: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -23544,14 +24798,14 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.4.6.")
+    warn("[The Veil Hub] loadstring is required to launch v6.4.10.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.4.6 compile failed:", compileError)
+    warn("[The Veil Hub] v6.4.10 compile failed:", compileError)
     return
 end
 
