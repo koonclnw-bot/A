@@ -1,4 +1,4 @@
--- The Veil Hub v6.4.18 Menu Aim GUI Inset
+-- The Veil Hub v6.4.19 Menu Aim Up
 -- Upload this entire file to your public GitHub "V" file.
 -- The short public GitHub loadstring remains unchanged.
 
@@ -277,7 +277,7 @@ local Config = {
     CELL_MENU_PHYSICAL_RETRIES = 4,
     CELL_MENU_PHYSICAL_VERIFY = 1.50,
     CELL_MENU_PHYSICAL_RETRY_DELAY = 1.00,
-    CELL_MENU_MOUSE_Y_OFFSETS = {26, 38, 50, 62},
+    CELL_MENU_MOUSE_Y_OFFSETS = {-12, 0, 12, 24},
     CELL_MENU_HUB_HIDE_SETTLE = 0.45,
 
     CELL_DAILY_REWARD_CLOSE_WINDOW = 15.0,
@@ -331,7 +331,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.4.18 Menu Aim GUI Inset",
+    HUB_VERSION = "v6.4.19 Menu Aim Up",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -26783,7 +26783,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics 30 FPS / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("Drops v6.4.18: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
+print("Drops v6.4.19: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -26803,14 +26803,14 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.4.18.")
+    warn("[The Veil Hub] loadstring is required to launch v6.4.19.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.4.18 compile failed:", compileError)
+    warn("[The Veil Hub] v6.4.19 compile failed:", compileError)
     return
 end
 
