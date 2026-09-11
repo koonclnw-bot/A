@@ -1,4 +1,4 @@
--- The Veil Hub v6.4.12 Cradle Stand-Still 2s
+-- The Veil Hub v6.4.13 WASD Flight + Menu Wait Fix
 -- Upload this entire file to your public GitHub "V" file.
 -- Your short loadstring loader remains unchanged.
 
@@ -267,13 +267,19 @@ local Config = {
     CELL_BUNDLE_CONFIRM_TIMEOUT = 1.5,
     CELL_BUNDLE_SETTLE = 0.35,
     CELL_SELL_RETRIES = 2,
-    CELL_MENU_BOOTSTRAP_TIMEOUT = 55,
-    CELL_MENU_BOOT_GRACE = 6.00,
-    CELL_GAMEPLAY_READY_STABLE = 2.00,
-    CELL_MENU_CONNECTION_WAIT = 3.00,
-    CELL_MENU_PHYSICAL_RETRIES = 5,
-    CELL_MENU_PHYSICAL_VERIFY = 1.10,
-    CELL_MENU_PHYSICAL_RETRY_DELAY = 0.30,
+    CELL_MENU_BOOTSTRAP_TIMEOUT = 90,
+    CELL_MENU_BOOT_GRACE = 25.00,
+    CELL_GAMEPLAY_READY_STABLE = 3.00,
+    CELL_MENU_CONNECTION_WAIT = 5.00,
+    CELL_MENU_MAIN_SETTLE = 2.00,
+    CELL_MENU_SLOT_SETTLE = 1.25,
+    CELL_MENU_SERVER_SETTLE = 1.25,
+    CELL_MENU_PHYSICAL_RETRIES = 4,
+    CELL_MENU_PHYSICAL_VERIFY = 1.50,
+    CELL_MENU_PHYSICAL_RETRY_DELAY = 1.00,
+
+    CELL_CRADLE_TRAVEL_INPUT_HOLD = 0.12,
+    CELL_CRADLE_TRAVEL_INPUT_GAP = 0.10,
 
     -- After entering gameplay the server gives the player a short spawn
     -- protection bubble. Interaction with The Cradle is blocked until it is
@@ -309,7 +315,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.4.12 Cradle Stand-Still 2s",
+    HUB_VERSION = "v6.4.13 WASD Flight + Menu Wait Fix",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -698,6 +704,8 @@ local State = {
         menuInputAttempts = 0,
         menuLastCallback = "None",
         menuLastMethod = "None",
+        menuLastHit = "None",
+        cradleTravelInput = "OFF",
         fightHeight = Config.CELL_DEFAULT_FIGHT_HEIGHT,
         travelSpeed = Config.CELL_DEFAULT_TRAVEL_SPEED,
         runs = 0,
@@ -4718,7 +4726,7 @@ State.cellFarmSection = F.createSection(State.cellFarmBody)
 State.cellFarmToggle = F.createToggle(
     State.cellFarmSection,
     "Full Auto The Cell Of Life",
-    "Menu physical click -> fly to Cradle -> stand completely still 2s -> Dialog start/option -> fight -> 5 reward chests with E -> wait drops stable -> collect -> Bundles -> filter/sell -> hop.",
+    "Wait real menu -> human-like physical click -> fly to Cradle while pulsing W/A/S/D -> stop input -> stand still 2s -> Dialog start/option -> fight -> reward chests -> loot/sell/hop.",
     false
 )
 
@@ -4839,7 +4847,7 @@ State.cellStopButton = F.createActionRow(
     "STOP NOW"
 )
 
-State.cellStatusCard = F.createCard(State.cellFarmSection, 274)
+State.cellStatusCard = F.createCard(State.cellFarmSection, 296)
 State.cellStatusLabel = F.createTextLabel(
     State.cellStatusCard,
     "Cell Farm: OFF",
@@ -16066,6 +16074,127 @@ function F.waitForCellSpawnProtectionClear(token)
     )
 end
 
+function F.startCellCradleTravelInput(token)
+    State.cellFarm.cradleTravelInput =
+        "WASD ACTIVE"
+
+    local pulseToken =
+        (State.cellFarm.cradleTravelInputToken or 0)
+        + 1
+
+    State.cellFarm.cradleTravelInputToken =
+        pulseToken
+
+    task.spawn(function()
+        local keys = {
+            {
+                code = Enum.KeyCode.W,
+                vk = 0x57,
+                name = "W",
+            },
+            {
+                code = Enum.KeyCode.A,
+                vk = 0x41,
+                name = "A",
+            },
+            {
+                code = Enum.KeyCode.S,
+                vk = 0x53,
+                name = "S",
+            },
+            {
+                code = Enum.KeyCode.D,
+                vk = 0x44,
+                name = "D",
+            },
+        }
+
+        local index = 1
+
+        while F.isCellFarmActive(token)
+            and State.cellFarm.cradleTravelInputToken
+                == pulseToken
+            and State.cellFarm.cradleTravelInput
+                == "WASD ACTIVE"
+        do
+            local key =
+                keys[index]
+
+            State.movementTelemetry.lastAction =
+                "Cradle flight input: "
+                .. key.name
+
+            F.pressVirtualKey(
+                key.code,
+                key.vk,
+                Config.CELL_CRADLE_TRAVEL_INPUT_HOLD,
+                "Cradle flight: " .. key.name
+            )
+
+            index =
+                (index % #keys) + 1
+
+            if not F.cellFarmWait(
+                token,
+                Config.CELL_CRADLE_TRAVEL_INPUT_GAP
+            ) then
+                break
+            end
+        end
+    end)
+
+    return pulseToken
+end
+
+function F.stopCellCradleTravelInput(pulseToken)
+    if pulseToken
+        and State.cellFarm.cradleTravelInputToken
+            ~= pulseToken
+    then
+        return false
+    end
+
+    State.cellFarm.cradleTravelInput =
+        "OFF"
+
+    State.cellFarm.cradleTravelInputToken =
+        (State.cellFarm.cradleTravelInputToken or 0)
+        + 1
+
+    return true
+end
+
+function F.flyCellToCFrameWithWASD(
+    token,
+    target,
+    arrivalDistance,
+    maxTravelTime
+)
+    if not F.isCellFarmActive(token) then
+        return false
+    end
+
+    local pulseToken =
+        F.startCellCradleTravelInput(
+            token
+        )
+
+    local reached =
+        F.flyToCFrame(
+            target,
+            "CELL",
+            arrivalDistance,
+            maxTravelTime,
+            "Cell"
+        )
+
+    F.stopCellCradleTravelInput(
+        pulseToken
+    )
+
+    return reached
+end
+
 function F.flyToCellCradle(token)
     if not F.isCellFarmActive(token) then
         return false
@@ -16083,12 +16212,11 @@ function F.flyToCellCradle(token)
         F.requestCellCradleStreaming()
 
         local reachedFallback =
-            F.flyToCFrame(
+            F.flyCellToCFrameWithWASD(
+                token,
                 Config.CELL_CRADLE_FALLBACK_CFRAME,
-                "CELL",
                 Config.CELL_CRADLE_ARRIVAL_DISTANCE,
-                Config.CELL_TRAVEL_MAX_TIME,
-                "Cell"
+                Config.CELL_TRAVEL_MAX_TIME
             )
 
         if not reachedFallback
@@ -16146,12 +16274,11 @@ function F.flyToCellCradle(token)
         )
 
     local reached =
-        F.flyToCFrame(
+        F.flyCellToCFrameWithWASD(
+            token,
             target,
-            "CELL",
             Config.CELL_CRADLE_ARRIVAL_DISTANCE,
-            Config.CELL_TRAVEL_MAX_TIME,
-            "Cell"
+            Config.CELL_TRAVEL_MAX_TIME
         )
 
     return reached == true
@@ -16374,9 +16501,11 @@ function F.settleCellAtCradle(token)
         return false
     end
 
+    F.stopCellCradleTravelInput()
+
     F.setCellFarmStage(
         "CRADLE SETTLE",
-        "Standing still at The Cradle for 2 seconds"
+        "WASD stopped; standing still at The Cradle for 2 seconds"
     )
 
     -- Release every movement owner before the dialogue sequence.
@@ -17239,24 +17368,18 @@ function F.isAnyCellMenuStageVisible()
 end
 
 function F.waitForCellResumeBootState(token)
-    local started =
-        os.clock()
-
     local graceDeadline =
-        started
+        os.clock()
         + Config.CELL_MENU_BOOT_GRACE
 
-    local gameplayStableSince = nil
-
     State.cellFarm.menuPhase =
-        "Waiting menu boot"
+        "Waiting for menu to appear"
 
     State.cellFarm.menuLastMethod =
-        "Resume boot guard"
+        "Resume menu wait"
 
     while F.isCellFarmActive(token)
-        and os.clock()
-            < graceDeadline
+        and os.clock() < graceDeadline
     do
         if F.isAnyCellMenuStageVisible() then
             State.cellFarm.menuPhase =
@@ -17265,18 +17388,6 @@ function F.waitForCellResumeBootState(token)
             return "menu"
         end
 
-        -- Character and world can exist before the menu controllers have
-        -- finished creating their UI. Never accept that transient state as
-        -- gameplay immediately after a hop.
-        if F.isCellGameplayReady() then
-            if not gameplayStableSince then
-                gameplayStableSince =
-                    os.clock()
-            end
-        else
-            gameplayStableSince = nil
-        end
-
         task.wait(0.05)
     end
 
@@ -17284,39 +17395,34 @@ function F.waitForCellResumeBootState(token)
         return "menu"
     end
 
-    -- Only accept gameplay if the no-menu state stays valid continuously.
-    gameplayStableSince = nil
+    -- Only after the full menu grace window has elapsed may we consider a
+    -- direct-to-gameplay resume. Require a stable gameplay state as well.
+    local stableSince = nil
 
-    local stableDeadline =
+    local deadline =
         os.clock()
         + Config.CELL_GAMEPLAY_READY_STABLE
-        + 1.50
+        + 3.0
 
     while F.isCellFarmActive(token)
-        and os.clock() < stableDeadline
+        and os.clock() < deadline
     do
         if F.isAnyCellMenuStageVisible() then
             return "menu"
         end
 
         if F.isCellGameplayReady() then
-            if not gameplayStableSince then
-                gameplayStableSince =
-                    os.clock()
-            elseif os.clock()
-                - gameplayStableSince
+            stableSince =
+                stableSince
+                or os.clock()
+
+            if os.clock() - stableSince
                 >= Config.CELL_GAMEPLAY_READY_STABLE
             then
-                State.cellFarm.menuPhase =
-                    "Gameplay stable"
-
-                State.cellFarm.menuLastMethod =
-                    "Stable gameplay confirmation"
-
                 return "gameplay"
             end
         else
-            gameplayStableSince = nil
+            stableSince = nil
         end
 
         task.wait(0.05)
@@ -17326,10 +17432,7 @@ function F.waitForCellResumeBootState(token)
         return "menu"
     end
 
-    return
-        F.isCellGameplayReady()
-        and "gameplay"
-        or "unknown"
+    return "unknown"
 end
 
 function F.runVerifiedCellMenuStep(
@@ -17905,7 +18008,9 @@ end
 function F.clickGuiButtonPhysical(button)
     if not button
         or not button.Parent
-        or not F.isGuiObjectActuallyVisible(button)
+        or not F.isGuiObjectActuallyVisible(
+            button
+        )
     then
         return false
     end
@@ -17922,13 +18027,36 @@ function F.clickGuiButtonPhysical(button)
                 "VirtualInputManager"
             )
 
-        virtualInput:SendMouseMoveEvent(
-            center.X,
-            center.Y,
-            game
-        )
+        local userInput =
+            game:GetService(
+                "UserInputService"
+            )
 
-        task.wait(0.14)
+        local current =
+            userInput:GetMouseLocation()
+
+        for step = 1, 6 do
+            local alpha =
+                step / 6
+
+            local x =
+                current.X
+                + (center.X - current.X) * alpha
+
+            local y =
+                current.Y
+                + (center.Y - current.Y) * alpha
+
+            virtualInput:SendMouseMoveEvent(
+                x,
+                y,
+                game
+            )
+
+            task.wait(0.035)
+        end
+
+        task.wait(0.22)
 
         virtualInput:SendMouseButtonEvent(
             center.X,
@@ -17939,7 +18067,7 @@ function F.clickGuiButtonPhysical(button)
             0
         )
 
-        task.wait(0.09)
+        task.wait(0.11)
 
         virtualInput:SendMouseButtonEvent(
             center.X,
@@ -17950,21 +18078,6 @@ function F.clickGuiButtonPhysical(button)
             0
         )
 
-        sent = true
-    end)
-
-    if sent then
-        return true
-    end
-
-    pcall(function()
-        local virtualUser =
-            game:GetService(
-                "VirtualUser"
-            )
-
-        virtualUser:CaptureController()
-        virtualUser:ClickButton1(center)
         sent = true
     end)
 
@@ -17997,6 +18110,207 @@ function F.setCellMenuHubHidden(hidden)
 
         screenGui.Enabled = previous
     end
+end
+
+function F.getCellMenuHitInfo(button)
+    if not button
+        or not button.Parent
+    then
+        return "Button missing"
+    end
+
+    local center =
+        button.AbsolutePosition
+        + button.AbsoluteSize / 2
+
+    local playerGui =
+        LocalPlayer:FindFirstChildOfClass(
+            "PlayerGui"
+        )
+
+    if not playerGui then
+        return "PlayerGui missing"
+    end
+
+    local ok, objects =
+        pcall(function()
+            return playerGui:GetGuiObjectsAtPosition(
+                center.X,
+                center.Y
+            )
+        end)
+
+    if not ok
+        or type(objects) ~= "table"
+        or #objects == 0
+    then
+        return
+            "No GUI hit @ "
+            .. tostring(math.floor(center.X))
+            .. ","
+            .. tostring(math.floor(center.Y))
+    end
+
+    local top =
+        objects[1]
+
+    return
+        tostring(top.ClassName)
+        .. ":"
+        .. tostring(top.Name)
+        .. " @ "
+        .. tostring(math.floor(center.X))
+        .. ","
+        .. tostring(math.floor(center.Y))
+end
+
+function F.waitForCellMenuButtonSettle(token, button, seconds)
+    local required =
+        math.max(
+            0.10,
+            tonumber(seconds) or 0.5
+        )
+
+    local deadline =
+        os.clock()
+        + required
+        + 8.0
+
+    local stableSince = nil
+    local lastPosition = nil
+    local lastSize = nil
+
+    while F.isCellFarmActive(token)
+        and button
+        and button.Parent
+        and os.clock() < deadline
+    do
+        if not F.isGuiObjectActuallyVisible(
+            button
+        ) then
+            stableSince = nil
+        else
+            local position =
+                button.AbsolutePosition
+
+            local size =
+                button.AbsoluteSize
+
+            local stableLayout =
+                size.X > 8
+                and size.Y > 8
+
+            if lastPosition
+                and lastSize
+            then
+                stableLayout =
+                    stableLayout
+                    and (
+                        position
+                        - lastPosition
+                    ).Magnitude <= 2.5
+                    and (
+                        size
+                        - lastSize
+                    ).Magnitude <= 2.5
+            end
+
+            if stableLayout then
+                stableSince =
+                    stableSince
+                    or os.clock()
+
+                if os.clock()
+                    - stableSince
+                    >= required
+                then
+                    return true
+                end
+            else
+                stableSince = nil
+            end
+
+            lastPosition = position
+            lastSize = size
+        end
+
+        task.wait(0.05)
+    end
+
+    return
+        button
+        and button.Parent
+        and F.isGuiObjectActuallyVisible(
+            button
+        )
+end
+
+function F.clickGuiButtonExecutorMouse(button)
+    if not button
+        or not button.Parent
+        or not F.isGuiObjectActuallyVisible(
+            button
+        )
+    then
+        return false
+    end
+
+    local center =
+        button.AbsolutePosition
+        + button.AbsoluteSize / 2
+
+    local moved = false
+
+    if type(mousemoveabs) == "function" then
+        moved =
+            pcall(
+                mousemoveabs,
+                center.X,
+                center.Y
+            )
+    elseif type(mousemoverel) == "function" then
+        local userInput =
+            game:GetService(
+                "UserInputService"
+            )
+
+        local current =
+            userInput:GetMouseLocation()
+
+        moved =
+            pcall(
+                mousemoverel,
+                center.X - current.X,
+                center.Y - current.Y
+            )
+    end
+
+    if moved then
+        task.wait(0.30)
+    end
+
+    if type(mouse1press) == "function"
+        and type(mouse1release) == "function"
+    then
+        local ok =
+            pcall(function()
+                mouse1press()
+                task.wait(0.11)
+                mouse1release()
+            end)
+
+        if ok then
+            return true
+        end
+    end
+
+    if type(mouse1click) == "function" then
+        return pcall(
+            mouse1click
+        )
+    end
+
+    return false
 end
 
 function F.clickGuiButtonVirtualUser(button)
@@ -18047,17 +18361,28 @@ function F.runPhysicalCellMenuStep(
         return false
     end
 
-    State.cellFarm.menuPhase =
+    local name =
         tostring(
             statusText
-            or "Menu physical click"
+            or "Menu"
         )
 
-    -- Wait until the game's real menu handler exists, but DO NOT call the
-    -- connection directly. Earlier builds could partially trip the game's
-    -- debounce without producing a real UI transition.
+    local settleSeconds =
+        Config.CELL_MENU_SLOT_SETTLE
+
+    if name == "Main Endure" then
+        settleSeconds =
+            Config.CELL_MENU_MAIN_SETTLE
+    elseif name == "Current Server" then
+        settleSeconds =
+            Config.CELL_MENU_SERVER_SETTLE
+    end
+
+    State.cellFarm.menuPhase =
+        name
+
     State.cellFarm.menuLastMethod =
-        "Waiting handler before physical click"
+        "Waiting game handler"
 
     F.waitForExactGuiConnection(
         token,
@@ -18065,6 +18390,21 @@ function F.runPhysicalCellMenuStep(
         signalName,
         sourceNeedle,
         Config.CELL_MENU_CONNECTION_WAIT
+    )
+
+    if not F.isCellFarmActive(token)
+        or not button.Parent
+    then
+        return false
+    end
+
+    State.cellFarm.menuLastMethod =
+        "Waiting button settle"
+
+    F.waitForCellMenuButtonSettle(
+        token,
+        button,
+        settleSeconds
     )
 
     for attempt = 1,
@@ -18076,39 +18416,33 @@ function F.runPhysicalCellMenuStep(
             return false
         end
 
-        local center =
-            button.AbsolutePosition
-            + button.AbsoluteSize / 2
-
         State.cellFarm.menuInputAttempts =
             (State.cellFarm.menuInputAttempts or 0)
             + 1
 
+        State.cellFarm.menuLastHit =
+            F.getCellMenuHitInfo(
+                button
+            )
+
+        -- 1) Executor-native mouse functions, when exposed.
         State.cellFarm.menuLastMethod =
-            "Physical click "
+            name
+            .. " native mouse "
             .. tostring(attempt)
-            .. "/"
-            .. tostring(
-                Config.CELL_MENU_PHYSICAL_RETRIES
-            )
-            .. " @ "
-            .. tostring(
-                math.floor(center.X)
-            )
-            .. ","
-            .. tostring(
-                math.floor(center.Y)
+
+        local nativeSent =
+            F.clickGuiButtonExecutorMouse(
+                button
             )
 
-        F.clickGuiButtonPhysical(
-            button
-        )
-
-        if F.waitCellMenuCondition(
-            token,
-            verifyCallback,
-            Config.CELL_MENU_PHYSICAL_VERIFY
-        ) then
+        if nativeSent
+            and F.waitCellMenuCondition(
+                token,
+                verifyCallback,
+                Config.CELL_MENU_PHYSICAL_VERIFY
+            )
+        then
             return true
         end
 
@@ -18118,18 +18452,51 @@ function F.runPhysicalCellMenuStep(
             return false
         end
 
-        -- A second real-input implementation is useful on executors where
-        -- VirtualInputManager accepts the call but Roblox does not route it
-        -- through the menu's normal mouse path.
-        F.clickGuiButtonVirtualUser(
-            button
-        )
+        -- 2) VirtualInputManager real mouse path.
+        State.cellFarm.menuLastMethod =
+            name
+            .. " VIM mouse "
+            .. tostring(attempt)
 
-        if F.waitCellMenuCondition(
-            token,
-            verifyCallback,
-            0.65
-        ) then
+        local vimSent =
+            F.clickGuiButtonPhysical(
+                button
+            )
+
+        if vimSent
+            and F.waitCellMenuCondition(
+                token,
+                verifyCallback,
+                Config.CELL_MENU_PHYSICAL_VERIFY
+            )
+        then
+            return true
+        end
+
+        if not F.isCellFarmActive(token)
+            or not button.Parent
+        then
+            return false
+        end
+
+        -- 3) VirtualUser fallback.
+        State.cellFarm.menuLastMethod =
+            name
+            .. " VirtualUser "
+            .. tostring(attempt)
+
+        local userSent =
+            F.clickGuiButtonVirtualUser(
+                button
+            )
+
+        if userSent
+            and F.waitCellMenuCondition(
+                token,
+                verifyCallback,
+                Config.CELL_MENU_PHYSICAL_VERIFY
+            )
+        then
             return true
         end
 
@@ -18238,15 +18605,9 @@ function F.bootstrapCellMenu(token)
     while F.isCellFarmActive(token)
         and os.clock() < deadline
     do
-        if F.isCellGameplayReady() then
-            State.cellFarm.menuPhase =
-                "Gameplay"
-
-            return finish(
-                true,
-                "Physical menu sequence complete"
-            )
-        end
+        -- Once bootstrap has seen a menu, do not use root + workspace.Systems
+        -- as a shortcut here. Those objects remain replicated while the menu
+        -- transitions and caused false "gameplay complete" results.
 
         -- STEP 1: Main THE VEIL Endure.
         local mainEndure =
@@ -18398,9 +18759,15 @@ function F.bootstrapCellMenu(token)
     State.cellFarm.menuPhase =
         "Timeout"
 
+    local timeoutReady =
+        not F.isAnyCellMenuStageVisible()
+        and F.isCellGameplayReady()
+
     return finish(
-        F.isCellGameplayReady(),
-        "Menu bootstrap timeout"
+        timeoutReady,
+        timeoutReady
+            and "Gameplay confirmed after menu timeout"
+            or "Menu bootstrap timeout"
     )
 end
 
@@ -20791,6 +21158,10 @@ function F.updateCellFarmUI()
         .. tostring(State.cellFarm.menuInputAttempts or 0)
         .. "\nMenu method: "
         .. tostring(State.cellFarm.menuLastMethod or "None")
+        .. "\nMenu hit: "
+        .. tostring(State.cellFarm.menuLastHit or "None")
+        .. "\nTravel input: "
+        .. tostring(State.cellFarm.cradleTravelInput or "OFF")
         .. "\nLast callback: "
         .. tostring(State.cellFarm.menuLastCallback or "None")
         .. "\nWeapon: "
@@ -25190,7 +25561,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics 30 FPS / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("Drops v6.4.12: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
+print("Drops v6.4.13: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -25210,14 +25581,14 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.4.12.")
+    warn("[The Veil Hub] loadstring is required to launch v6.4.13.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.4.12 compile failed:", compileError)
+    warn("[The Veil Hub] v6.4.13 compile failed:", compileError)
     return
 end
 
