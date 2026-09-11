@@ -1,5 +1,6 @@
--- The Veil Hub v6.4.3 Cell Weapon + Local Menu Callback Fix
--- Self-installing launcher. Stores the full runtime locally for queue_on_teleport resume.
+-- The Veil Hub v6.4.5 Cradle E-1-1 + Slow Hop
+-- Upload this entire file to your public GitHub "V" file.
+-- Your short loadstring loader can remain unchanged.
 
 local runtimeSource = [==============[
 -- =========================================================
@@ -225,7 +226,17 @@ local Config = {
     CELL_CRADLE_FALLBACK_CFRAME = CFrame.new(442.25, -911, -300.75),
     CELL_CRADLE_ARRIVAL_DISTANCE = 5.0,
     CELL_TRAVEL_MAX_TIME = 120,
-    CELL_SUMMON_TIMEOUT = 22,
+    CELL_SUMMON_TIMEOUT = 26,
+    CELL_CRADLE_KEY_HOLD = 0.08,
+    CELL_CRADLE_AFTER_E_DELAY = 0.80,
+    CELL_CRADLE_AFTER_FIRST_ONE_DELAY = 0.72,
+    CELL_CRADLE_AFTER_SECOND_ONE_DELAY = 0.45,
+    CELL_CRADLE_DIALOGUE_DETECT_TIMEOUT = 2.50,
+    CELL_POST_LOOT_SETTLE = 1.25,
+    CELL_POST_BUNDLE_SETTLE = 1.25,
+    CELL_POST_SELL_SETTLE = 2.50,
+    CELL_PRE_HOP_DELAY = 4.00,
+    CELL_INVENTORY_STABLE_WINDOW = 1.50,
     CELL_FIGHT_TIMEOUT = 420,
     CELL_RESPAWN_WAIT = 22,
     CELL_DROP_DISCOVERY_SECONDS = 5.0,
@@ -263,7 +274,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.4.3 Cell Weapon + Local Menu Callback Fix",
+    HUB_VERSION = "v6.4.5 Cradle E-1-1 + Slow Hop",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -649,7 +660,9 @@ local State = {
         menuPhase = "Unknown",
         menuProtocolAttempts = 0,
         menuCallbackAttempts = 0,
+        menuInputAttempts = 0,
         menuLastCallback = "None",
+        menuLastMethod = "None",
         fightHeight = Config.CELL_DEFAULT_FIGHT_HEIGHT,
         travelSpeed = Config.CELL_DEFAULT_TRAVEL_SPEED,
         runs = 0,
@@ -4665,7 +4678,7 @@ State.cellFarmSection = F.createSection(State.cellFarmBody)
 State.cellFarmToggle = F.createToggle(
     State.cellFarmSection,
     "Full Auto The Cell Of Life",
-    "Cradle -> Release -> summon -> fight -> collect -> open Bundles -> keep Legendary/Mythic + whitelist -> sell -> hop -> resume.",
+    "Cradle -> physical E -> 1 -> 1 -> wait Cell -> fight -> collect -> open Bundles -> keep Legendary/Mythic + whitelist -> sell -> verify -> delayed hop -> resume.",
     false
 )
 
@@ -5538,32 +5551,46 @@ function F.getDropStandCFrame(drop)
     )
 end
 
-function F.pressLootInteractKey()
-    State.movementTelemetry.lastAction = "Press E fallback"
+function F.pressVirtualKey(keyCode, fallbackVirtualKey, holdSeconds, actionName)
+    if actionName then
+        State.movementTelemetry.lastAction =
+            tostring(actionName)
+    end
+
+    local hold =
+        math.max(
+            0.025,
+            tonumber(holdSeconds) or 0.06
+        )
+
     local virtualInput = nil
 
     pcall(function()
-        virtualInput = game:GetService("VirtualInputManager")
+        virtualInput =
+            game:GetService(
+                "VirtualInputManager"
+            )
     end)
 
     if virtualInput then
-        local success = pcall(function()
-            virtualInput:SendKeyEvent(
-                true,
-                Enum.KeyCode.E,
-                false,
-                game
-            )
+        local success =
+            pcall(function()
+                virtualInput:SendKeyEvent(
+                    true,
+                    keyCode,
+                    false,
+                    game
+                )
 
-            task.wait(0.045)
+                task.wait(hold)
 
-            virtualInput:SendKeyEvent(
-                false,
-                Enum.KeyCode.E,
-                false,
-                game
-            )
-        end)
+                virtualInput:SendKeyEvent(
+                    false,
+                    keyCode,
+                    false,
+                    game
+                )
+            end)
 
         if success then
             return true
@@ -5572,17 +5599,63 @@ function F.pressLootInteractKey()
 
     if type(keypress) == "function"
         and type(keyrelease) == "function"
+        and fallbackVirtualKey ~= nil
     then
-        local success = pcall(function()
-            keypress(0x45)
-            task.wait(0.045)
-            keyrelease(0x45)
-        end)
+        local success =
+            pcall(function()
+                keypress(
+                    fallbackVirtualKey
+                )
 
-        return success
+                task.wait(hold)
+
+                keyrelease(
+                    fallbackVirtualKey
+                )
+            end)
+
+        if success then
+            return true
+        end
     end
 
     return false
+end
+
+function F.cellFarmWait(token, seconds)
+    local deadline =
+        os.clock()
+        + math.max(
+            0,
+            tonumber(seconds) or 0
+        )
+
+    while os.clock() < deadline do
+        if not F.isCellFarmActive(token) then
+            return false
+        end
+
+        task.wait(
+            math.min(
+                0.05,
+                math.max(
+                    0.01,
+                    deadline - os.clock()
+                )
+            )
+        )
+    end
+
+    return F.isCellFarmActive(token)
+end
+
+function F.pressLootInteractKey()
+    return F.pressVirtualKey(
+        Enum.KeyCode.E,
+        0x45,
+        0.045,
+        "Press E fallback"
+    )
 end
 
 function F.getInteractPromptEvent()
@@ -15925,6 +15998,106 @@ function F.getCellRemotes()
     }
 end
 
+function F.isCellCradleDialogueVisible()
+    local playerGui =
+        LocalPlayer:FindFirstChildOfClass(
+            "PlayerGui"
+        )
+
+    if not playerGui then
+        return false
+    end
+
+    local dialogueGui =
+        playerGui:FindFirstChild(
+            "DialogueGui"
+        )
+
+    if dialogueGui then
+        for _, object in ipairs(
+            dialogueGui:GetDescendants()
+        ) do
+            if (
+                object:IsA("TextLabel")
+                or object:IsA("TextButton")
+            )
+                and F.isGuiObjectActuallyVisible
+                and F.isGuiObjectActuallyVisible(
+                    object
+                )
+            then
+                local textValue =
+                    string.lower(
+                        F.trimText(
+                            object.Text
+                        )
+                    )
+
+                if textValue == "the cradle"
+                    or textValue == "(release)"
+                    or string.find(
+                        textValue,
+                        "release",
+                        1,
+                        true
+                    )
+                then
+                    return true
+                end
+            end
+        end
+    end
+
+    return false
+end
+
+function F.waitForCellCradleDialogue(token, timeout)
+    local deadline =
+        os.clock()
+        + math.max(
+            0.1,
+            tonumber(timeout)
+                or Config.CELL_CRADLE_DIALOGUE_DETECT_TIMEOUT
+        )
+
+    while F.isCellFarmActive(token)
+        and os.clock() < deadline
+    do
+        if F.isCellCradleDialogueVisible() then
+            return true
+        end
+
+        task.wait(0.06)
+    end
+
+    return false
+end
+
+function F.waitForCellBossSpawn(token, timeout)
+    local deadline =
+        os.clock()
+        + math.max(
+            1,
+            tonumber(timeout)
+                or Config.CELL_SUMMON_TIMEOUT
+        )
+
+    while F.isCellFarmActive(token)
+        and os.clock() < deadline
+    do
+        local boss =
+            F.getCellBoss()
+
+        if boss then
+            return boss
+        end
+
+        task.wait(0.10)
+    end
+
+    return nil
+end
+
 function F.summonCellBoss(token)
     if not F.isCellFarmActive(token) then
         return false
@@ -15943,114 +16116,127 @@ function F.summonCellBoss(token)
     if not cradle
         or not cradle.Parent
     then
-        return false
-    end
-
-    local remotes =
-        F.getCellRemotes()
-
-    if not remotes
-        or not remotes.Dialog
-        or not remotes.Release
-        or not remotes.Crystal
-    then
         F.recordCellFailure(
-            "The Cradle remote contract is incomplete"
+            "The Cradle is not loaded"
         )
         return false
     end
 
     F.setCellFarmStage(
-        "RELEASE",
-        "Opening The Cradle"
+        "CRADLE INTERACT",
+        "Pressing E"
     )
 
-    local success, err =
-        pcall(function()
-            if remotes.Register then
-                remotes.Register:FireServer(
-                    "The Cradle"
-                )
-
-                task.wait(0.16)
-            end
-
-            if not F.isCellFarmActive(token) then
-                return
-            end
-
-            remotes.Dialog:FireServer(
-                "start",
-                cradle,
-                10
-            )
-
-            task.wait(0.18)
-
-            if not F.isCellFarmActive(token) then
-                return
-            end
-
-            remotes.Dialog:FireServer(
-                "option",
-                cradle,
-                5
-            )
-
-            task.wait(0.18)
-
-            if not F.isCellFarmActive(token) then
-                return
-            end
-
-            remotes.Release:FireServer(
-                nil,
-                nil
-            )
-
-            task.wait(0.18)
-
-            if not F.isCellFarmActive(token) then
-                return
-            end
-
-            remotes.Crystal:FireServer(
-                "SummonBoss",
-                nil
-            )
-        end)
-
-    if not success then
-        F.recordCellFailure(
-            "Cradle summon request failed: "
-                .. tostring(err)
+    local pressedE =
+        F.pressVirtualKey(
+            Enum.KeyCode.E,
+            0x45,
+            Config.CELL_CRADLE_KEY_HOLD,
+            "Cell Cradle: E"
         )
+
+    if not pressedE then
+        F.recordCellFailure(
+            "Could not send E to The Cradle"
+        )
+        return false
+    end
+
+    -- Prefer observing the dialogue, but never depend on GUI text alone.
+    -- This preserves the exact manual sequence even if the game changes the
+    -- dialogue label layout.
+    local dialogueSeen =
+        F.waitForCellCradleDialogue(
+            token,
+            Config.CELL_CRADLE_DIALOGUE_DETECT_TIMEOUT
+        )
+
+    if not dialogueSeen then
+        if not F.cellFarmWait(
+            token,
+            Config.CELL_CRADLE_AFTER_E_DELAY
+        ) then
+            return false
+        end
+    else
+        if not F.cellFarmWait(
+            token,
+            0.18
+        ) then
+            return false
+        end
+    end
+
+    F.setCellFarmStage(
+        "CRADLE RELEASE",
+        "Pressing 1"
+    )
+
+    local firstOne =
+        F.pressVirtualKey(
+            Enum.KeyCode.One,
+            0x31,
+            Config.CELL_CRADLE_KEY_HOLD,
+            "Cell Cradle: 1 (Release)"
+        )
+
+    if not firstOne then
+        F.recordCellFailure(
+            "Could not send first 1 to The Cradle dialogue"
+        )
+        return false
+    end
+
+    if not F.cellFarmWait(
+        token,
+        Config.CELL_CRADLE_AFTER_FIRST_ONE_DELAY
+    ) then
+        return false
+    end
+
+    F.setCellFarmStage(
+        "CRADLE SUMMON",
+        "Pressing 1 again"
+    )
+
+    local secondOne =
+        F.pressVirtualKey(
+            Enum.KeyCode.One,
+            0x31,
+            Config.CELL_CRADLE_KEY_HOLD,
+            "Cell Cradle: 1 (Summon)"
+        )
+
+    if not secondOne then
+        F.recordCellFailure(
+            "Could not send second 1 to The Cradle dialogue"
+        )
+        return false
+    end
+
+    if not F.cellFarmWait(
+        token,
+        Config.CELL_CRADLE_AFTER_SECOND_ONE_DELAY
+    ) then
         return false
     end
 
     State.movementTelemetry.lastRemote =
-        "The Cradle -> CradleRelease -> CellOfLifeCrystalInteraction(SummonBoss)"
+        "None - Cradle uses physical E -> 1 -> 1"
 
     F.setCellFarmStage(
         "WAITING FOR BOSS",
-        "Release sent; watching Workspace.Monsters"
+        "E -> 1 -> 1 complete; waiting for The Cell Of Life"
     )
 
-    local deadline =
-        os.clock()
-        + Config.CELL_SUMMON_TIMEOUT
+    local boss =
+        F.waitForCellBossSpawn(
+            token,
+            Config.CELL_SUMMON_TIMEOUT
+        )
 
-    while F.isCellFarmActive(token)
-        and os.clock() < deadline
-    do
-        local boss =
-            F.getCellBoss()
-
-        if boss then
-            return true, boss
-        end
-
-        task.wait(0.12)
+    if boss then
+        return true, boss
     end
 
     return false
@@ -16324,15 +16510,23 @@ function F.fireExactGuiConnection(button, signalName, sourceNeedle)
         then
             local fired = false
 
-            pcall(function()
-                if type(connection.Fire) == "function" then
-                    connection:Fire()
-                    fired = true
-                elseif type(fn) == "function" then
-                    fn()
-                    fired = true
-                end
-            end)
+            if type(fn) == "function" then
+                local okCall =
+                    pcall(
+                        fn
+                    )
+
+                fired = okCall
+            end
+
+            if not fired then
+                pcall(function()
+                    if type(connection.Fire) == "function" then
+                        connection:Fire()
+                        fired = true
+                    end
+                end)
+            end
 
             if fired then
                 State.cellFarm.menuCallbackAttempts =
@@ -16361,15 +16555,23 @@ function F.fireExactGuiConnection(button, signalName, sourceNeedle)
 
         local fired = false
 
-        pcall(function()
-            if type(fallback.Fire) == "function" then
-                fallback:Fire()
-                fired = true
-            elseif type(fn) == "function" then
-                fn()
-                fired = true
-            end
-        end)
+        if type(fn) == "function" then
+            local okCall =
+                pcall(
+                    fn
+                )
+
+            fired = okCall
+        end
+
+        if not fired then
+            pcall(function()
+                if type(fallback.Fire) == "function" then
+                    fallback:Fire()
+                    fired = true
+                end
+            end)
+        end
 
         if fired then
             State.cellFarm.menuCallbackAttempts =
@@ -16545,6 +16747,105 @@ function F.waitCellMenuCondition(token, predicate, timeout)
         )
 
     return ok and result == true
+end
+
+function F.runVerifiedCellMenuStep(
+    token,
+    button,
+    signalName,
+    sourceNeedle,
+    verifyCallback,
+    verifyTimeout,
+    statusText
+)
+    if not F.isCellFarmActive(token)
+        or not button
+        or not button.Parent
+    then
+        return false
+    end
+
+    local timeout =
+        math.max(
+            0.35,
+            tonumber(verifyTimeout) or 1
+        )
+
+    State.cellFarm.menuPhase =
+        tostring(statusText or "Menu step")
+
+    -- Attempt 1: invoke the exact game callback found by the tracer.
+    local callbackFired, callbackSource =
+        F.fireExactGuiConnection(
+            button,
+            signalName,
+            sourceNeedle
+        )
+
+    if callbackFired then
+        State.cellFarm.menuLastMethod =
+            "Direct callback"
+
+        State.cellFarm.menuLastCallback =
+            tostring(callbackSource or sourceNeedle)
+
+        if F.waitCellMenuCondition(
+            token,
+            verifyCallback,
+            timeout
+        ) then
+            return true
+        end
+    end
+
+    if not F.isCellFarmActive(token) then
+        return false
+    end
+
+    -- Attempt 2: actual VirtualInput mouse click on the exact traced button.
+    State.cellFarm.menuInputAttempts =
+        (State.cellFarm.menuInputAttempts or 0)
+        + 1
+
+    State.cellFarm.menuLastMethod =
+        "VirtualInput physical click"
+
+    F.clickGuiButtonPhysical(
+        button
+    )
+
+    if F.waitCellMenuCondition(
+        token,
+        verifyCallback,
+        timeout
+    ) then
+        return true
+    end
+
+    if not F.isCellFarmActive(token)
+        or not button.Parent
+    then
+        return false
+    end
+
+    -- Attempt 3: full signal + input compatibility path.
+    State.cellFarm.menuInputAttempts =
+        (State.cellFarm.menuInputAttempts or 0)
+        + 1
+
+    State.cellFarm.menuLastMethod =
+        "Signal/input fallback"
+
+    F.activateGuiButton(
+        button,
+        verifyCallback
+    )
+
+    return F.waitCellMenuCondition(
+        token,
+        verifyCallback,
+        timeout
+    )
 end
 
 function F.tryCellMenuRemoteProtocol()
@@ -16941,7 +17242,7 @@ function F.activateGuiButton(button, verifyCallback)
             game
         )
 
-        task.wait(0.03)
+        task.wait(0.14)
 
         virtualInput:SendMouseButtonEvent(
             center.X,
@@ -16952,7 +17253,7 @@ function F.activateGuiButton(button, verifyCallback)
             0
         )
 
-        task.wait(0.05)
+        task.wait(0.09)
 
         virtualInput:SendMouseButtonEvent(
             center.X,
@@ -17027,7 +17328,7 @@ function F.clickGuiButtonPhysical(button)
             game
         )
 
-        task.wait(0.03)
+        task.wait(0.14)
 
         virtualInput:SendMouseButtonEvent(
             center.X,
@@ -17038,7 +17339,7 @@ function F.clickGuiButtonPhysical(button)
             0
         )
 
-        task.wait(0.05)
+        task.wait(0.09)
 
         virtualInput:SendMouseButtonEvent(
             center.X,
@@ -17106,18 +17407,20 @@ function F.bootstrapCellMenu(token)
 
     State.cellFarm.menuProtocolAttempts = 0
     State.cellFarm.menuCallbackAttempts = 0
+    State.cellFarm.menuInputAttempts = 0
     State.cellFarm.menuLastCallback = "None"
+    State.cellFarm.menuLastMethod = "None"
 
     F.setCellFarmStage(
         "MENU BOOTSTRAP",
-        "Using traced local menu callbacks"
+        "Waiting for THE VEIL menu"
     )
 
     local deadline =
         os.clock()
         + Config.CELL_MENU_BOOTSTRAP_TIMEOUT
 
-    local lastActionAt = 0
+    local lastServerListRequest = 0
 
     while F.isCellFarmActive(token)
         and os.clock() < deadline
@@ -17125,181 +17428,157 @@ function F.bootstrapCellMenu(token)
         if F.isCellGameplayReady() then
             State.cellFarm.menuPhase =
                 "Gameplay"
+            State.cellFarm.menuLastMethod =
+                "Complete"
             return true
         end
 
-        local now = os.clock()
-
-        if now - lastActionAt < 0.25 then
-            task.wait(0.05)
-            continue
-        end
-
+        -- STEP 1: THE VEIL -> Endure.
         local mainEndure =
             F.getMainMenuEndureButton()
 
         if mainEndure then
-            State.cellFarm.menuPhase =
-                "Main Endure callback"
-
             F.setCellFarmStage(
                 "MENU BOOTSTRAP",
-                "Calling MainMenuGui.Handler"
+                "Main Endure"
             )
 
-            local fired =
-                F.fireExactGuiConnection(
+            local changed =
+                F.runVerifiedCellMenuStep(
+                    token,
                     mainEndure,
                     "MouseButton1Click",
-                    "mainmenugui.handler"
-                )
-
-            if not fired then
-                F.activateGuiButton(
-                    mainEndure,
+                    "mainmenugui.handler",
                     function()
                         return
-                            F.getSlotOneEndureButtonExact()
-                            ~= nil
-                    end
+                            F.getMainMenuEndureButton()
+                                == nil
+                            and F.getSlotOneEndureButtonExact()
+                                ~= nil
+                    end,
+                    1.35,
+                    "Main Endure"
                 )
+
+            if not changed then
+                State.cellFarm.menuLastMethod =
+                    "Main Endure did not transition"
+                task.wait(0.20)
             end
 
-            lastActionAt = os.clock()
-
-            F.waitCellMenuCondition(
-                token,
-                function()
-                    return
-                        F.getSlotOneEndureButtonExact()
-                        ~= nil
-                end,
-                1.25
-            )
-
-            task.wait(0.05)
             continue
         end
 
+        -- STEP 2: Save slot screen. The trace proves Slot 1's Endure
+        -- itself is the actionable button; there is no separate Slot 1 click.
         local slotEndure =
             F.getSlotOneEndureButtonExact()
 
         if slotEndure then
-            State.cellFarm.menuPhase =
-                "Slot 1 Endure callback"
-
             F.setCellFarmStage(
                 "MENU BOOTSTRAP",
-                "Calling SaveSlotMenu.SlotCard for Slot 1"
+                "Slot 1 Endure"
             )
 
-            local fired =
-                F.fireExactGuiConnection(
+            local changed =
+                F.runVerifiedCellMenuStep(
+                    token,
                     slotEndure,
                     "MouseButton1Click",
-                    "saveslotmenu.slotcard"
-                )
-
-            if not fired then
-                F.activateGuiButton(
-                    slotEndure,
+                    "saveslotmenu.slotcard",
                     function()
                         return
-                            F.isCellServerMenuVisible()
-                    end
+                            F.getSlotOneEndureButtonExact()
+                                == nil
+                            and F.isCellServerMenuVisible()
+                    end,
+                    1.85,
+                    "Slot 1 Endure"
                 )
+
+            if not changed then
+                State.cellFarm.menuLastMethod =
+                    "Slot 1 Endure did not transition"
+                task.wait(0.20)
             end
 
-            lastActionAt = os.clock()
-
-            F.waitCellMenuCondition(
-                token,
-                function()
-                    return
-                        F.getCurrentServerMenuButton()
-                        ~= nil
-                        or F.isCellServerMenuVisible()
-                end,
-                1.75
-            )
-
-            task.wait(0.05)
             continue
         end
 
+        -- STEP 3: Current Server card. Request the list only to populate
+        -- cards; the actual traced Current Server GUI callback enters play.
         if F.isCellServerMenuVisible() then
-            State.cellFarm.menuPhase =
-                "Current Server callback"
-
             local currentServer =
                 F.getCurrentServerMenuButton()
 
-            if currentServer then
-                F.setCellFarmStage(
-                    "MENU BOOTSTRAP",
-                    "Calling ServerMenu Current Server callback"
-                )
-
-                local fired =
-                    F.fireExactGuiConnection(
-                        currentServer,
-                        "Activated",
-                        "assets.scripts.servermenu"
-                    )
-
-                if not fired then
-                    F.activateGuiButton(
-                        currentServer,
-                        function()
-                            return
-                                F.isCellGameplayReady()
-                        end
-                    )
-                end
-
-                lastActionAt = os.clock()
-
-                if F.waitCellMenuCondition(
-                    token,
-                    function()
-                        return
-                            F.isCellGameplayReady()
-                    end,
-                    3.5
-                ) then
-                    State.cellFarm.menuPhase =
-                        "Gameplay"
-                    return true
-                end
-            else
-                local cellRemotes =
-                    F.getCellRemotes()
-
-                if cellRemotes
-                    and cellRemotes.ServerList
+            if not currentServer then
+                if os.clock()
+                    - lastServerListRequest
+                    >= 0.80
                 then
-                    pcall(function()
-                        cellRemotes.ServerList:FireServer()
-                    end)
+                    local cellRemotes =
+                        F.getCellRemotes()
 
-                    State.movementTelemetry.lastRemote =
-                        "RequestServerList (populate Current Server card)"
+                    if cellRemotes
+                        and cellRemotes.ServerList
+                    then
+                        pcall(function()
+                            cellRemotes.ServerList:FireServer()
+                        end)
+
+                        State.movementTelemetry.lastRemote =
+                            "RequestServerList (populate cards)"
+                    end
+
+                    lastServerListRequest =
+                        os.clock()
                 end
 
                 State.cellFarm.menuPhase =
                     "Waiting Current Server card"
 
-                lastActionAt = os.clock()
+                task.wait(0.12)
+                continue
             end
 
-            task.wait(0.10)
+            F.setCellFarmStage(
+                "MENU BOOTSTRAP",
+                "Current Server"
+            )
+
+            local changed =
+                F.runVerifiedCellMenuStep(
+                    token,
+                    currentServer,
+                    "Activated",
+                    "assets.scripts.servermenu",
+                    function()
+                        return
+                            F.isCellGameplayReady()
+                    end,
+                    4.0,
+                    "Current Server"
+                )
+
+            if changed then
+                State.cellFarm.menuPhase =
+                    "Gameplay"
+                State.cellFarm.menuLastMethod =
+                    "Complete"
+                return true
+            end
+
+            State.cellFarm.menuLastMethod =
+                "Current Server did not transition"
+
+            task.wait(0.25)
             continue
         end
 
         State.cellFarm.menuPhase =
             "Waiting menu transition"
 
-        task.wait(0.10)
+        task.wait(0.12)
     end
 
     State.cellFarm.menuPhase =
@@ -18548,6 +18827,84 @@ function F.collectCellSellCandidates()
     return result
 end
 
+function F.getCellInventorySignature()
+    local entries = {}
+
+    for _, item in ipairs(
+        F.collectInventoryItems()
+    ) do
+        if item and item.Parent then
+            local quantity =
+                F.getNightCallItemQuantity(
+                    item
+                )
+
+            table.insert(
+                entries,
+                string.lower(
+                    tostring(item.Name)
+                )
+                .. ":"
+                .. tostring(
+                    quantity ~= nil
+                    and quantity
+                    or 1
+                )
+            )
+        end
+    end
+
+    table.sort(entries)
+
+    return table.concat(
+        entries,
+        "|"
+    )
+end
+
+function F.waitForCellInventoryStable(token, stableWindow, maxWait)
+    local requiredStable =
+        math.max(
+            0.25,
+            tonumber(stableWindow)
+                or Config.CELL_INVENTORY_STABLE_WINDOW
+        )
+
+    local deadline =
+        os.clock()
+        + math.max(
+            requiredStable,
+            tonumber(maxWait) or 6
+        )
+
+    local signature =
+        F.getCellInventorySignature()
+
+    local stableSince =
+        os.clock()
+
+    while F.isCellFarmActive(token)
+        and os.clock() < deadline
+    do
+        task.wait(0.12)
+
+        local nextSignature =
+            F.getCellInventorySignature()
+
+        if nextSignature ~= signature then
+            signature = nextSignature
+            stableSince = os.clock()
+        elseif os.clock() - stableSince
+            >= requiredStable
+        then
+            return true
+        end
+    end
+
+    return
+        F.isCellFarmActive(token)
+end
+
 function F.sellCellInventory(token)
     F.setCellFarmStage(
         "SELLING",
@@ -18677,6 +19034,10 @@ function F.updateCellFarmUI()
         .. tostring(State.cellFarm.menuPhase)
         .. " | Callback attempts: "
         .. tostring(State.cellFarm.menuCallbackAttempts or 0)
+        .. " | Input attempts: "
+        .. tostring(State.cellFarm.menuInputAttempts or 0)
+        .. "\nMenu method: "
+        .. tostring(State.cellFarm.menuLastMethod or "None")
         .. "\nLast callback: "
         .. tostring(State.cellFarm.menuLastCallback or "None")
         .. "\nWeapon: "
@@ -18882,8 +19243,35 @@ function F.runCellFarm(token, resumed)
         return false
     end
 
+    F.setCellFarmStage(
+        "LOOT SETTLE",
+        "Waiting for collected drops to finish syncing"
+    )
+
+    if not F.cellFarmWait(
+        token,
+        Config.CELL_POST_LOOT_SETTLE
+    ) then
+        return false
+    end
+
     F.openCellBundles(
         token
+    )
+
+    if not F.isCellFarmActive(token) then
+        return false
+    end
+
+    F.setCellFarmStage(
+        "BUNDLE SETTLE",
+        "Waiting for bundle rewards to finish syncing"
+    )
+
+    F.waitForCellInventoryStable(
+        token,
+        Config.CELL_INVENTORY_STABLE_WINDOW,
+        Config.CELL_POST_BUNDLE_SETTLE + 4
     )
 
     if not F.isCellFarmActive(token) then
@@ -18902,6 +19290,61 @@ function F.runCellFarm(token, resumed)
     end
 
     if not F.isCellFarmActive(token) then
+        return false
+    end
+
+    F.setCellFarmStage(
+        "VERIFY INVENTORY",
+        "Waiting for sell/filter changes to settle"
+    )
+
+    F.waitForCellInventoryStable(
+        token,
+        Config.CELL_INVENTORY_STABLE_WINDOW,
+        Config.CELL_POST_SELL_SETTLE + 5
+    )
+
+    if not F.isCellFarmActive(token) then
+        return false
+    end
+
+    local remainingSellable =
+        F.collectCellSellCandidates()
+
+    if #remainingSellable > 0 then
+        F.setCellFarmStage(
+            "SELL VERIFY RETRY",
+            "Found remaining sellable items"
+        )
+
+        F.sellCellInventory(
+            token
+        )
+
+        if not F.isCellFarmActive(token) then
+            return false
+        end
+
+        F.waitForCellInventoryStable(
+            token,
+            Config.CELL_INVENTORY_STABLE_WINDOW,
+            Config.CELL_POST_SELL_SETTLE + 4
+        )
+    end
+
+    if not F.isCellFarmActive(token) then
+        return false
+    end
+
+    F.setCellFarmStage(
+        "READY TO HOP",
+        "Loot, bundles, filtering and selling complete"
+    )
+
+    if not F.cellFarmWait(
+        token,
+        Config.CELL_PRE_HOP_DELAY
+    ) then
         return false
     end
 
@@ -22939,7 +23382,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics 30 FPS / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("Drops v6.4.3: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
+print("Drops v6.4.5: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -22959,14 +23402,14 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.4.3.")
+    warn("[The Veil Hub] loadstring is required to launch v6.4.5.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.4.3 compile failed:", compileError)
+    warn("[The Veil Hub] v6.4.5 compile failed:", compileError)
     return
 end
 
