@@ -1,6 +1,6 @@
--- The Veil Hub v6.4.14 Lower Menu Aim + Cradle Handshake
+-- The Veil Hub v6.4.17 Verified Dialog + Boss State
 -- Upload this entire file to your public GitHub "V" file.
--- Your short loadstring loader remains unchanged.
+-- The short public GitHub loadstring remains unchanged.
 
 local runtimeSource = [==============[
 -- =========================================================
@@ -277,12 +277,21 @@ local Config = {
     CELL_MENU_PHYSICAL_RETRIES = 4,
     CELL_MENU_PHYSICAL_VERIFY = 1.50,
     CELL_MENU_PHYSICAL_RETRY_DELAY = 1.00,
-    CELL_MENU_MOUSE_Y_OFFSETS = {8, 12, 5, 0},
+    CELL_MENU_MOUSE_Y_OFFSETS = {20, 24, 16, 28},
+    CELL_MENU_HUB_HIDE_SETTLE = 0.45,
 
-    CELL_CRADLE_DIALOG_ATTEMPTS = 3,
+    CELL_DAILY_REWARD_CLOSE_WINDOW = 15.0,
+    CELL_DAILY_REWARD_CLOSE_INTERVAL = 0.20,
+
+    CELL_CRADLE_DIALOG_ATTEMPTS = 4,
     CELL_CRADLE_PREP_E_HOLD = 0.08,
     CELL_CRADLE_PREP_E_DELAY = 0.35,
-    CELL_CRADLE_DIALOG_VISIBLE_WAIT = 1.80,
+    CELL_CRADLE_DIALOG_VISIBLE_WAIT = 5.00,
+    CELL_CRADLE_RELEASE_SETTLE = 0.12,
+    CELL_CRADLE_RELEASE_CONFIRM_WAIT = 4.00,
+    CELL_CRADLE_OPTION_RETRIES = 2,
+    CELL_CRADLE_BOSS_MODEL_WAIT = 30.0,
+    CELL_CRADLE_BOSS_ALIVE_WAIT = 10.0,
     CELL_CRADLE_RETRY_DELAY = 1.25,
 
     CELL_CRADLE_TRAVEL_INPUT_HOLD = 0.12,
@@ -322,7 +331,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.4.14 Lower Menu Aim + Cradle Handshake",
+    HUB_VERSION = "v6.4.17 Verified Dialog + Boss State",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -712,7 +721,20 @@ local State = {
         menuLastCallback = "None",
         menuLastMethod = "None",
         menuLastHit = "None",
+        launchFromMenu = false,
+        dailyRewardStatus = "Not checked",
         cradleTravelInput = "OFF",
+        dialogStartSent = false,
+        dialogUiConfirmed = false,
+        dialogReleaseVisible = false,
+        dialogOptionSent = false,
+        dialogOptionConfirmed = false,
+        dialogClientEvents = 0,
+        dialogLastClientEvent = "None",
+        bossSpawnConfirmed = false,
+        bossSpawnSource = "None",
+        bossSpawnRemoteEvents = 0,
+        bossLastSpawnEvent = "None",
         fightHeight = Config.CELL_DEFAULT_FIGHT_HEIGHT,
         travelSpeed = Config.CELL_DEFAULT_TRAVEL_SPEED,
         runs = 0,
@@ -4854,7 +4876,7 @@ State.cellStopButton = F.createActionRow(
     "STOP NOW"
 )
 
-State.cellStatusCard = F.createCard(State.cellFarmSection, 296)
+State.cellStatusCard = F.createCard(State.cellFarmSection, 340)
 State.cellStatusLabel = F.createTextLabel(
     State.cellStatusCard,
     "Cell Farm: OFF",
@@ -4870,10 +4892,53 @@ State.cellStatusLabel.TextYAlignment = Enum.TextYAlignment.Top
 
 State.cellFarmToggle:OnChanged(function(state)
     if state then
-        if F.startCellFarm then
+        local fromMenu =
+            false
+
+        if F.isAnyCellMenuStageVisible
+            and F.isAnyCellMenuStageVisible()
+        then
+            fromMenu = true
+        elseif F.isCellGameplayReady
+            and not F.isCellGameplayReady()
+        then
+            fromMenu = true
+        end
+
+        State.cellFarm.launchFromMenu =
+            fromMenu
+
+        if fromMenu
+            and F.setCellMenuHubHidden
+        then
+            -- Hide the Hub before any menu mouse input is sent.
+            F.setCellMenuHubHidden(
+                true
+            )
+
+            task.delay(
+                Config.CELL_MENU_HUB_HIDE_SETTLE,
+                function()
+                    if F.startCellFarm then
+                        F.startCellFarm(
+                            false
+                        )
+                    end
+                end
+            )
+        elseif F.startCellFarm then
             F.startCellFarm(false)
         end
     elseif F.stopCellFarm then
+        State.cellFarm.launchFromMenu =
+            false
+
+        if F.setCellMenuHubHidden then
+            F.setCellMenuHubHidden(
+                false
+            )
+        end
+
         F.stopCellFarm(true, "Stopped by user")
     end
 end)
@@ -16330,17 +16395,21 @@ function F.getCellRemotes()
             Remotes:FindFirstChild(
                 "AnalyticsReport"
             ),
+        BossSpawnLabel =
+            Remotes:FindFirstChild(
+                "BossSpawnLabelEvent"
+            ),
     }
 end
 
-function F.isCellCradleDialogueVisible()
+function F.getCellCradleDialogueEvidence()
     local playerGui =
         LocalPlayer:FindFirstChildOfClass(
             "PlayerGui"
         )
 
     if not playerGui then
-        return false
+        return false, false, nil, "PlayerGui missing"
     end
 
     local dialogueGui =
@@ -16348,90 +16417,607 @@ function F.isCellCradleDialogueVisible()
             "DialogueGui"
         )
 
-    if dialogueGui then
-        for _, object in ipairs(
-            dialogueGui:GetDescendants()
-        ) do
-            if (
-                object:IsA("TextLabel")
-                or object:IsA("TextButton")
-            )
-                and F.isGuiObjectActuallyVisible
-                and F.isGuiObjectActuallyVisible(
+    if not dialogueGui then
+        return false, false, nil, "DialogueGui missing"
+    end
+
+    local guiVisible = true
+
+    if dialogueGui:IsA("ScreenGui") then
+        guiVisible =
+            dialogueGui.Enabled
+    end
+
+    if not guiVisible then
+        return false, false, nil, "DialogueGui disabled"
+    end
+
+    local cradleSeen = false
+    local releaseSeen = false
+    local releaseButton = nil
+    local evidence = {}
+
+    local function objectVisible(object)
+        if F.isGuiObjectActuallyVisible then
+            return
+                F.isGuiObjectActuallyVisible(
                     object
                 )
+        end
+
+        return true
+    end
+
+    local function findButtonAncestor(object)
+        local current = object
+
+        for _ = 1, 6 do
+            if not current
+                or current == dialogueGui
             then
-                local textValue =
-                    string.lower(
-                        F.trimText(
-                            object.Text
-                        )
+                break
+            end
+
+            if current:IsA("GuiButton") then
+                return current
+            end
+
+            current = current.Parent
+        end
+
+        return nil
+    end
+
+    for _, object in ipairs(
+        dialogueGui:GetDescendants()
+    ) do
+        if (
+            object:IsA("TextLabel")
+            or object:IsA("TextButton")
+        )
+            and objectVisible(
+                object
+            )
+        then
+            local rawText =
+                F.trimText(
+                    object.Text
+                )
+
+            local textValue =
+                string.lower(
+                    rawText
+                )
+
+            if string.find(
+                textValue,
+                "cradle",
+                1,
+                true
+            ) then
+                cradleSeen = true
+
+                if #evidence < 4 then
+                    table.insert(
+                        evidence,
+                        rawText
+                    )
+                end
+            end
+
+            if string.find(
+                textValue,
+                "release",
+                1,
+                true
+            ) then
+                releaseSeen = true
+
+                releaseButton =
+                    releaseButton
+                    or findButtonAncestor(
+                        object
                     )
 
-                if textValue == "the cradle"
-                    or textValue == "(release)"
-                    or string.find(
-                        textValue,
-                        "release",
-                        1,
-                        true
+                if #evidence < 4 then
+                    table.insert(
+                        evidence,
+                        rawText
                     )
-                then
-                    return true
                 end
             end
         end
     end
 
-    return false
+    if releaseSeen then
+        return
+            true,
+            true,
+            releaseButton,
+            "Release visible"
+            .. (
+                #evidence > 0
+                and (
+                    " | "
+                    .. table.concat(
+                        evidence,
+                        " / "
+                    )
+                )
+                or ""
+            )
+    end
+
+    if cradleSeen then
+        return
+            true,
+            false,
+            nil,
+            "Cradle dialogue visible"
+            .. (
+                #evidence > 0
+                and (
+                    " | "
+                    .. table.concat(
+                        evidence,
+                        " / "
+                    )
+                )
+                or ""
+            )
+    end
+
+    return
+        true,
+        false,
+        nil,
+        "DialogueGui visible; Release not rendered yet"
 end
 
-function F.waitForCellCradleDialogue(token, timeout)
+function F.isCellCradleDialogueVisible()
+    local visible =
+        F.getCellCradleDialogueEvidence()
+
+    return visible == true
+end
+
+function F.findCellCradleReleaseButton()
+    local _,
+        releaseVisible,
+        releaseButton =
+            F.getCellCradleDialogueEvidence()
+
+    if releaseVisible then
+        return releaseButton
+    end
+
+    return nil
+end
+
+function F.waitForCellCradleDialogue(
+    token,
+    timeout,
+    requireRelease
+)
     local deadline =
         os.clock()
         + math.max(
             0.1,
             tonumber(timeout)
-                or Config.CELL_CRADLE_DIALOGUE_DETECT_TIMEOUT
+                or Config.CELL_CRADLE_DIALOG_VISIBLE_WAIT
         )
+
+    local lastDetail =
+        "Waiting"
 
     while F.isCellFarmActive(token)
         and os.clock() < deadline
     do
-        if F.isCellCradleDialogueVisible() then
-            return true
+        local visible,
+            releaseVisible,
+            releaseButton,
+            detail =
+                F.getCellCradleDialogueEvidence()
+
+        lastDetail =
+            detail
+            or lastDetail
+
+        if visible
+            and (
+                requireRelease ~= true
+                or releaseVisible
+            )
+        then
+            return
+                true,
+                releaseVisible,
+                releaseButton,
+                lastDetail
         end
 
-        task.wait(0.06)
+        task.wait(0.05)
     end
 
-    return false
+    return
+        false,
+        false,
+        nil,
+        lastDetail
 end
 
-function F.waitForCellBossSpawn(token, timeout)
+function F.describeCellEventArgs(...)
+    local args = {...}
+    local parts = {}
+
+    for index = 1,
+        math.min(
+            #args,
+            5
+        )
+    do
+        local value =
+            args[index]
+
+        local description = nil
+
+        if typeof(value) == "Instance" then
+            description =
+                value.ClassName
+                .. ":"
+                .. value:GetFullName()
+        else
+            description =
+                tostring(value)
+        end
+
+        if #description > 80 then
+            description =
+                string.sub(
+                    description,
+                    1,
+                    77
+                )
+                .. "..."
+        end
+
+        table.insert(
+            parts,
+            tostring(index)
+                .. "="
+                .. description
+        )
+    end
+
+    return
+        #parts > 0
+        and table.concat(
+            parts,
+            " | "
+        )
+        or "(no args)"
+end
+
+function F.startCellDialogObserver(dialogRemote)
+    if not dialogRemote
+        or not dialogRemote:IsA("RemoteEvent")
+    then
+        return nil
+    end
+
+    local connection = nil
+
+    local ok =
+        pcall(function()
+            connection =
+                dialogRemote.OnClientEvent:Connect(
+                    function(...)
+                        State.cellFarm.dialogClientEvents =
+                            (
+                                State.cellFarm.dialogClientEvents
+                                or 0
+                            )
+                            + 1
+
+                        State.cellFarm.dialogLastClientEvent =
+                            F.describeCellEventArgs(
+                                ...
+                            )
+
+                        if F.updateCellFarmUI then
+                            F.updateCellFarmUI()
+                        end
+                    end
+                )
+        end)
+
+    if not ok then
+        return nil
+    end
+
+    return connection
+end
+
+function F.findCellBossModelRaw()
+    local monsters =
+        F.findMonstersFolder
+        and F.findMonstersFolder()
+        or workspace:FindFirstChild(
+            "Monsters"
+        )
+
+    if not monsters then
+        return nil
+    end
+
+    local direct =
+        monsters:FindFirstChild(
+            "The Cell Of Life"
+        )
+
+    if direct
+        and direct:IsA("Model")
+    then
+        return direct
+    end
+
+    for _, object in ipairs(
+        monsters:GetChildren()
+    ) do
+        if object:IsA("Model")
+            and tostring(
+                object.Name
+            ) == "The Cell Of Life"
+        then
+            return object
+        end
+    end
+
+    return nil
+end
+
+function F.startCellBossSpawnWatcher(remotes)
+    local watcher = {
+        model = nil,
+        source = "None",
+        childConnection = nil,
+        remoteConnection = nil,
+    }
+
+    local monsters =
+        F.findMonstersFolder
+        and F.findMonstersFolder()
+        or workspace:FindFirstChild(
+            "Monsters"
+        )
+
+    local existing =
+        F.findCellBossModelRaw()
+
+    if existing then
+        watcher.model = existing
+        watcher.source = "Existing model"
+    end
+
+    if monsters then
+        pcall(function()
+            watcher.childConnection =
+                monsters.ChildAdded:Connect(
+                    function(object)
+                        if object:IsA("Model")
+                            and tostring(
+                                object.Name
+                            ) == "The Cell Of Life"
+                        then
+                            watcher.model =
+                                object
+
+                            watcher.source =
+                                "workspace.Monsters.ChildAdded"
+
+                            State.cellFarm.bossSpawnConfirmed =
+                                true
+
+                            State.cellFarm.bossSpawnSource =
+                                watcher.source
+
+                            if F.updateCellFarmUI then
+                                F.updateCellFarmUI()
+                            end
+                        end
+                    end
+                )
+        end)
+    end
+
+    local bossSpawnRemote =
+        remotes
+        and remotes.BossSpawnLabel
+
+    if bossSpawnRemote
+        and bossSpawnRemote:IsA(
+            "RemoteEvent"
+        )
+    then
+        pcall(function()
+            watcher.remoteConnection =
+                bossSpawnRemote.OnClientEvent:Connect(
+                    function(...)
+                        State.cellFarm.bossSpawnRemoteEvents =
+                            (
+                                State.cellFarm.bossSpawnRemoteEvents
+                                or 0
+                            )
+                            + 1
+
+                        State.cellFarm.bossLastSpawnEvent =
+                            F.describeCellEventArgs(
+                                ...
+                            )
+
+                        if F.updateCellFarmUI then
+                            F.updateCellFarmUI()
+                        end
+                    end
+                )
+        end)
+    end
+
+    return watcher
+end
+
+function F.stopCellBossSpawnWatcher(watcher)
+    if not watcher then
+        return
+    end
+
+    for _, key in ipairs({
+        "childConnection",
+        "remoteConnection",
+    }) do
+        local connection =
+            watcher[key]
+
+        if connection then
+            pcall(function()
+                connection:Disconnect()
+            end)
+
+            watcher[key] = nil
+        end
+    end
+end
+
+function F.waitForCellBossConfirmed(
+    token,
+    watcher,
+    timeout
+)
     local deadline =
         os.clock()
         + math.max(
             1,
             tonumber(timeout)
-                or Config.CELL_SUMMON_TIMEOUT
+                or Config.CELL_CRADLE_BOSS_MODEL_WAIT
         )
+
+    local rawModel = nil
 
     while F.isCellFarmActive(token)
         and os.clock() < deadline
+    do
+        rawModel =
+            (
+                watcher
+                and watcher.model
+            )
+            or F.findCellBossModelRaw()
+
+        if rawModel
+            and rawModel.Parent
+        then
+            if State.cellFarm.bossSpawnSource
+                == "None"
+            then
+                State.cellFarm.bossSpawnSource =
+                    watcher
+                    and watcher.source
+                    or "Polling"
+            end
+
+            State.cellFarm.bossSpawnConfirmed =
+                true
+
+            break
+        end
+
+        task.wait(0.05)
+    end
+
+    if not rawModel
+        or not rawModel.Parent
+    then
+        return nil
+    end
+
+    F.setCellFarmStage(
+        "BOSS MODEL CONFIRMED",
+        "The Cell Of Life model exists; waiting for alive state"
+    )
+
+    local aliveDeadline =
+        os.clock()
+        + Config.CELL_CRADLE_BOSS_ALIVE_WAIT
+
+    while F.isCellFarmActive(token)
+        and os.clock() < aliveDeadline
     do
         local boss =
             F.getCellBoss()
 
         if boss then
-            return boss
+            local hp,
+                maxHp =
+                    F.getCellBossHealth(
+                        boss
+                    )
+
+            if maxHp > 0
+                and hp > 0
+            then
+                State.cellFarm.bossSpawnConfirmed =
+                    true
+
+                State.cellFarm.bossSpawnSource =
+                    (
+                        State.cellFarm.bossSpawnSource
+                        ~= "None"
+                    )
+                    and State.cellFarm.bossSpawnSource
+                    or "Alive polling"
+
+                State.cellFarm.status =
+                    "Boss confirmed alive: "
+                    .. string.format(
+                        "%.0f / %.0f HP",
+                        hp,
+                        maxHp
+                    )
+
+                if F.updateCellFarmUI then
+                    F.updateCellFarmUI()
+                end
+
+                return boss
+            end
         end
 
-        task.wait(0.10)
+        task.wait(0.08)
     end
 
     return nil
 end
+
+function F.waitForCellBossSpawn(token, timeout)
+    local watcher =
+        F.startCellBossSpawnWatcher(
+            F.getCellRemotes()
+        )
+
+    local boss =
+        F.waitForCellBossConfirmed(
+            token,
+            watcher,
+            timeout
+        )
+
+    F.stopCellBossSpawnWatcher(
+        watcher
+    )
+
+    return boss
+end
+
 
 function F.getCellCradleDialogTargets()
     local npcCradle = nil
@@ -16656,32 +17242,53 @@ function F.summonCellBoss(token)
         return false
     end
 
-    local existing = F.getCellBoss()
+    local existing =
+        F.getCellBoss()
 
     if existing then
+        State.cellFarm.bossSpawnConfirmed =
+            true
+
+        State.cellFarm.bossSpawnSource =
+            "Already present"
+
         return true, existing
     end
 
-    local remotes = F.getCellRemotes()
+    local remotes =
+        F.getCellRemotes()
 
-    if not remotes or not remotes.Dialog then
-        F.recordCellFailure("DialogEvent is unavailable")
-        return false
-    end
-
-    local npcCradle, worldCradle =
-        F.waitForCellCradleDialogTargets(
-            token,
-            Config.CELL_CRADLE_TARGET_WAIT
+    if not remotes
+        or not remotes.Dialog
+    then
+        F.recordCellFailure(
+            "DialogEvent is unavailable"
         )
-
-    if not npcCradle or not npcCradle.Parent then
-        F.recordCellFailure('workspace.NPCs["The Cradle"] is unavailable')
         return false
     end
 
-    if not worldCradle or not worldCradle.Parent then
-        F.recordCellFailure('workspace.Systems.CellOfLifeJunk["The Cradle"] is unavailable')
+    local npcCradle,
+        worldCradle =
+            F.waitForCellCradleDialogTargets(
+                token,
+                Config.CELL_CRADLE_TARGET_WAIT
+            )
+
+    if not npcCradle
+        or not npcCradle.Parent
+    then
+        F.recordCellFailure(
+            'workspace.NPCs["The Cradle"] is unavailable'
+        )
+        return false
+    end
+
+    if not worldCradle
+        or not worldCradle.Parent
+    then
+        F.recordCellFailure(
+            'workspace.Systems.CellOfLifeJunk["The Cradle"] is unavailable'
+        )
         return false
     end
 
@@ -16693,177 +17300,418 @@ function F.summonCellBoss(token)
         return false
     end
 
-    for attempt = 1, Config.CELL_CRADLE_DIALOG_ATTEMPTS do
+    State.cellFarm.dialogStartSent = false
+    State.cellFarm.dialogUiConfirmed = false
+    State.cellFarm.dialogReleaseVisible = false
+    State.cellFarm.dialogOptionSent = false
+    State.cellFarm.dialogOptionConfirmed = false
+    State.cellFarm.dialogClientEvents = 0
+    State.cellFarm.dialogLastClientEvent = "None"
+    State.cellFarm.bossSpawnConfirmed = false
+    State.cellFarm.bossSpawnSource = "None"
+    State.cellFarm.bossSpawnRemoteEvents = 0
+    State.cellFarm.bossLastSpawnEvent = "None"
+
+    local dialogObserver =
+        F.startCellDialogObserver(
+            remotes.Dialog
+        )
+
+    local bossWatcher =
+        F.startCellBossSpawnWatcher(
+            remotes
+        )
+
+    local function cleanup()
+        if dialogObserver then
+            pcall(function()
+                dialogObserver:Disconnect()
+            end)
+
+            dialogObserver = nil
+        end
+
+        F.stopCellBossSpawnWatcher(
+            bossWatcher
+        )
+    end
+
+    for attempt = 1,
+        Config.CELL_CRADLE_DIALOG_ATTEMPTS
+    do
         if not F.isCellFarmActive(token) then
+            cleanup()
             return false
         end
 
-        local bossNow = F.getCellBoss()
+        local bossNow =
+            F.getCellBoss()
+
         if bossNow then
+            State.cellFarm.bossSpawnConfirmed =
+                true
+
+            State.cellFarm.bossSpawnSource =
+                "Detected before dialogue attempt"
+
+            cleanup()
             return true, bossNow
         end
 
-        local refreshedNpc, refreshedWorld = F.getCellCradleDialogTargets()
+        local refreshedNpc,
+            refreshedWorld =
+                F.getCellCradleDialogTargets()
 
-        if refreshedNpc and refreshedNpc.Parent then
-            npcCradle = refreshedNpc
-        end
-
-        if refreshedWorld and refreshedWorld.Parent then
-            worldCradle = refreshedWorld
-        end
-
-        if not npcCradle or not npcCradle.Parent
-            or not worldCradle or not worldCradle.Parent
+        if refreshedNpc
+            and refreshedNpc.Parent
         then
-            F.recordCellFailure("Cradle dialogue target disappeared")
+            npcCradle =
+                refreshedNpc
+        end
+
+        if refreshedWorld
+            and refreshedWorld.Parent
+        then
+            worldCradle =
+                refreshedWorld
+        end
+
+        if not npcCradle
+            or not npcCradle.Parent
+            or not worldCradle
+            or not worldCradle.Parent
+        then
+            cleanup()
+
+            F.recordCellFailure(
+                "Cradle dialogue target disappeared"
+            )
+
             return false
         end
 
-        if not F.settleCellAtCradle(token) then
+        if not F.settleCellAtCradle(
+            token
+        ) then
+            cleanup()
             return false
         end
+
+        State.cellFarm.dialogStartSent =
+            false
+        State.cellFarm.dialogUiConfirmed =
+            false
+        State.cellFarm.dialogReleaseVisible =
+            false
+        State.cellFarm.dialogOptionSent =
+            false
+        State.cellFarm.dialogOptionConfirmed =
+            false
 
         F.setCellFarmStage(
-            "CRADLE INTERACT",
-            "E + register + dialog start "
+            "DIALOG START SENT",
+            "Sending start and waiting for real Release UI "
                 .. tostring(attempt)
                 .. "/"
-                .. tostring(Config.CELL_CRADLE_DIALOG_ATTEMPTS)
+                .. tostring(
+                    Config.CELL_CRADLE_DIALOG_ATTEMPTS
+                )
         )
 
-        F.pressVirtualKey(
-            Enum.KeyCode.E,
-            0x45,
-            Config.CELL_CRADLE_PREP_E_HOLD,
-            "Cradle pre-dialogue E"
-        )
-
-        if not F.cellFarmWait(
-            token,
-            Config.CELL_CRADLE_PREP_E_DELAY
-        ) then
-            return false
-        end
-
-        if remotes.Register then
+        local startOk =
             pcall(function()
-                remotes.Register:FireServer("The Cradle")
+                remotes.Dialog:FireServer(
+                    "start",
+                    npcCradle,
+                    10
+                )
             end)
 
-            State.movementTelemetry.lastRemote =
-                'RegisterNPCInteraction("The Cradle")'
-        end
+        State.cellFarm.dialogStartSent =
+            startOk == true
 
-        task.wait(0.12)
-
-        F.setCellFarmStage(
-            "CRADLE DIALOG START",
-            'DialogEvent("start", NPCs["The Cradle"], 10)'
-        )
-
-        local startOk = pcall(function()
-            remotes.Dialog:FireServer(
-                "start",
-                npcCradle,
-                10
+        if not startOk then
+            F.recordCellFailure(
+                "Cradle DialogEvent start failed"
             )
-        end)
-
-        if startOk then
+        else
             State.movementTelemetry.lastRemote =
                 'DialogEvent("start", workspace.NPCs["The Cradle"], 10)'
-        else
-            F.recordCellFailure("Cradle DialogEvent start failed")
         end
-
-        local dialogueVisible =
-            F.waitForCellCradleDialogue(
-                token,
-                Config.CELL_CRADLE_DIALOG_VISIBLE_WAIT
-            )
-
-        State.cellFarm.status =
-            dialogueVisible
-            and "Cradle dialogue visible"
-            or "Cradle dialogue not visible; continuing handshake"
 
         if F.updateCellFarmUI then
             F.updateCellFarmUI()
         end
 
+        -- This is the authoritative start confirmation. We do NOT send
+        -- option merely because FireServer returned without error.
+        local dialogueConfirmed,
+            releaseVisible,
+            releaseButton,
+            dialogueDetail =
+                F.waitForCellCradleDialogue(
+                    token,
+                    Config.CELL_CRADLE_DIALOG_VISIBLE_WAIT,
+                    true
+                )
+
+        State.cellFarm.dialogUiConfirmed =
+            dialogueConfirmed == true
+
+        State.cellFarm.dialogReleaseVisible =
+            releaseVisible == true
+
+        State.cellFarm.status =
+            dialogueConfirmed
+            and (
+                "CONFIRMED: Release UI rendered"
+                .. (
+                    releaseButton
+                    and (
+                        " | "
+                        .. releaseButton:GetFullName()
+                    )
+                    or ""
+                )
+            )
+            or (
+                "NOT CONFIRMED: "
+                .. tostring(
+                    dialogueDetail
+                )
+            )
+
+        if F.updateCellFarmUI then
+            F.updateCellFarmUI()
+        end
+
+        if not dialogueConfirmed
+            or not releaseVisible
+        then
+            F.setCellFarmStage(
+                "DIALOG NOT CONFIRMED",
+                "Start was sent but Release UI did not appear"
+            )
+
+            if attempt
+                < Config.CELL_CRADLE_DIALOG_ATTEMPTS
+            then
+                if not F.cellFarmWait(
+                    token,
+                    Config.CELL_CRADLE_RETRY_DELAY
+                ) then
+                    cleanup()
+                    return false
+                end
+
+                continue
+            end
+
+            cleanup()
+            return false
+        end
+
+        -- Release is now proven to exist on the player's actual DialogueGui.
+        -- The captured option remote is only allowed after this confirmation.
         if not F.cellFarmWait(
             token,
-            Config.CELL_CRADLE_START_TO_OPTION_DELAY
+            Config.CELL_CRADLE_RELEASE_SETTLE
         ) then
+            cleanup()
             return false
         end
 
-        local _, latestWorld = F.getCellCradleDialogTargets()
+        local optionConfirmed = false
 
-        if latestWorld and latestWorld.Parent then
-            worldCradle = latestWorld
-        end
+        for optionAttempt = 1,
+            Config.CELL_CRADLE_OPTION_RETRIES
+        do
+            if not F.isCellFarmActive(token) then
+                cleanup()
+                return false
+            end
 
-        if not worldCradle or not worldCradle.Parent then
-            F.recordCellFailure("Cradle option target disappeared")
-            return false
-        end
+            local _,
+                latestWorld =
+                    F.getCellCradleDialogTargets()
 
-        F.setCellFarmStage(
-            "CRADLE DIALOG OPTION",
-            'DialogEvent("option", CellOfLifeJunk["The Cradle"], 5)'
-        )
+            if latestWorld
+                and latestWorld.Parent
+            then
+                worldCradle =
+                    latestWorld
+            end
 
-        local optionOk = pcall(function()
-            remotes.Dialog:FireServer(
-                "option",
-                worldCradle,
-                5
+            if not worldCradle
+                or not worldCradle.Parent
+            then
+                cleanup()
+
+                F.recordCellFailure(
+                    "Cradle option target disappeared"
+                )
+
+                return false
+            end
+
+            F.setCellFarmStage(
+                "RELEASE CONFIRMED",
+                "Release UI exists; sending exact option remote "
+                    .. tostring(optionAttempt)
+                    .. "/"
+                    .. tostring(
+                        Config.CELL_CRADLE_OPTION_RETRIES
+                    )
             )
-        end)
 
-        if optionOk then
-            State.movementTelemetry.lastRemote =
-                'DialogEvent("option", workspace.Systems.CellOfLifeJunk["The Cradle"], 5)'
-        else
-            F.recordCellFailure("Cradle DialogEvent option failed")
+            local optionOk =
+                pcall(function()
+                    remotes.Dialog:FireServer(
+                        "option",
+                        worldCradle,
+                        5
+                    )
+                end)
+
+            State.cellFarm.dialogOptionSent =
+                optionOk == true
+
+            if optionOk then
+                State.movementTelemetry.lastRemote =
+                    'DialogEvent("option", workspace.Systems.CellOfLifeJunk["The Cradle"], 5)'
+            else
+                F.recordCellFailure(
+                    "Cradle DialogEvent option failed"
+                )
+            end
+
+            if F.updateCellFarmUI then
+                F.updateCellFarmUI()
+            end
+
+            local confirmDeadline =
+                os.clock()
+                + Config.CELL_CRADLE_RELEASE_CONFIRM_WAIT
+
+            while F.isCellFarmActive(token)
+                and os.clock()
+                    < confirmDeadline
+            do
+                local rawBoss =
+                    (
+                        bossWatcher
+                        and bossWatcher.model
+                    )
+                    or F.findCellBossModelRaw()
+
+                local _dialogVisible,
+                    releaseStillVisible =
+                        F.getCellCradleDialogueEvidence()
+
+                if rawBoss
+                    and rawBoss.Parent
+                then
+                    optionConfirmed = true
+
+                    State.cellFarm.dialogOptionConfirmed =
+                        true
+
+                    State.cellFarm.status =
+                        "CONFIRMED: boss model appeared after Release"
+
+                    break
+                end
+
+                if not releaseStillVisible then
+                    optionConfirmed = true
+
+                    State.cellFarm.dialogOptionConfirmed =
+                        true
+
+                    State.cellFarm.status =
+                        "CONFIRMED: Release option left DialogueGui"
+
+                    break
+                end
+
+                task.wait(0.05)
+            end
+
+            if optionConfirmed then
+                break
+            end
+        end
+
+        if not optionConfirmed then
+            F.setCellFarmStage(
+                "RELEASE NOT CONFIRMED",
+                "Option remote sent but Release UI remained and no boss appeared"
+            )
+
+            if attempt
+                < Config.CELL_CRADLE_DIALOG_ATTEMPTS
+            then
+                if not F.cellFarmWait(
+                    token,
+                    Config.CELL_CRADLE_RETRY_DELAY
+                ) then
+                    cleanup()
+                    return false
+                end
+
+                continue
+            end
+
+            cleanup()
+            return false
         end
 
         F.setCellFarmStage(
-            "WAITING FOR BOSS",
-            "Handshake complete; waiting for The Cell Of Life"
+            "WAITING FOR BOSS CONFIRMATION",
+            "Release confirmed; waiting for actual The Cell Of Life model"
         )
 
-        local perAttemptWait = math.max(
-            4,
-            Config.CELL_SUMMON_TIMEOUT
-                / Config.CELL_CRADLE_DIALOG_ATTEMPTS
-        )
-
-        local boss = F.waitForCellBossSpawn(
-            token,
-            perAttemptWait
-        )
+        local boss =
+            F.waitForCellBossConfirmed(
+                token,
+                bossWatcher,
+                Config.CELL_CRADLE_BOSS_MODEL_WAIT
+            )
 
         if boss then
+            State.cellFarm.bossSpawnConfirmed =
+                true
+
+            State.cellFarm.status =
+                "CONFIRMED: The Cell Of Life spawned and is alive"
+
+            if F.updateCellFarmUI then
+                F.updateCellFarmUI()
+            end
+
+            cleanup()
             return true, boss
         end
 
-        if attempt < Config.CELL_CRADLE_DIALOG_ATTEMPTS then
-            F.setCellFarmStage(
-                "CRADLE RETRY",
-                "Boss not spawned; retrying interaction"
-            )
+        F.setCellFarmStage(
+            "BOSS NOT CONFIRMED",
+            "Release completed but live Cell model was not confirmed"
+        )
 
+        if attempt
+            < Config.CELL_CRADLE_DIALOG_ATTEMPTS
+        then
             if not F.cellFarmWait(
                 token,
                 Config.CELL_CRADLE_RETRY_DELAY
             ) then
+                cleanup()
                 return false
             end
         end
     end
+
+    cleanup()
 
     return false
 end
@@ -18234,12 +19082,10 @@ function F.getCellMenuClickPoint(button, attempt)
     local x = position.X + size.X * 0.5
     local y = position.Y + size.Y * 0.5 + offsetY
 
-    y = math.clamp(
-        y,
-        position.Y + 3,
-        position.Y + size.Y - 3
-    )
-
+    -- Do not clamp Y to the GuiObject rectangle here.
+    -- On this game's menu the mouse-input coordinate is visually lower than
+    -- the reported AbsolutePosition. The calibrated offset intentionally
+    -- compensates for that client coordinate difference.
     return Vector2.new(x, y)
 end
 
@@ -18298,6 +19144,17 @@ function F.getCellMenuHitInfo(button, attempt)
         .. tostring(math.floor(center.X))
         .. ","
         .. tostring(math.floor(center.Y))
+        .. " | YShift="
+        .. tostring(
+            Config.CELL_MENU_MOUSE_Y_OFFSETS[
+                math.clamp(
+                    tonumber(attempt) or 1,
+                    1,
+                    #Config.CELL_MENU_MOUSE_Y_OFFSETS
+                )
+            ]
+            or 0
+        )
 end
 
 function F.waitForCellMenuButtonSettle(token, button, seconds)
@@ -18646,6 +19503,110 @@ function F.isCellServerMenuVisible()
         F.findVisibleGuiTextObject(
             "Server Menu"
         ) ~= nil
+end
+
+function F.closeCellDailyRewardsOnce()
+    local playerGui =
+        LocalPlayer:FindFirstChildOfClass(
+            "PlayerGui"
+        )
+
+    if not playerGui then
+        return false
+    end
+
+    local dailyGui =
+        playerGui:FindFirstChild(
+            "DailyRewardsGui"
+        )
+
+    if not dailyGui then
+        return false
+    end
+
+    local mainFrame =
+        dailyGui:FindFirstChild(
+            "MainFrame"
+        )
+
+    local wasVisible =
+        false
+
+    pcall(function()
+        if dailyGui:IsA("ScreenGui") then
+            wasVisible =
+                dailyGui.Enabled
+                and (
+                    not mainFrame
+                    or not mainFrame:IsA("GuiObject")
+                    or mainFrame.Visible
+                )
+        elseif mainFrame
+            and mainFrame:IsA("GuiObject")
+        then
+            wasVisible =
+                mainFrame.Visible
+        end
+    end)
+
+    if not wasVisible then
+        return false
+    end
+
+    -- The purpose here is only to dismiss the local popup so it cannot cover
+    -- automated input. Do not claim/alter the Daily Reward itself.
+    pcall(function()
+        if mainFrame
+            and mainFrame:IsA("GuiObject")
+        then
+            mainFrame.Visible =
+                false
+        end
+
+        if dailyGui:IsA("ScreenGui") then
+            dailyGui.Enabled =
+                false
+        end
+    end)
+
+    State.cellFarm.dailyRewardStatus =
+        "Closed"
+
+    State.movementTelemetry.lastAction =
+        "Closed Daily Rewards popup"
+
+    return true
+end
+
+function F.startCellDailyRewardAutoClose(token)
+    State.cellFarm.dailyRewardStatus =
+        "Watching"
+
+    task.spawn(function()
+        local deadline =
+            os.clock()
+            + Config.CELL_DAILY_REWARD_CLOSE_WINDOW
+
+        while F.isCellFarmActive(token)
+            and os.clock() < deadline
+        do
+            F.closeCellDailyRewardsOnce()
+
+            task.wait(
+                Config.CELL_DAILY_REWARD_CLOSE_INTERVAL
+            )
+        end
+
+        if F.isCellFarmActive(token)
+            and State.cellFarm.dailyRewardStatus
+                == "Watching"
+        then
+            State.cellFarm.dailyRewardStatus =
+                "Not shown"
+        end
+    end)
+
+    return true
 end
 
 function F.isCellGameplayReady()
@@ -21292,8 +22253,28 @@ function F.updateCellFarmUI()
         .. tostring(State.cellFarm.menuLastHit or "None")
         .. "\nTravel input: "
         .. tostring(State.cellFarm.cradleTravelInput or "OFF")
+        .. " | Daily Reward: "
+        .. tostring(State.cellFarm.dailyRewardStatus or "Not checked")
         .. "\nLast callback: "
         .. tostring(State.cellFarm.menuLastCallback or "None")
+        .. "\nDialog: start="
+        .. tostring(State.cellFarm.dialogStartSent == true)
+        .. " ui="
+        .. tostring(State.cellFarm.dialogUiConfirmed == true)
+        .. " release="
+        .. tostring(State.cellFarm.dialogReleaseVisible == true)
+        .. " option="
+        .. tostring(State.cellFarm.dialogOptionConfirmed == true)
+        .. "\nDialog RX: "
+        .. tostring(State.cellFarm.dialogClientEvents or 0)
+        .. " | "
+        .. tostring(State.cellFarm.dialogLastClientEvent or "None")
+        .. "\nBoss spawn: "
+        .. tostring(State.cellFarm.bossSpawnConfirmed == true)
+        .. " via "
+        .. tostring(State.cellFarm.bossSpawnSource or "None")
+        .. " | SpawnEvent RX: "
+        .. tostring(State.cellFarm.bossSpawnRemoteEvents or 0)
         .. "\nWeapon: "
         .. tostring(State.cellFarm.weaponStatus)
         .. "\nBoss: The Cell Of Life | "
@@ -21379,7 +22360,16 @@ function F.cellFarmHop(token, reason)
 end
 
 function F.runCellFarm(token, resumed)
-    if resumed then
+    local needsMenuBootstrap =
+        resumed
+        or State.cellFarm.launchFromMenu
+        or (
+            F.isAnyCellMenuStageVisible
+            and F.isAnyCellMenuStageVisible()
+        )
+        or not F.isCellGameplayReady()
+
+    if needsMenuBootstrap then
         local bootstrapped =
             F.bootstrapCellMenu(
                 token
@@ -21393,13 +22383,27 @@ function F.runCellFarm(token, resumed)
                 "ERROR",
                 "Could not enter gameplay"
             )
+
+            F.setCellMenuHubHidden(
+                false
+            )
+
             return false
         end
     end
 
+    State.cellFarm.launchFromMenu =
+        false
+
     if not F.isCellFarmActive(token) then
         return false
     end
+
+    -- Daily Rewards may appear a moment after Current Server completes.
+    -- Keep a short local watcher so it never covers later automation.
+    F.startCellDailyRewardAutoClose(
+        token
+    )
 
     F.setCellFarmStage(
         "WORLD READY",
@@ -21688,6 +22692,15 @@ function F.stopCellFarm(restorePrevious, reason)
         State.cellFarmToggle:SetSilent(false)
     end
 
+    State.cellFarm.launchFromMenu =
+        false
+
+    if F.setCellMenuHubHidden then
+        F.setCellMenuHubHidden(
+            false
+        )
+    end
+
     F.updateCellFarmUI()
     F.markConfigDirty()
 
@@ -21737,6 +22750,17 @@ function F.startCellFarm(resumed)
         State.cellFarm.lastBossHealthPercent = 0
         State.cellFarm.lastBossHealthState = "WAITING"
         State.cellFarm.lastBossHealthUIAt = 0
+        State.cellFarm.dialogStartSent = false
+        State.cellFarm.dialogUiConfirmed = false
+        State.cellFarm.dialogReleaseVisible = false
+        State.cellFarm.dialogOptionSent = false
+        State.cellFarm.dialogOptionConfirmed = false
+        State.cellFarm.dialogClientEvents = 0
+        State.cellFarm.dialogLastClientEvent = "None"
+        State.cellFarm.bossSpawnConfirmed = false
+        State.cellFarm.bossSpawnSource = "None"
+        State.cellFarm.bossSpawnRemoteEvents = 0
+        State.cellFarm.bossLastSpawnEvent = "None"
         State.cellFarm.startedAt = os.clock()
     end
 
@@ -21764,7 +22788,10 @@ function F.startCellFarm(resumed)
         or "AUTO / not selected"
 
     State.cellFarm.menuPhase =
-        resumed
+        (
+            resumed
+            or State.cellFarm.launchFromMenu
+        )
         and "Waiting for menu"
         or "Gameplay"
 
@@ -25691,7 +26718,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics 30 FPS / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("Drops v6.4.14: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
+print("Drops v6.4.17: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -25711,14 +26738,14 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.4.14.")
+    warn("[The Veil Hub] loadstring is required to launch v6.4.17.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.4.14 compile failed:", compileError)
+    warn("[The Veil Hub] v6.4.17 compile failed:", compileError)
     return
 end
 
