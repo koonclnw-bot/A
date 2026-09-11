@@ -1,4 +1,4 @@
--- The Veil Hub v6.4.11 Protection Wait + Physical Menu
+-- The Veil Hub v6.4.12 Cradle Stand-Still 2s
 -- Upload this entire file to your public GitHub "V" file.
 -- Your short loadstring loader remains unchanged.
 
@@ -232,8 +232,8 @@ local Config = {
     CELL_CRADLE_AFTER_FIRST_ONE_DELAY = 0.72,
     CELL_CRADLE_AFTER_SECOND_ONE_DELAY = 0.45,
     CELL_CRADLE_DIALOGUE_DETECT_TIMEOUT = 2.50,
-    CELL_CRADLE_STILL_BEFORE_START = 1.00,
-    CELL_CRADLE_START_TO_OPTION_DELAY = 0.60,
+    CELL_CRADLE_STILL_BEFORE_START = 2.00,
+    CELL_CRADLE_START_TO_OPTION_DELAY = 0.85,
     CELL_CRADLE_TARGET_WAIT = 4.00,
     CELL_POST_LOOT_SETTLE = 1.25,
     CELL_POST_BUNDLE_SETTLE = 1.25,
@@ -309,7 +309,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.4.11 Protection Wait + Physical Menu",
+    HUB_VERSION = "v6.4.12 Cradle Stand-Still 2s",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -4718,7 +4718,7 @@ State.cellFarmSection = F.createSection(State.cellFarmBody)
 State.cellFarmToggle = F.createToggle(
     State.cellFarmSection,
     "Full Auto The Cell Of Life",
-    "Menu physical click -> wait spawn protection clear -> Cradle Dialog start/option -> fight -> 5 reward chests with E -> wait drops stable -> collect -> Bundles -> filter/sell -> hop.",
+    "Menu physical click -> fly to Cradle -> stand completely still 2s -> Dialog start/option -> fight -> 5 reward chests with E -> wait drops stable -> collect -> Bundles -> filter/sell -> hop.",
     false
 )
 
@@ -16052,92 +16052,18 @@ function F.waitForCellSpawnProtectionClear(token)
         return false
     end
 
+    -- v6.4.12: the live game can keep the visible blue ForceField after
+    -- interactions are otherwise possible. Do not use the ForceField as a
+    -- readiness gate. This helper is retained only for compatibility.
     F.setCellFarmStage(
-        "SPAWN PROTECTION",
-        "Waiting for blue protection bubble to clear"
+        "SPAWN SETTLE",
+        "Fixed settle; ForceField is informational only"
     )
 
-    -- Always perform one normal movement action. The user confirmed the
-    -- protection may remain until the character actually moves/acts.
-    F.wakeCellCharacterFromSpawnProtection(
-        token
-    )
-
-    if not F.cellFarmWait(
+    return F.cellFarmWait(
         token,
-        Config.CELL_SPAWN_PROTECTION_WAKE_SETTLE
-    ) then
-        return false
-    end
-
-    local started =
-        os.clock()
-
-    local clearSince = nil
-    local lastWakeAt = os.clock()
-
-    while F.isCellFarmActive(token)
-        and os.clock() - started
-            < Config.CELL_SPAWN_PROTECTION_MAX_WAIT
-    do
-        local marker =
-            F.findCellSpawnProtectionMarker()
-
-        if marker then
-            clearSince = nil
-
-            State.cellFarm.status =
-                "Spawn protection active: "
-                .. tostring(
-                    marker.ClassName
-                )
-                .. " "
-                .. tostring(
-                    marker.Name
-                )
-
-            if os.clock() - lastWakeAt
-                >= Config.CELL_SPAWN_PROTECTION_WAKE_SETTLE
-            then
-                F.wakeCellCharacterFromSpawnProtection(
-                    token
-                )
-
-                lastWakeAt =
-                    os.clock()
-            end
-        else
-            if not clearSince then
-                clearSince =
-                    os.clock()
-            elseif os.clock() - clearSince
-                >= Config.CELL_SPAWN_PROTECTION_CLEAR_STABLE
-            then
-                F.setCellFarmStage(
-                    "PROTECTION CLEAR",
-                    "Interaction unlocked"
-                )
-
-                return true
-            end
-        end
-
-        task.wait(0.10)
-    end
-
-    -- If the game uses a server-only protection marker that is not replicated
-    -- to the client, we already performed real movement and waited the full
-    -- protection window. Continue without attempting to bypass the game state.
-    if F.isCellFarmActive(token) then
-        F.setCellFarmStage(
-            "PROTECTION WAIT COMPLETE",
-            "Protection marker not visible; continuing after movement/wait"
-        )
-
-        return true
-    end
-
-    return false
+        1.00
+    )
 end
 
 function F.flyToCellCradle(token)
@@ -16448,9 +16374,12 @@ function F.settleCellAtCradle(token)
         return false
     end
 
-    -- flyToCFrame already stops its flight controller on arrival.
-    -- Explicitly clear anything left over so the player stays still
-    -- during the dialogue-start request.
+    F.setCellFarmStage(
+        "CRADLE SETTLE",
+        "Standing still at The Cradle for 2 seconds"
+    )
+
+    -- Release every movement owner before the dialogue sequence.
     F.stopMovementFlight(
         "CELL"
     )
@@ -16461,44 +16390,64 @@ function F.settleCellAtCradle(token)
         )
     end
 
+    F.stopMovementFlight(
+        "MONSTER_LOCK"
+    )
+
     F.releaseMovement(
         "CELL"
     )
 
-    local root =
-        F.getCharacterRoot()
-
-    if root then
-        pcall(function()
-            root.AssemblyLinearVelocity =
-                Vector3.zero
-
-            root.AssemblyAngularVelocity =
-                Vector3.zero
-        end)
-    end
-
-    local humanoid =
-        F.getHumanoid()
-
-    if humanoid then
-        pcall(function()
-            humanoid:Move(
-                Vector3.zero,
-                false
-            )
-        end)
-    end
-
-    F.setCellFarmStage(
-        "CRADLE SETTLE",
-        "Holding still before dialogue"
+    F.releaseMovement(
+        "MONSTER_LOCK"
     )
 
-    return F.cellFarmWait(
-        token,
-        Config.CELL_CRADLE_STILL_BEFORE_START
-    )
+    local deadline =
+        os.clock()
+        + Config.CELL_CRADLE_STILL_BEFORE_START
+
+    -- Hold the character still for the entire settle period. A one-shot
+    -- velocity clear was not enough in the live game because residual
+    -- Humanoid/controller movement can immediately resume.
+    while F.isCellFarmActive(token)
+        and os.clock() < deadline
+    do
+        local root =
+            F.getCharacterRoot()
+
+        if root then
+            pcall(function()
+                root.AssemblyLinearVelocity =
+                    Vector3.zero
+
+                root.AssemblyAngularVelocity =
+                    Vector3.zero
+            end)
+        end
+
+        local humanoid =
+            F.getHumanoid()
+
+        if humanoid then
+            pcall(function()
+                humanoid:Move(
+                    Vector3.zero,
+                    false
+                )
+            end)
+        end
+
+        task.wait(0.05)
+    end
+
+    if not F.isCellFarmActive(token) then
+        return false
+    end
+
+    -- Small final quiet frame before firing DialogEvent("start").
+    task.wait(0.10)
+
+    return true
 end
 
 function F.summonCellBoss(token)
@@ -16554,6 +16503,13 @@ function F.summonCellBoss(token)
         token
     ) then
         return false
+    end
+
+    State.cellFarm.status =
+        "Cradle settle complete (2.0s); sending dialog start"
+
+    if F.updateCellFarmUI then
+        F.updateCellFarmUI()
     end
 
     F.setCellFarmStage(
@@ -19153,8 +19109,14 @@ function F.fightCellBoss(token, boss)
                 return false
             end
 
-            if not F.waitForCellSpawnProtectionClear(
-                token
+            F.setCellFarmStage(
+                "RESPAWN SETTLE",
+                "Waiting for character controller"
+            )
+
+            if not F.cellFarmWait(
+                token,
+                1.25
             ) then
                 return false
             end
@@ -20956,15 +20918,9 @@ function F.runCellFarm(token, resumed)
     end
 
     F.setCellFarmStage(
-        "SPAWN PROTECTION",
-        "Preparing interaction state"
+        "WORLD READY",
+        "Cradle interaction will settle at target"
     )
-
-    if not F.waitForCellSpawnProtectionClear(
-        token
-    ) then
-        return false
-    end
 
     State.cellFarm.runs =
         State.cellFarm.runs + 1
@@ -25234,7 +25190,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics 30 FPS / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("Drops v6.4.11: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
+print("Drops v6.4.12: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -25254,14 +25210,14 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.4.11.")
+    warn("[The Veil Hub] loadstring is required to launch v6.4.12.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.4.11 compile failed:", compileError)
+    warn("[The Veil Hub] v6.4.12 compile failed:", compileError)
     return
 end
 
