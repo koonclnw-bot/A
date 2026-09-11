@@ -1,4 +1,4 @@
--- The Veil Hub v6.4.17 Verified Dialog + Boss State
+-- The Veil Hub v6.4.18 Menu Aim GUI Inset
 -- Upload this entire file to your public GitHub "V" file.
 -- The short public GitHub loadstring remains unchanged.
 
@@ -277,7 +277,7 @@ local Config = {
     CELL_MENU_PHYSICAL_RETRIES = 4,
     CELL_MENU_PHYSICAL_VERIFY = 1.50,
     CELL_MENU_PHYSICAL_RETRY_DELAY = 1.00,
-    CELL_MENU_MOUSE_Y_OFFSETS = {20, 24, 16, 28},
+    CELL_MENU_MOUSE_Y_OFFSETS = {26, 38, 50, 62},
     CELL_MENU_HUB_HIDE_SETTLE = 0.45,
 
     CELL_DAILY_REWARD_CLOSE_WINDOW = 15.0,
@@ -331,7 +331,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.4.17 Verified Dialog + Boss State",
+    HUB_VERSION = "v6.4.18 Menu Aim GUI Inset",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -19059,9 +19059,15 @@ function F.getCellMenuClickPoint(button, attempt)
         return nil
     end
 
-    local position = button.AbsolutePosition
-    local size = button.AbsoluteSize
-    local offsets = Config.CELL_MENU_MOUSE_Y_OFFSETS
+    local position =
+        button.AbsolutePosition
+
+    local size =
+        button.AbsoluteSize
+
+    local offsets =
+        Config.CELL_MENU_MOUSE_Y_OFFSETS
+
     local offsetY = 0
 
     if type(offsets) == "table"
@@ -19079,14 +19085,44 @@ function F.getCellMenuClickPoint(button, attempt)
             or 0
     end
 
-    local x = position.X + size.X * 0.5
-    local y = position.Y + size.Y * 0.5 + offsetY
+    -- Roblox mouse/input coordinates can be offset from GuiObject
+    -- AbsolutePosition by the CoreGui/top-bar inset. The user's live
+    -- screenshots show the cursor consistently landing too high, so include
+    -- the real client inset instead of relying on a fixed guess only.
+    local guiInsetY = 0
 
-    -- Do not clamp Y to the GuiObject rectangle here.
-    -- On this game's menu the mouse-input coordinate is visually lower than
-    -- the reported AbsolutePosition. The calibrated offset intentionally
-    -- compensates for that client coordinate difference.
-    return Vector2.new(x, y)
+    pcall(function()
+        local guiService =
+            game:GetService(
+                "GuiService"
+            )
+
+        local topLeftInset =
+            guiService:GetGuiInset()
+
+        if typeof(topLeftInset) == "Vector2" then
+            guiInsetY =
+                topLeftInset.Y
+        elseif typeof(topLeftInset) == "Tuple" then
+            -- Defensive fallback; current Roblox normally returns Vector2s.
+            guiInsetY = 0
+        end
+    end)
+
+    local x =
+        position.X
+        + size.X * 0.5
+
+    local y =
+        position.Y
+        + size.Y * 0.5
+        + guiInsetY
+        + offsetY
+
+    return Vector2.new(
+        x,
+        y
+    )
 end
 
 function F.getCellMenuHitInfo(button, attempt)
@@ -19136,6 +19172,33 @@ function F.getCellMenuHitInfo(button, attempt)
 
     local top = objects[1]
 
+    local guiInsetY = 0
+
+    pcall(function()
+        local guiService =
+            game:GetService(
+                "GuiService"
+            )
+
+        local topLeftInset =
+            guiService:GetGuiInset()
+
+        if typeof(topLeftInset) == "Vector2" then
+            guiInsetY =
+                topLeftInset.Y
+        end
+    end)
+
+    local configuredShift =
+        Config.CELL_MENU_MOUSE_Y_OFFSETS[
+            math.clamp(
+                tonumber(attempt) or 1,
+                1,
+                #Config.CELL_MENU_MOUSE_Y_OFFSETS
+            )
+        ]
+        or 0
+
     return
         tostring(top.ClassName)
         .. ":"
@@ -19144,16 +19207,18 @@ function F.getCellMenuHitInfo(button, attempt)
         .. tostring(math.floor(center.X))
         .. ","
         .. tostring(math.floor(center.Y))
-        .. " | YShift="
+        .. " | InsetY="
         .. tostring(
-            Config.CELL_MENU_MOUSE_Y_OFFSETS[
-                math.clamp(
-                    tonumber(attempt) or 1,
-                    1,
-                    #Config.CELL_MENU_MOUSE_Y_OFFSETS
-                )
-            ]
-            or 0
+            math.floor(guiInsetY)
+        )
+        .. " ExtraY="
+        .. tostring(configuredShift)
+        .. " TotalY="
+        .. tostring(
+            math.floor(
+                guiInsetY
+                + configuredShift
+            )
         )
 end
 
@@ -26718,7 +26783,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics 30 FPS / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("Drops v6.4.17: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
+print("Drops v6.4.18: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -26738,14 +26803,14 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.4.17.")
+    warn("[The Veil Hub] loadstring is required to launch v6.4.18.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.4.17 compile failed:", compileError)
+    warn("[The Veil Hub] v6.4.18 compile failed:", compileError)
     return
 end
 
