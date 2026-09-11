@@ -1,4 +1,4 @@
--- The Veil Hub v6.4.5 Cradle E-1-1 + Slow Hop
+-- The Veil Hub v6.4.6 Cradle Dialog Start + Option
 -- Upload this entire file to your public GitHub "V" file.
 -- Your short loadstring loader can remain unchanged.
 
@@ -232,6 +232,9 @@ local Config = {
     CELL_CRADLE_AFTER_FIRST_ONE_DELAY = 0.72,
     CELL_CRADLE_AFTER_SECOND_ONE_DELAY = 0.45,
     CELL_CRADLE_DIALOGUE_DETECT_TIMEOUT = 2.50,
+    CELL_CRADLE_STILL_BEFORE_START = 1.00,
+    CELL_CRADLE_START_TO_OPTION_DELAY = 0.60,
+    CELL_CRADLE_TARGET_WAIT = 4.00,
     CELL_POST_LOOT_SETTLE = 1.25,
     CELL_POST_BUNDLE_SETTLE = 1.25,
     CELL_POST_SELL_SETTLE = 2.50,
@@ -274,7 +277,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.4.5 Cradle E-1-1 + Slow Hop",
+    HUB_VERSION = "v6.4.6 Cradle Dialog Start + Option",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -4678,7 +4681,7 @@ State.cellFarmSection = F.createSection(State.cellFarmBody)
 State.cellFarmToggle = F.createToggle(
     State.cellFarmSection,
     "Full Auto The Cell Of Life",
-    "Cradle -> physical E -> 1 -> 1 -> wait Cell -> fight -> collect -> open Bundles -> keep Legendary/Mythic + whitelist -> sell -> verify -> delayed hop -> resume.",
+    "Cradle -> hold still 1s -> Dialog start -> Dialog option -> wait Cell -> fight -> collect -> open Bundles -> keep Legendary/Mythic + whitelist -> sell -> verify -> delayed hop -> resume.",
     false
 )
 
@@ -16098,6 +16101,134 @@ function F.waitForCellBossSpawn(token, timeout)
     return nil
 end
 
+function F.getCellCradleDialogTargets()
+    local npcCradle = nil
+    local worldCradle = nil
+
+    local npcs =
+        workspace:FindFirstChild(
+            "NPCs"
+        )
+
+    if npcs then
+        npcCradle =
+            npcs:FindFirstChild(
+                "The Cradle"
+            )
+    end
+
+    local systems =
+        workspace:FindFirstChild(
+            "Systems"
+        )
+
+    local junk =
+        systems
+        and systems:FindFirstChild(
+            "CellOfLifeJunk"
+        )
+
+    if junk then
+        worldCradle =
+            junk:FindFirstChild(
+                "The Cradle"
+            )
+    end
+
+    return npcCradle, worldCradle
+end
+
+function F.waitForCellCradleDialogTargets(token, timeout)
+    local deadline =
+        os.clock()
+        + math.max(
+            0.25,
+            tonumber(timeout)
+                or Config.CELL_CRADLE_TARGET_WAIT
+        )
+
+    repeat
+        if not F.isCellFarmActive(token) then
+            return nil, nil
+        end
+
+        local npcCradle,
+            worldCradle =
+                F.getCellCradleDialogTargets()
+
+        if npcCradle
+            and npcCradle.Parent
+            and worldCradle
+            and worldCradle.Parent
+        then
+            return npcCradle, worldCradle
+        end
+
+        F.requestCellCradleStreaming()
+        task.wait(0.10)
+    until os.clock() >= deadline
+
+    return F.getCellCradleDialogTargets()
+end
+
+function F.settleCellAtCradle(token)
+    if not F.isCellFarmActive(token) then
+        return false
+    end
+
+    -- flyToCFrame already stops its flight controller on arrival.
+    -- Explicitly clear anything left over so the player stays still
+    -- during the dialogue-start request.
+    F.stopMovementFlight(
+        "CELL"
+    )
+
+    if F.stopLootFlight then
+        F.stopLootFlight(
+            "CELL"
+        )
+    end
+
+    F.releaseMovement(
+        "CELL"
+    )
+
+    local root =
+        F.getCharacterRoot()
+
+    if root then
+        pcall(function()
+            root.AssemblyLinearVelocity =
+                Vector3.zero
+
+            root.AssemblyAngularVelocity =
+                Vector3.zero
+        end)
+    end
+
+    local humanoid =
+        F.getHumanoid()
+
+    if humanoid then
+        pcall(function()
+            humanoid:Move(
+                Vector3.zero,
+                false
+            )
+        end)
+    end
+
+    F.setCellFarmStage(
+        "CRADLE SETTLE",
+        "Holding still before dialogue"
+    )
+
+    return F.cellFarmWait(
+        token,
+        Config.CELL_CRADLE_STILL_BEFORE_START
+    )
+end
+
 function F.summonCellBoss(token)
     if not F.isCellFarmActive(token) then
         return false
@@ -16110,123 +16241,134 @@ function F.summonCellBoss(token)
         return true, existing
     end
 
-    local cradle =
-        F.findCellCradle()
+    local remotes =
+        F.getCellRemotes()
 
-    if not cradle
-        or not cradle.Parent
+    if not remotes
+        or not remotes.Dialog
     then
         F.recordCellFailure(
-            "The Cradle is not loaded"
+            "DialogEvent is unavailable"
         )
         return false
     end
 
-    F.setCellFarmStage(
-        "CRADLE INTERACT",
-        "Pressing E"
-    )
+    local npcCradle,
+        worldCradle =
+            F.waitForCellCradleDialogTargets(
+                token,
+                Config.CELL_CRADLE_TARGET_WAIT
+            )
 
-    local pressedE =
-        F.pressVirtualKey(
-            Enum.KeyCode.E,
-            0x45,
-            Config.CELL_CRADLE_KEY_HOLD,
-            "Cell Cradle: E"
-        )
-
-    if not pressedE then
+    if not npcCradle
+        or not npcCradle.Parent
+    then
         F.recordCellFailure(
-            "Could not send E to The Cradle"
+            'workspace.NPCs["The Cradle"] is unavailable'
         )
         return false
     end
 
-    -- Prefer observing the dialogue, but never depend on GUI text alone.
-    -- This preserves the exact manual sequence even if the game changes the
-    -- dialogue label layout.
-    local dialogueSeen =
-        F.waitForCellCradleDialogue(
-            token,
-            Config.CELL_CRADLE_DIALOGUE_DETECT_TIMEOUT
-        )
-
-    if not dialogueSeen then
-        if not F.cellFarmWait(
-            token,
-            Config.CELL_CRADLE_AFTER_E_DELAY
-        ) then
-            return false
-        end
-    else
-        if not F.cellFarmWait(
-            token,
-            0.18
-        ) then
-            return false
-        end
-    end
-
-    F.setCellFarmStage(
-        "CRADLE RELEASE",
-        "Pressing 1"
-    )
-
-    local firstOne =
-        F.pressVirtualKey(
-            Enum.KeyCode.One,
-            0x31,
-            Config.CELL_CRADLE_KEY_HOLD,
-            "Cell Cradle: 1 (Release)"
-        )
-
-    if not firstOne then
+    if not worldCradle
+        or not worldCradle.Parent
+    then
         F.recordCellFailure(
-            "Could not send first 1 to The Cradle dialogue"
+            'workspace.Systems.CellOfLifeJunk["The Cradle"] is unavailable'
         )
         return false
     end
 
-    if not F.cellFarmWait(
-        token,
-        Config.CELL_CRADLE_AFTER_FIRST_ONE_DELAY
+    if not F.settleCellAtCradle(
+        token
     ) then
         return false
     end
 
     F.setCellFarmStage(
-        "CRADLE SUMMON",
-        "Pressing 1 again"
+        "CRADLE DIALOG START",
+        'DialogEvent("start", NPCs["The Cradle"], 10)'
     )
 
-    local secondOne =
-        F.pressVirtualKey(
-            Enum.KeyCode.One,
-            0x31,
-            Config.CELL_CRADLE_KEY_HOLD,
-            "Cell Cradle: 1 (Summon)"
-        )
+    local startOk =
+        pcall(function()
+            remotes.Dialog:FireServer(
+                "start",
+                npcCradle,
+                10
+            )
+        end)
 
-    if not secondOne then
+    if not startOk then
         F.recordCellFailure(
-            "Could not send second 1 to The Cradle dialogue"
+            "Cradle DialogEvent start failed"
         )
-        return false
-    end
-
-    if not F.cellFarmWait(
-        token,
-        Config.CELL_CRADLE_AFTER_SECOND_ONE_DELAY
-    ) then
         return false
     end
 
     State.movementTelemetry.lastRemote =
-        "None - Cradle uses physical E -> 1 -> 1"
+        'DialogEvent("start", workspace.NPCs["The Cradle"], 10)'
+
+    if not F.cellFarmWait(
+        token,
+        Config.CELL_CRADLE_START_TO_OPTION_DELAY
+    ) then
+        return false
+    end
+
+    -- Refresh the world target because streaming/dialogue code can replace
+    -- the object between start and option.
+    local refreshedNpc,
+        refreshedWorld =
+            F.getCellCradleDialogTargets()
+
+    if refreshedNpc
+        and refreshedNpc.Parent
+    then
+        npcCradle = refreshedNpc
+    end
+
+    if refreshedWorld
+        and refreshedWorld.Parent
+    then
+        worldCradle = refreshedWorld
+    end
+
+    if not worldCradle
+        or not worldCradle.Parent
+    then
+        F.recordCellFailure(
+            "Cradle option target disappeared"
+        )
+        return false
+    end
+
+    F.setCellFarmStage(
+        "CRADLE DIALOG OPTION",
+        'DialogEvent("option", CellOfLifeJunk["The Cradle"], 5)'
+    )
+
+    local optionOk =
+        pcall(function()
+            remotes.Dialog:FireServer(
+                "option",
+                worldCradle,
+                5
+            )
+        end)
+
+    if not optionOk then
+        F.recordCellFailure(
+            "Cradle DialogEvent option failed"
+        )
+        return false
+    end
+
+    State.movementTelemetry.lastRemote =
+        'DialogEvent("option", workspace.Systems.CellOfLifeJunk["The Cradle"], 5)'
 
     F.setCellFarmStage(
         "WAITING FOR BOSS",
-        "E -> 1 -> 1 complete; waiting for The Cell Of Life"
+        "Dialogue option sent; waiting for The Cell Of Life"
     )
 
     local boss =
@@ -23382,7 +23524,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics 30 FPS / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("Drops v6.4.5: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
+print("Drops v6.4.6: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -23402,14 +23544,14 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.4.5.")
+    warn("[The Veil Hub] loadstring is required to launch v6.4.6.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.4.5 compile failed:", compileError)
+    warn("[The Veil Hub] v6.4.6 compile failed:", compileError)
     return
 end
 
