@@ -1,4 +1,4 @@
--- The Veil Hub v6.4.20 Native NPC Interaction
+-- The Veil Hub v6.4.27 Cradle E Prompt Start Assist
 -- Upload this entire file to your public GitHub "V" file.
 -- The short public GitHub loadstring remains unchanged.
 
@@ -254,10 +254,13 @@ local Config = {
     CELL_REWARD_CHEST_E_HOLD = 0.08,
     CELL_REWARD_CHEST_AFTER_E_DELAY = 0.20,
     CELL_REWARD_CHEST_OPEN_RETRIES = 3,
-    CELL_REWARD_CHEST_OPEN_CONFIRM = 6.0,
+    CELL_REWARD_CHEST_OPEN_CONFIRM = 8.0,
+    CELL_REWARD_CHEST_REMOTE_SETTLE = 0.30,
+    CELL_REWARD_CHEST_NIL_SCAN_INTERVAL = 0.35,
     CELL_REWARD_CHEST_BETWEEN = 0.55,
     CELL_REWARD_CHEST_NO_NEW_WINDOW = 4.0,
-    CELL_REWARD_DROP_STABLE_WINDOW = 4.0,
+    CELL_REWARD_DROP_STABLE_WINDOW = 6.0,
+    CELL_REWARD_DROP_FINAL_GUARD = 4.0,
     CELL_REWARD_DROP_NOTICE = 30.0,
 
     CELL_DROP_DISCOVERY_SECONDS = 5.0,
@@ -266,6 +269,8 @@ local Config = {
     CELL_BUNDLE_OPEN_LIMIT = 40,
     CELL_BUNDLE_CONFIRM_TIMEOUT = 1.5,
     CELL_BUNDLE_SETTLE = 0.35,
+    CELL_BUNDLE_EMPTY_RECHECKS = 3,
+    CELL_BUNDLE_EMPTY_STABLE_WINDOW = 1.50,
     CELL_SELL_RETRIES = 2,
     CELL_MENU_BOOTSTRAP_TIMEOUT = 90,
     CELL_MENU_BOOT_GRACE = 25.00,
@@ -286,15 +291,24 @@ local Config = {
     CELL_CRADLE_DIALOG_ATTEMPTS = 4,
     CELL_CRADLE_NATIVE_SCAN_WAIT = 3.0,
     CELL_CRADLE_NATIVE_RETRY_DELAY = 0.35,
+    CELL_CRADLE_DIALOGPART_TARGET_DISTANCE = 1.25,
+    CELL_CRADLE_DIALOGPART_REQUIRED_DISTANCE = 2.25,
+    CELL_CRADLE_DIALOGPART_ARRIVAL_DISTANCE = 0.65,
+    CELL_CRADLE_DIALOGPART_POSITION_RETRIES = 3,
     CELL_CRADLE_PREP_E_HOLD = 0.08,
     CELL_CRADLE_PREP_E_DELAY = 0.35,
-    CELL_CRADLE_DIALOG_VISIBLE_WAIT = 5.00,
+    CELL_CRADLE_DIALOG_VISIBLE_WAIT = 7.00,
+    CELL_CRADLE_RELEASE_KEY_HOLD = 0.10,
+    CELL_CRADLE_RELEASE_KEY_CONFIRM = 3.00,
     CELL_CRADLE_RELEASE_SETTLE = 0.12,
     CELL_CRADLE_RELEASE_CONFIRM_WAIT = 4.00,
     CELL_CRADLE_OPTION_RETRIES = 2,
     CELL_CRADLE_BOSS_MODEL_WAIT = 30.0,
     CELL_CRADLE_BOSS_ALIVE_WAIT = 10.0,
+    CELL_CRADLE_BOSS_WAIT_NOTICE = 20.0,
     CELL_CRADLE_RETRY_DELAY = 1.25,
+    CELL_CRADLE_SAME_SERVER_RETRY = 2.0,
+    CELL_CRADLE_OPTION_KEY_FALLBACK_DELAY = 1.00,
 
     CELL_CRADLE_TRAVEL_INPUT_HOLD = 0.12,
     CELL_CRADLE_TRAVEL_INPUT_GAP = 0.10,
@@ -333,7 +347,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.4.20 Native NPC Interaction",
+    HUB_VERSION = "v6.4.27 Cradle E Prompt Start Assist",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -724,6 +738,8 @@ local State = {
         menuLastMethod = "None",
         menuLastHit = "None",
         launchFromMenu = false,
+        keepHubHidden = false,
+        hubManuallyOpened = false,
         dailyRewardStatus = "Not checked",
         cradleTravelInput = "OFF",
         dialogStartSent = false,
@@ -731,7 +747,15 @@ local State = {
         npcInteractionCallOk = false,
         npcInteractionMethod = "None",
         npcInteractionSource = "None",
+        cradleDialogPartDistance = -1,
+        cradleDialogPartPath = "None",
+        cradleInteractPromptVisible = false,
+        cradleInteractPromptText = "None",
+        cradleInteractPromptAttempts = 0,
         dialogUiConfirmed = false,
+        dialogTitleConfirmed = false,
+        dialogBodyConfirmed = false,
+        dialogOptionsConfirmed = false,
         dialogReleaseVisible = false,
         dialogOptionSent = false,
         dialogOptionConfirmed = false,
@@ -748,6 +772,16 @@ local State = {
         lootCollected = 0,
         rewardChestsFound = 0,
         rewardChestsOpened = 0,
+        rewardChestRemoteCalls = 0,
+        rewardLastChestDebugId = "None",
+        rewardDropWaves = 0,
+        rewardDropCount = 0,
+        bossDefeatEventConfirmed = false,
+        bossDefeatEvents = 0,
+        bossDefeatLast = "None",
+        itemNotifyEvents = 0,
+        itemNotifyItems = 0,
+        itemNotifyLast = "None",
         bundlesOpened = 0,
         itemsSold = 0,
         hops = 0,
@@ -4882,7 +4916,7 @@ State.cellStopButton = F.createActionRow(
     "STOP NOW"
 )
 
-State.cellStatusCard = F.createCard(State.cellFarmSection, 340)
+State.cellStatusCard = F.createCard(State.cellFarmSection, 390)
 State.cellStatusLabel = F.createTextLabel(
     State.cellStatusCard,
     "Cell Farm: OFF",
@@ -4914,38 +4948,30 @@ State.cellFarmToggle:OnChanged(function(state)
         State.cellFarm.launchFromMenu =
             fromMenu
 
-        if fromMenu
-            and F.setCellMenuHubHidden
-        then
-            -- Hide the Hub before any menu mouse input is sent.
-            F.setCellMenuHubHidden(
-                true
-            )
+        -- Hide the entire Hub before Full Auto begins, whether the user
+        -- starts from THE VEIL menu or from gameplay.
+        F.setCellFarmHubHidden(
+            true
+        )
 
-            task.delay(
-                Config.CELL_MENU_HUB_HIDE_SETTLE,
-                function()
-                    if F.startCellFarm then
-                        F.startCellFarm(
-                            false
-                        )
-                    end
+        task.delay(
+            Config.CELL_MENU_HUB_HIDE_SETTLE,
+            function()
+                if F.startCellFarm then
+                    F.startCellFarm(
+                        false
+                    )
                 end
-            )
-        elseif F.startCellFarm then
-            F.startCellFarm(false)
-        end
+            end
+        )
     elseif F.stopCellFarm then
         State.cellFarm.launchFromMenu =
             false
 
-        if F.setCellMenuHubHidden then
-            F.setCellMenuHubHidden(
-                false
-            )
-        end
-
-        F.stopCellFarm(true, "Stopped by user")
+        F.stopCellFarm(
+            true,
+            "Stopped by user"
+        )
     end
 end)
 
@@ -5382,7 +5408,15 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
     end
 
     if input.KeyCode == Config.TOGGLE_UI_KEY then
-        F.setUICollapsed(not State.uiCollapsed)
+        if F.toggleCellFarmHubForUser
+            and F.toggleCellFarmHubForUser()
+        then
+            return
+        end
+
+        F.setUICollapsed(
+            not State.uiCollapsed
+        )
     end
 end)
 
@@ -16405,6 +16439,18 @@ function F.getCellRemotes()
             Remotes:FindFirstChild(
                 "BossSpawnLabelEvent"
             ),
+        BossDefeatLabel =
+            Remotes:FindFirstChild(
+                "BossDefeatLabel"
+            ),
+        ItemNotify =
+            Remotes:FindFirstChild(
+                "ItemNotifyEvent"
+            ),
+        InteractPrompt =
+            Remotes:FindFirstChild(
+                "InteractPromptEvent"
+            ),
     }
 end
 
@@ -16768,6 +16814,106 @@ function F.callNativeCradleInteraction(
         tostring(result)
 end
 
+
+function F.getCellCradleInteractPromptEvidence()
+    local playerGui =
+        LocalPlayer:FindFirstChildOfClass(
+            "PlayerGui"
+        )
+
+    if not playerGui then
+        return false, "PlayerGui missing"
+    end
+
+    local promptGui =
+        playerGui:FindFirstChild(
+            "InteractPromptBillboard_NPC"
+        )
+
+    if not promptGui then
+        return false, "InteractPromptBillboard_NPC missing"
+    end
+
+    local texts = {}
+
+    for _, object in ipairs(
+        promptGui:GetDescendants()
+    ) do
+        if (
+            object:IsA("TextLabel")
+            or object:IsA("TextButton")
+            or object:IsA("TextBox")
+        )
+            and F.isGuiObjectActuallyVisible(
+                object
+            )
+        then
+            local text =
+                F.trimText(
+                    object.Text
+                )
+
+            if text ~= "" then
+                table.insert(
+                    texts,
+                    text
+                )
+            end
+        end
+    end
+
+    local combined =
+        table.concat(
+            texts,
+            " "
+        )
+
+    if combined == "" then
+        return false, "Interact prompt GUI has no visible text"
+    end
+
+    local lowered =
+        string.lower(
+            combined
+        )
+
+    local interactVisible =
+        string.find(
+            lowered,
+            "interact",
+            1,
+            true
+        ) ~= nil
+
+    local eVisible =
+        string.find(
+            lowered,
+            "(e)",
+            1,
+            true
+        ) ~= nil
+        or string.find(
+            lowered,
+            "[e]",
+            1,
+            true
+        ) ~= nil
+        or string.find(
+            lowered,
+            " e",
+            1,
+            true
+        ) ~= nil
+
+    if interactVisible
+        and eVisible
+    then
+        return true, combined
+    end
+
+    return false, combined
+end
+
 function F.getCellCradleDialogueEvidence()
     local playerGui =
         LocalPlayer:FindFirstChildOfClass(
@@ -16787,37 +16933,33 @@ function F.getCellCradleDialogueEvidence()
         return false, false, nil, "DialogueGui missing"
     end
 
-    local guiVisible = true
-
-    if dialogueGui:IsA("ScreenGui") then
-        guiVisible =
-            dialogueGui.Enabled
-    end
-
-    if not guiVisible then
+    if dialogueGui:IsA("ScreenGui")
+        and not dialogueGui.Enabled
+    then
         return false, false, nil, "DialogueGui disabled"
     end
 
-    local cradleSeen = false
-    local releaseSeen = false
-    local releaseButton = nil
-    local evidence = {}
+    local mainFrame =
+        dialogueGui:FindFirstChild(
+            "MainFrame"
+        )
 
-    local function objectVisible(object)
-        if F.isGuiObjectActuallyVisible then
-            return
-                F.isGuiObjectActuallyVisible(
-                    object
-                )
-        end
-
-        return true
+    if mainFrame
+        and mainFrame:IsA("GuiObject")
+        and not F.isGuiObjectActuallyVisible(
+            mainFrame
+        )
+    then
+        return false, false, nil, "Dialogue MainFrame hidden"
     end
+
+    local visibleTexts = {}
+    local releaseButton = nil
 
     local function findButtonAncestor(object)
         local current = object
 
-        for _ = 1, 6 do
+        for _ = 1, 7 do
             if not current
                 or current == dialogueGui
             then
@@ -16841,7 +16983,7 @@ function F.getCellCradleDialogueEvidence()
             object:IsA("TextLabel")
             or object:IsA("TextButton")
         )
-            and objectVisible(
+            and F.isGuiObjectActuallyVisible(
                 object
             )
         then
@@ -16850,94 +16992,146 @@ function F.getCellCradleDialogueEvidence()
                     object.Text
                 )
 
-            local textValue =
-                string.lower(
+            if rawText ~= "" then
+                table.insert(
+                    visibleTexts,
                     rawText
                 )
 
-            if string.find(
-                textValue,
-                "cradle",
-                1,
-                true
-            ) then
-                cradleSeen = true
-
-                if #evidence < 4 then
-                    table.insert(
-                        evidence,
+                local lower =
+                    string.lower(
                         rawText
                     )
-                end
-            end
 
-            if string.find(
-                textValue,
-                "release",
-                1,
-                true
-            ) then
-                releaseSeen = true
-
-                releaseButton =
-                    releaseButton
-                    or findButtonAncestor(
-                        object
-                    )
-
-                if #evidence < 4 then
-                    table.insert(
-                        evidence,
-                        rawText
-                    )
+                if string.find(
+                    lower,
+                    "release",
+                    1,
+                    true
+                ) then
+                    releaseButton =
+                        releaseButton
+                        or findButtonAncestor(
+                            object
+                        )
                 end
             end
         end
     end
 
-    if releaseSeen then
+    local combined =
+        string.lower(
+            table.concat(
+                visibleTexts,
+                "\n"
+            )
+        )
+
+    local titleConfirmed =
+        string.find(
+            combined,
+            "the cradle",
+            1,
+            true
+        ) ~= nil
+
+    local bodyConfirmed =
+        (
+            string.find(
+                combined,
+                "ancient obsidian crystal",
+                1,
+                true
+            ) ~= nil
+            and string.find(
+                combined,
+                "primordial energy",
+                1,
+                true
+            ) ~= nil
+        )
+        or (
+            string.find(
+                combined,
+                "release it from its cage",
+                1,
+                true
+            ) ~= nil
+        )
+
+    local releaseConfirmed =
+        string.find(
+            combined,
+            "release",
+            1,
+            true
+        ) ~= nil
+
+    local goBackConfirmed =
+        string.find(
+            combined,
+            "go back up",
+            1,
+            true
+        ) ~= nil
+
+    local endConfirmed =
+        string.find(
+            combined,
+            "end dialogue",
+            1,
+            true
+        ) ~= nil
+
+    local optionsConfirmed =
+        releaseConfirmed
+        and goBackConfirmed
+        and endConfirmed
+
+    local exactPanelConfirmed =
+        titleConfirmed
+        and bodyConfirmed
+        and optionsConfirmed
+
+    State.cellFarm.dialogTitleConfirmed =
+        titleConfirmed
+
+    State.cellFarm.dialogBodyConfirmed =
+        bodyConfirmed
+
+    State.cellFarm.dialogOptionsConfirmed =
+        optionsConfirmed
+
+    if exactPanelConfirmed then
         return
             true,
             true,
             releaseButton,
-            "Release visible"
-            .. (
-                #evidence > 0
-                and (
-                    " | "
-                    .. table.concat(
-                        evidence,
-                        " / "
-                    )
-                )
-                or ""
-            )
+            "EXACT Cradle dialog confirmed: title + body + Release/Go Back Up/End Dialogue"
     end
 
-    if cradleSeen then
+    if titleConfirmed
+        or releaseConfirmed
+        or #visibleTexts > 0
+    then
         return
             true,
-            false,
-            nil,
-            "Cradle dialogue visible"
-            .. (
-                #evidence > 0
-                and (
-                    " | "
-                    .. table.concat(
-                        evidence,
-                        " / "
-                    )
-                )
-                or ""
-            )
+            releaseConfirmed,
+            releaseButton,
+            "Dialogue visible but exact Cradle panel incomplete"
+                .. " | title="
+                .. tostring(titleConfirmed)
+                .. " body="
+                .. tostring(bodyConfirmed)
+                .. " options="
+                .. tostring(optionsConfirmed)
     end
 
     return
-        true,
+        false,
         false,
         nil,
-        "DialogueGui visible; Release not rendered yet"
+        "DialogueGui exists but no visible Cradle dialogue text"
 end
 
 function F.isCellCradleDialogueVisible()
@@ -17460,64 +17654,209 @@ function F.refineCellCradleDialogPosition(token, npcCradle, worldCradle)
         return false
     end
 
-    local root = F.getCharacterRoot()
+    local root =
+        F.getCharacterRoot()
 
     if not root then
         return false
     end
 
-    local bestPart = nil
-    local bestDistance = math.huge
-
-    for _, targetObject in ipairs({npcCradle, worldCradle}) do
-        local part = F.getCellCradlePart(targetObject)
-
-        if part and part.Parent then
-            local distance = (root.Position - part.Position).Magnitude
-
-            if distance < bestDistance then
-                bestDistance = distance
-                bestPart = part
-            end
-        end
-    end
-
-    State.cellFarm.status =
-        "Cradle target distance: "
-        .. string.format(
-            "%.1f",
-            bestDistance < math.huge and bestDistance or -1
+    -- The captured NPCInputHandler function explicitly contains:
+    -- NPCs -> DialogPart -> Position -> Magnitude.
+    -- Therefore the authoritative interaction-distance target is the NPC's
+    -- DialogPart, not the CellOfLifeJunk copy used by the option remote.
+    local dialogPart =
+        npcCradle
+        and npcCradle.Parent
+        and npcCradle:FindFirstChild(
+            "DialogPart",
+            true
         )
-        .. " studs"
 
-    if F.updateCellFarmUI then
-        F.updateCellFarmUI()
+    if not dialogPart
+        or not dialogPart:IsA("BasePart")
+    then
+        dialogPart =
+            F.getCellCradlePart(
+                npcCradle
+            )
     end
 
-    if not bestPart or bestDistance <= 7.0 then
+    if not dialogPart
+        or not dialogPart.Parent
+    then
+        State.cellFarm.cradleDialogPartDistance =
+            -1
+
+        State.cellFarm.cradleDialogPartPath =
+            "DialogPart unavailable"
+
+        F.recordCellFailure(
+            'NPC Cradle DialogPart is unavailable'
+        )
+
+        return false
+    end
+
+    State.cellFarm.cradleDialogPartPath =
+        dialogPart:GetFullName()
+
+    local function readDistance()
+        local currentRoot =
+            F.getCharacterRoot()
+
+        if not currentRoot
+            or not dialogPart
+            or not dialogPart.Parent
+        then
+            return math.huge
+        end
+
+        local distance =
+            (
+                currentRoot.Position
+                - dialogPart.Position
+            ).Magnitude
+
+        State.cellFarm.cradleDialogPartDistance =
+            distance
+
+        State.cellFarm.status =
+            "NPC DialogPart distance: "
+            .. string.format(
+                "%.2f",
+                distance
+            )
+            .. " studs"
+
+        if F.updateCellFarmUI then
+            F.updateCellFarmUI()
+        end
+
+        return distance
+    end
+
+    local distance =
+        readDistance()
+
+    if distance
+        <= Config.CELL_CRADLE_DIALOGPART_REQUIRED_DISTANCE
+    then
         return true
     end
 
     F.setCellFarmStage(
-        "CRADLE POSITION",
-        "Refining interaction distance"
+        "CRADLE CLOSE RANGE",
+        "Moving directly to NPC DialogPart"
     )
 
-    local targetPosition =
-        bestPart.Position
-        + bestPart.CFrame.LookVector * 3.5
+    for attempt = 1,
+        Config.CELL_CRADLE_DIALOGPART_POSITION_RETRIES
+    do
+        if not F.isCellFarmActive(token) then
+            return false
+        end
 
-    local target = CFrame.lookAt(
-        targetPosition,
-        bestPart.Position
+        if not dialogPart
+            or not dialogPart.Parent
+        then
+            return false
+        end
+
+        local currentRoot =
+            F.getCharacterRoot()
+
+        if not currentRoot then
+            return false
+        end
+
+        -- Approach from whichever horizontal side we are already on. This is
+        -- more robust than assuming the DialogPart's LookVector faces the
+        -- player. The final RootPart-to-DialogPart distance is ~1.25 studs.
+        local offset =
+            currentRoot.Position
+            - dialogPart.Position
+
+        local horizontal =
+            Vector3.new(
+                offset.X,
+                0,
+                offset.Z
+            )
+
+        local direction = nil
+
+        if horizontal.Magnitude > 0.05 then
+            direction =
+                horizontal.Unit
+        else
+            direction =
+                -dialogPart.CFrame.LookVector
+        end
+
+        local targetPosition =
+            dialogPart.Position
+            + direction
+                * Config.CELL_CRADLE_DIALOGPART_TARGET_DISTANCE
+
+        local target =
+            CFrame.lookAt(
+                targetPosition,
+                dialogPart.Position
+            )
+
+        local reached =
+            F.flyCellToCFrameWithWASD(
+                token,
+                target,
+                Config.CELL_CRADLE_DIALOGPART_ARRIVAL_DISTANCE,
+                20
+            )
+
+        F.stopCellCradleTravelInput()
+
+        if not reached then
+            State.cellFarm.status =
+                "Close-range flight did not report arrival"
+        end
+
+        -- Give the root position one frame to settle before measuring the
+        -- exact Magnitude that NPCInputHandler is expected to care about.
+        task.wait(0.12)
+
+        distance =
+            readDistance()
+
+        if distance
+            <= Config.CELL_CRADLE_DIALOGPART_REQUIRED_DISTANCE
+        then
+            State.cellFarm.status =
+                "CONFIRMED close to NPC DialogPart: "
+                .. string.format(
+                    "%.2f",
+                    distance
+                )
+                .. " studs"
+
+            if F.updateCellFarmUI then
+                F.updateCellFarmUI()
+            end
+
+            return true
+        end
+    end
+
+    F.recordCellFailure(
+        "Could not get close enough to NPC Cradle DialogPart; distance="
+            .. string.format(
+                "%.2f",
+                distance < math.huge
+                and distance
+                or -1
+            )
     )
 
-    return F.flyCellToCFrameWithWASD(
-        token,
-        target,
-        4.0,
-        30
-    )
+    return false
 end
 
 function F.settleCellAtCradle(token)
@@ -17658,16 +17997,25 @@ function F.summonCellBoss(token)
         return false
     end
 
-    if not F.refineCellCradleDialogPosition(
-        token,
-        npcCradle,
-        worldCradle
-    ) then
-        return false
-    end
+    -- Best-effort positioning only. The user manually verified that the
+    -- exact Cobalt DialogEvent start can open the dialogue, so distance must
+    -- never block that exact remote from being attempted.
+    pcall(function()
+        F.refineCellCradleDialogPosition(
+            token,
+            npcCradle,
+            worldCradle
+        )
+    end)
 
     State.cellFarm.dialogStartSent = false
+    State.cellFarm.cradleInteractPromptVisible = false
+    State.cellFarm.cradleInteractPromptText = "None"
+    State.cellFarm.cradleInteractPromptAttempts = 0
     State.cellFarm.dialogUiConfirmed = false
+    State.cellFarm.dialogTitleConfirmed = false
+    State.cellFarm.dialogBodyConfirmed = false
+    State.cellFarm.dialogOptionsConfirmed = false
     State.cellFarm.dialogReleaseVisible = false
     State.cellFarm.dialogOptionSent = false
     State.cellFarm.dialogOptionConfirmed = false
@@ -17765,7 +18113,19 @@ function F.summonCellBoss(token)
 
         State.cellFarm.dialogStartSent =
             false
+        State.cellFarm.cradleInteractPromptVisible =
+            false
+        State.cellFarm.cradleInteractPromptText =
+            "None"
+        State.cellFarm.cradleInteractPromptAttempts =
+            0
         State.cellFarm.dialogUiConfirmed =
+            false
+        State.cellFarm.dialogTitleConfirmed =
+            false
+        State.cellFarm.dialogBodyConfirmed =
+            false
+        State.cellFarm.dialogOptionsConfirmed =
             false
         State.cellFarm.dialogReleaseVisible =
             false
@@ -17774,45 +18134,118 @@ function F.summonCellBoss(token)
         State.cellFarm.dialogOptionConfirmed =
             false
 
-        F.setCellFarmStage(
-            "NATIVE NPC INTERACTION",
-            "Calling the game's tryStartNPCInteraction "
-                .. tostring(attempt)
-                .. "/"
-                .. tostring(
-                    Config.CELL_CRADLE_DIALOG_ATTEMPTS
+        -- Re-check/approach if possible, but never prevent the exact Cobalt
+        -- start from firing solely because the measured DialogPart distance
+        -- did not satisfy our helper.
+        pcall(function()
+            F.refineCellCradleDialogPosition(
+                token,
+                npcCradle,
+                worldCradle
+            )
+        end)
+
+        local dialogueConfirmed = false
+        local releaseVisible = false
+        local releaseButton = nil
+        local dialogueDetail = "Waiting for Cradle dialogue"
+
+        local promptVisible,
+            promptText =
+                F.getCellCradleInteractPromptEvidence()
+
+        State.cellFarm.cradleInteractPromptVisible =
+            promptVisible == true
+
+        State.cellFarm.cradleInteractPromptText =
+            promptText
+            or "None"
+
+        if promptVisible then
+            State.cellFarm.cradleInteractPromptAttempts =
+                (
+                    State.cellFarm.cradleInteractPromptAttempts
+                    or 0
                 )
-        )
+                + 1
 
-        local nativeOk,
-            nativeDetail =
-                F.callNativeCradleInteraction(
-                    token,
-                    npcCradle
-                )
+            State.cellFarm.npcInteractionMethod =
+                "Visible Interact (E) prompt"
 
-        local startOk =
-            nativeOk
+            State.cellFarm.npcInteractionSource =
+                "InteractPromptBillboard_NPC"
 
-        if nativeOk then
-            State.cellFarm.dialogStartSent =
-                true
-
-            State.cellFarm.status =
-                "Native NPC interaction called; waiting for Release UI"
-        else
-            -- Compatibility fallback for executors that do not expose getgc
-            -- or debug metadata. This is the exact Cobalt-proven remote.
             F.setCellFarmStage(
-                "DIALOG START FALLBACK",
-                "Native function unavailable; sending exact DialogEvent start"
+                "CRADLE INTERACT (E)",
+                "Visible Interact (E) prompt found - pressing E before exact Cobalt start"
             )
 
-            startOk =
+            F.pressVirtualKey(
+                Enum.KeyCode.E,
+                0x45,
+                Config.CELL_CRADLE_PREP_E_HOLD,
+                "Cradle Interact (E)"
+            )
+
+            dialogueConfirmed,
+                releaseVisible,
+                releaseButton,
+                dialogueDetail =
+                    F.waitForCellCradleDialogue(
+                        token,
+                        Config.CELL_CRADLE_DIALOGUE_DETECT_TIMEOUT,
+                        true
+                    )
+
+            State.cellFarm.dialogUiConfirmed =
+                dialogueConfirmed == true
+
+            State.cellFarm.dialogReleaseVisible =
+                releaseVisible == true
+
+            if dialogueConfirmed
+                and releaseVisible
+            then
+                State.cellFarm.status =
+                    "CONFIRMED: Interact (E) opened the exact Cradle Release dialogue"
+
+                if F.updateCellFarmUI then
+                    F.updateCellFarmUI()
+                end
+            end
+        end
+
+        if not dialogueConfirmed
+            or not releaseVisible
+        then
+            F.setCellFarmStage(
+                "EXACT COBALT DIALOG START",
+                "DialogPart "
+                    .. string.format(
+                        "%.2f",
+                        State.cellFarm.cradleDialogPartDistance
+                        or -1
+                    )
+                    .. " studs | running exact Cobalt start "
+                    .. tostring(attempt)
+                    .. "/"
+                    .. tostring(
+                        Config.CELL_CRADLE_DIALOG_ATTEMPTS
+                    )
+            )
+
+            -- Exact Cobalt snippet supplied by the user. This start is executed
+            -- directly and is not routed through any other interaction helper.
+            local startOk =
                 pcall(function()
-                    remotes.Dialog:FireServer(
+                    local Event =
+                        game:GetService(
+                            "ReplicatedStorage"
+                        ).Remotes.DialogEvent
+
+                    Event:FireServer(
                         "start",
-                        npcCradle,
+                        workspace.NPCs["The Cradle"],
                         10
                     )
                 end)
@@ -17820,64 +18253,78 @@ function F.summonCellBoss(token)
             State.cellFarm.dialogStartSent =
                 startOk == true
 
+            State.cellFarm.npcInteractionFunctionFound =
+                false
+
+            State.cellFarm.npcInteractionCallOk =
+                false
+
+            State.cellFarm.npcInteractionMethod =
+                "Exact Cobalt DialogEvent start"
+
+            State.cellFarm.npcInteractionSource =
+                'DialogEvent:FireServer("start", workspace.NPCs["The Cradle"], 10)'
+
             if startOk then
                 State.movementTelemetry.lastRemote =
                     'DialogEvent("start", workspace.NPCs["The Cradle"], 10)'
+
+                State.cellFarm.status =
+                    "Exact Cobalt start sent; waiting for real Release UI"
             else
                 F.recordCellFailure(
-                    "Cradle native interaction and DialogEvent start both failed"
+                    "Exact Cobalt DialogEvent start failed"
                 )
+
+                State.cellFarm.status =
+                    "Exact Cobalt start pcall failed"
             end
 
-            State.cellFarm.status =
-                "Native interaction unavailable: "
-                .. tostring(nativeDetail)
-        end
+            if F.updateCellFarmUI then
+                F.updateCellFarmUI()
+            end
 
-        if F.updateCellFarmUI then
-            F.updateCellFarmUI()
-        end
-
-        -- This is the authoritative start confirmation. We do NOT send
-        -- option merely because FireServer returned without error.
-        local dialogueConfirmed,
-            releaseVisible,
-            releaseButton,
-            dialogueDetail =
-                F.waitForCellCradleDialogue(
-                    token,
-                    Config.CELL_CRADLE_DIALOG_VISIBLE_WAIT,
-                    true
-                )
-
-        State.cellFarm.dialogUiConfirmed =
-            dialogueConfirmed == true
-
-        State.cellFarm.dialogReleaseVisible =
-            releaseVisible == true
-
-        State.cellFarm.status =
-            dialogueConfirmed
-            and (
-                "CONFIRMED: Release UI rendered"
-                .. (
-                    releaseButton
-                    and (
-                        " | "
-                        .. releaseButton:GetFullName()
+            -- This is the authoritative start confirmation. We do NOT send
+            -- option merely because FireServer returned without error.
+            dialogueConfirmed,
+                releaseVisible,
+                releaseButton,
+                dialogueDetail =
+                    F.waitForCellCradleDialogue(
+                        token,
+                        Config.CELL_CRADLE_DIALOG_VISIBLE_WAIT,
+                        true
                     )
-                    or ""
-                )
-            )
-            or (
-                "NOT CONFIRMED: "
-                .. tostring(
-                    dialogueDetail
-                )
-            )
 
-        if F.updateCellFarmUI then
-            F.updateCellFarmUI()
+            State.cellFarm.dialogUiConfirmed =
+                dialogueConfirmed == true
+
+            State.cellFarm.dialogReleaseVisible =
+                releaseVisible == true
+
+            State.cellFarm.status =
+                dialogueConfirmed
+                and (
+                    "CONFIRMED: Release UI rendered"
+                    .. (
+                        releaseButton
+                        and (
+                            " | "
+                            .. releaseButton:GetFullName()
+                        )
+                        or ""
+                    )
+                )
+                or (
+                    "NOT CONFIRMED: "
+                    .. tostring(
+                        dialogueDetail
+                    )
+                )
+
+            if F.updateCellFarmUI then
+                F.updateCellFarmUI()
+            end
         end
 
         if not dialogueConfirmed
@@ -17885,11 +18332,7 @@ function F.summonCellBoss(token)
         then
             F.setCellFarmStage(
                 "DIALOG NOT CONFIRMED",
-                (
-                    State.cellFarm.npcInteractionFunctionFound
-                    and "Native NPC interaction ran but Release UI did not appear"
-                    or "Dialog start fallback ran but Release UI did not appear"
-                )
+                "Interact (E) and exact Cobalt start did not produce the Release UI"
             )
 
             if attempt
@@ -17910,8 +18353,8 @@ function F.summonCellBoss(token)
             return false
         end
 
-        -- Release is now proven to exist on the player's actual DialogueGui.
-        -- The captured option remote is only allowed after this confirmation.
+        -- The screenshot confirms option 1 is "(Release)". Once the exact
+        -- panel is proven, use the same visible player action first.
         if not F.cellFarmWait(
             token,
             Config.CELL_CRADLE_RELEASE_SETTLE
@@ -17922,9 +18365,69 @@ function F.summonCellBoss(token)
 
         local optionConfirmed = false
 
+        F.setCellFarmStage(
+            "PRESSING RELEASE",
+            "Exact Cradle panel confirmed - pressing option 1 (Release)"
+        )
+
+        F.pressVirtualKey(
+            Enum.KeyCode.One,
+            0x31,
+            Config.CELL_CRADLE_RELEASE_KEY_HOLD,
+            "Cradle option 1 - Release"
+        )
+
+        local keyConfirmDeadline =
+            os.clock()
+            + Config.CELL_CRADLE_RELEASE_KEY_CONFIRM
+
+        while F.isCellFarmActive(token)
+            and os.clock() < keyConfirmDeadline
+        do
+            local rawBoss =
+                (
+                    bossWatcher
+                    and bossWatcher.model
+                )
+                or F.findCellBossModelRaw()
+
+            local dialogVisible,
+                releaseStillVisible =
+                    F.getCellCradleDialogueEvidence()
+
+            if rawBoss
+                and rawBoss.Parent
+            then
+                optionConfirmed = true
+                State.cellFarm.dialogOptionSent = true
+                State.cellFarm.dialogOptionConfirmed = true
+                State.cellFarm.status =
+                    "CONFIRMED: Release accepted; boss model appeared"
+                break
+            end
+
+            if not dialogVisible
+                or not releaseStillVisible
+            then
+                optionConfirmed = true
+                State.cellFarm.dialogOptionSent = true
+                State.cellFarm.dialogOptionConfirmed = true
+                State.cellFarm.status =
+                    "CONFIRMED: Release option closed after key 1"
+                break
+            end
+
+            task.wait(0.05)
+        end
+
+        -- If the visible key 1 path does not transition, use the exact option
+        -- Cobalt remote supplied earlier as a fallback.
         for optionAttempt = 1,
             Config.CELL_CRADLE_OPTION_RETRIES
         do
+            if optionConfirmed then
+                break
+            end
             if not F.isCellFarmActive(token) then
                 cleanup()
                 return false
@@ -17955,7 +18458,7 @@ function F.summonCellBoss(token)
 
             F.setCellFarmStage(
                 "RELEASE CONFIRMED",
-                "Release UI exists; sending exact option remote "
+                "Key 1 did not transition; sending exact Cobalt option fallback "
                     .. tostring(optionAttempt)
                     .. "/"
                     .. tostring(
@@ -17963,11 +18466,24 @@ function F.summonCellBoss(token)
                     )
             )
 
+            -- Exact full Cobalt option command supplied earlier:
+            --
+            -- local Event = game:GetService("ReplicatedStorage").Remotes.DialogEvent
+            -- Event:FireServer(
+            --     "option",
+            --     workspace.Systems.CellOfLifeJunk["The Cradle"],
+            --     5
+            -- )
             local optionOk =
                 pcall(function()
-                    remotes.Dialog:FireServer(
+                    local Event =
+                        game:GetService(
+                            "ReplicatedStorage"
+                        ).Remotes.DialogEvent
+
+                    Event:FireServer(
                         "option",
-                        worldCradle,
+                        workspace.Systems.CellOfLifeJunk["The Cradle"],
                         5
                     )
                 end)
@@ -17980,7 +18496,7 @@ function F.summonCellBoss(token)
                     'DialogEvent("option", workspace.Systems.CellOfLifeJunk["The Cradle"], 5)'
             else
                 F.recordCellFailure(
-                    "Cradle DialogEvent option failed"
+                    "Exact Cobalt Cradle option failed"
                 )
             end
 
@@ -18066,48 +18582,65 @@ function F.summonCellBoss(token)
         end
 
         F.setCellFarmStage(
-            "WAITING FOR BOSS CONFIRMATION",
-            "Release confirmed; waiting for actual The Cell Of Life model"
+            "WAITING TO FIGHT BOSS",
+            "Dialogue complete - waiting for The Cell Of Life; server hop blocked"
         )
 
-        local boss =
-            F.waitForCellBossConfirmed(
-                token,
-                bossWatcher,
-                Config.CELL_CRADLE_BOSS_MODEL_WAIT
-            )
+        local lastBossWaitNotice =
+            os.clock()
 
-        if boss then
-            State.cellFarm.bossSpawnConfirmed =
-                true
+        while F.isCellFarmActive(token) do
+            local boss =
+                F.waitForCellBossConfirmed(
+                    token,
+                    bossWatcher,
+                    Config.CELL_CRADLE_BOSS_MODEL_WAIT
+                )
 
-            State.cellFarm.status =
-                "CONFIRMED: The Cell Of Life spawned and is alive"
+            if boss then
+                State.cellFarm.bossSpawnConfirmed =
+                    true
 
-            if F.updateCellFarmUI then
-                F.updateCellFarmUI()
+                State.cellFarm.status =
+                    "CONFIRMED: The Cell Of Life spawned and is alive - starting fight"
+
+                if F.updateCellFarmUI then
+                    F.updateCellFarmUI()
+                end
+
+                cleanup()
+                return true, boss
             end
 
-            cleanup()
-            return true, boss
-        end
+            -- A slow boss spawn is not a reason to abandon the server.
+            F.setCellFarmStage(
+                "WAITING TO FIGHT BOSS",
+                "Dialogue is finished; still waiting for The Cell Of Life - NO HOP"
+            )
 
-        F.setCellFarmStage(
-            "BOSS NOT CONFIRMED",
-            "Release completed but live Cell model was not confirmed"
-        )
+            if os.clock() - lastBossWaitNotice
+                >= Config.CELL_CRADLE_BOSS_WAIT_NOTICE
+            then
+                lastBossWaitNotice =
+                    os.clock()
 
-        if attempt
-            < Config.CELL_CRADLE_DIALOG_ATTEMPTS
-        then
+                F.recordDiagnosticEvent(
+                    "CellFarm",
+                    "Dialogue complete; still waiting for The Cell Of Life. Server hop remains blocked."
+                )
+            end
+
             if not F.cellFarmWait(
                 token,
-                Config.CELL_CRADLE_RETRY_DELAY
+                0.75
             ) then
                 cleanup()
                 return false
             end
         end
+
+        cleanup()
+        return false
     end
 
     cleanup()
@@ -19447,8 +19980,95 @@ function F.setCellMenuHubHidden(hidden)
             previous = true
         end
 
-        screenGui.Enabled = previous
+        if State.cellFarm.keepHubHidden then
+            screenGui.Enabled =
+                State.cellFarm.hubManuallyOpened
+        else
+            screenGui.Enabled =
+                previous
+        end
     end
+end
+
+
+function F.setCellFarmHubHidden(hidden)
+    if not screenGui
+        or not screenGui.Parent
+    then
+        return false
+    end
+
+    if hidden then
+        State.cellFarm.keepHubHidden =
+            true
+
+        State.cellFarm.hubManuallyOpened =
+            false
+
+        screenGui.Enabled =
+            false
+
+        return true
+    end
+
+    State.cellFarm.keepHubHidden =
+        false
+
+    State.cellFarm.hubManuallyOpened =
+        false
+
+    screenGui.Enabled =
+        true
+
+    if F.setUICollapsed then
+        F.setUICollapsed(
+            false
+        )
+    end
+
+    return true
+end
+
+function F.toggleCellFarmHubForUser()
+    if not screenGui
+        or not screenGui.Parent
+        or not State.cellFarm.keepHubHidden
+        or not (
+            State.cellFarm.enabled
+            or State.cellFarm.running
+        )
+    then
+        return false
+    end
+
+    State.cellFarm.hubManuallyOpened =
+        not State.cellFarm.hubManuallyOpened
+
+    if State.cellFarm.hubManuallyOpened then
+        screenGui.Enabled =
+            true
+
+        if F.setUICollapsed then
+            F.setUICollapsed(
+                false
+            )
+        end
+
+        State.cellFarm.status =
+            "Hub opened with RightShift - turn Full Auto off to stop"
+    else
+        screenGui.Enabled =
+            false
+
+        State.cellFarm.status =
+            "Hub hidden - Full Auto The Cell Of Life continues"
+    end
+
+    if F.updateCellFarmUI then
+        F.updateCellFarmUI()
+    end
+
+    return true
 end
 
 function F.getCellMenuClickPoint(button, attempt)
@@ -20927,13 +21547,13 @@ function F.fightCellBoss(token, boss)
         "The Cell Of Life"
     )
 
-    local deadline =
+    local fightStartedAt =
         os.clock()
-        + Config.CELL_FIGHT_TIMEOUT
 
-    while F.isCellFarmActive(token)
-        and os.clock() < deadline
-    do
+    local timeoutNoticeSent =
+        false
+
+    while F.isCellFarmActive(token) do
         if not boss
             or not boss.Parent
             or (
@@ -21058,18 +21678,25 @@ function F.fightCellBoss(token, boss)
             )
         end
 
+        if not timeoutNoticeSent
+            and os.clock() - fightStartedAt
+                >= Config.CELL_FIGHT_TIMEOUT
+        then
+            timeoutNoticeSent = true
+
+            F.recordDiagnosticEvent(
+                "CellFarm",
+                "Fight exceeded timeout notice threshold; continuing instead of server hopping."
+            )
+
+            State.cellFarm.status =
+                "Long fight - continuing until The Cell Of Life is actually defeated"
+        end
+
         task.wait(0.10)
     end
 
-    return
-        boss
-        and (
-            not boss.Parent
-            or (
-                F.isMonsterAlive
-                and not F.isMonsterAlive(boss)
-            )
-        )
+    return false
 end
 
 function F.collectCellDropConfirmed(drop, token)
@@ -21238,10 +21865,350 @@ function F.collectCellDropConfirmed(drop, token)
     return false
 end
 
-function F.getCellRewardChestRoot(object)
-    if not object
-        or not object.Parent
+function F.formatCellRewardItemList(payload)
+    if type(payload) ~= "table" then
+        return nil, 0
+    end
+
+    local names = {}
+    local count = 0
+
+    for _, entry in pairs(payload) do
+        if type(entry) == "table" then
+            local itemName =
+                entry.n
+                or entry.Name
+                or entry.name
+
+            local rarity =
+                entry.r
+                or entry.Rarity
+                or entry.rarity
+
+            if itemName then
+                count = count + 1
+
+                if #names < 8 then
+                    table.insert(
+                        names,
+                        tostring(itemName)
+                            .. (
+                                rarity
+                                and (
+                                    " ["
+                                    .. tostring(rarity)
+                                    .. "]"
+                                )
+                                or ""
+                            )
+                    )
+                end
+            end
+        end
+    end
+
+    if count <= 0 then
+        return nil, 0
+    end
+
+    return
+        table.concat(
+            names,
+            ", "
+        ),
+        count
+end
+
+function F.startCellRewardEventObserver(token)
+    local remotes =
+        F.getCellRemotes()
+
+    local observer = {
+        connections = {},
+    }
+
+    local function addConnection(connection)
+        if connection then
+            table.insert(
+                observer.connections,
+                connection
+            )
+        end
+    end
+
+    local defeatRemote =
+        remotes
+        and remotes.BossDefeatLabel
+
+    if defeatRemote
+        and defeatRemote:IsA(
+            "RemoteEvent"
+        )
     then
+        local ok,
+            connection =
+                pcall(function()
+                    return defeatRemote.OnClientEvent:Connect(
+                        function(...)
+                            if not F.isCellFarmActive(token) then
+                                return
+                            end
+
+                            State.cellFarm.bossDefeatEvents =
+                                (
+                                    State.cellFarm.bossDefeatEvents
+                                    or 0
+                                )
+                                + 1
+
+                            local args = {...}
+                            local matched = false
+                            local parts = {}
+
+                            for index,
+                                value in ipairs(args)
+                            do
+                                local textValue =
+                                    tostring(value)
+
+                                if #parts < 4 then
+                                    table.insert(
+                                        parts,
+                                        textValue
+                                    )
+                                end
+
+                                if string.find(
+                                    string.upper(
+                                        textValue
+                                    ),
+                                    "CREATION UNDONE",
+                                    1,
+                                    true
+                                ) then
+                                    matched = true
+                                end
+                            end
+
+                            State.cellFarm.bossDefeatLast =
+                                #parts > 0
+                                and table.concat(
+                                    parts,
+                                    " | "
+                                )
+                                or "(no args)"
+
+                            if matched then
+                                State.cellFarm.bossDefeatEventConfirmed =
+                                    true
+
+                                State.cellFarm.lastBossHealthState =
+                                    "DEFEATED"
+
+                                State.cellFarm.status =
+                                    "CONFIRMED BossDefeatLabel: CREATION UNDONE"
+                            end
+
+                            if F.updateCellFarmUI then
+                                F.updateCellFarmUI()
+                            end
+                        end
+                    )
+                end)
+
+        if ok then
+            addConnection(
+                connection
+            )
+        end
+    end
+
+    local itemRemote =
+        remotes
+        and remotes.ItemNotify
+
+    if itemRemote
+        and itemRemote:IsA(
+            "RemoteEvent"
+        )
+    then
+        local ok,
+            connection =
+                pcall(function()
+                    return itemRemote.OnClientEvent:Connect(
+                        function(...)
+                            if not F.isCellFarmActive(token) then
+                                return
+                            end
+
+                            State.cellFarm.itemNotifyEvents =
+                                (
+                                    State.cellFarm.itemNotifyEvents
+                                    or 0
+                                )
+                                + 1
+
+                            local args = {...}
+                            local bestText = nil
+                            local bestCount = 0
+
+                            for _,
+                                value in ipairs(args)
+                            do
+                                local textValue,
+                                    itemCount =
+                                        F.formatCellRewardItemList(
+                                            value
+                                        )
+
+                                if itemCount > bestCount then
+                                    bestCount =
+                                        itemCount
+
+                                    bestText =
+                                        textValue
+                                end
+                            end
+
+                            if bestCount > 0 then
+                                State.cellFarm.itemNotifyItems =
+                                    (
+                                        State.cellFarm.itemNotifyItems
+                                        or 0
+                                    )
+                                    + bestCount
+
+                                State.cellFarm.itemNotifyLast =
+                                    bestText
+                                    or (
+                                        tostring(bestCount)
+                                        .. " item(s)"
+                                    )
+
+                                State.cellFarm.status =
+                                    "CONFIRMED ItemNotifyEvent: "
+                                    .. tostring(
+                                        State.cellFarm.itemNotifyLast
+                                    )
+                            else
+                                State.cellFarm.itemNotifyLast =
+                                    F.describeCellEventArgs(
+                                        ...
+                                    )
+                            end
+
+                            if F.updateCellFarmUI then
+                                F.updateCellFarmUI()
+                            end
+                        end
+                    )
+                end)
+
+        if ok then
+            addConnection(
+                connection
+            )
+        end
+    end
+
+    return observer
+end
+
+function F.stopCellRewardEventObserver(observer)
+    if not observer
+        or type(observer.connections)
+            ~= "table"
+    then
+        return
+    end
+
+    for _,
+        connection in ipairs(
+            observer.connections
+        )
+    do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+
+    table.clear(
+        observer.connections
+    )
+end
+
+function F.getCellInstanceDebugId(object)
+    if typeof(object) ~= "Instance" then
+        return "None"
+    end
+
+    local debugId =
+        "Unavailable"
+
+    pcall(function()
+        debugId =
+            object:GetDebugId()
+    end)
+
+    return tostring(debugId)
+end
+
+function F.isCellNilRewardChestCandidate(object)
+    if typeof(object) ~= "Instance" then
+        return false
+    end
+
+    if object.Parent then
+        return false
+    end
+
+    if not (
+        object:IsA("Model")
+        or object:IsA("BasePart")
+    ) then
+        return false
+    end
+
+    local lowered =
+        string.lower(
+            F.trimText(
+                tostring(
+                    object.Name
+                    or ""
+                )
+            )
+        )
+
+    return
+        lowered == "chest"
+        or string.find(
+            lowered,
+            "chest",
+            1,
+            true
+        ) ~= nil
+        or string.find(
+            lowered,
+            "world boss",
+            1,
+            true
+        ) ~= nil
+end
+
+function F.getCellRewardChestRoot(object)
+    if not object then
+        return nil
+    end
+
+    if not object.Parent
+        and F.isCellNilRewardChestCandidate(
+            object
+        )
+    then
+        return object
+    end
+
+    if not object.Parent then
         return nil
     end
 
@@ -21396,30 +22363,76 @@ function F.collectCellRewardChestCandidates(beforeSnapshot)
     local result = {}
     local seen = {}
 
-    for _, object in ipairs(
-        workspace:GetDescendants()
-    ) do
+    local function consider(object)
         local chest =
             F.getCellRewardChestRoot(
                 object
             )
 
-        if chest
-            and chest.Parent
-            and not seen[chest]
-            and (
-                not beforeSnapshot
-                or not beforeSnapshot[chest]
-            )
-            and F.isCellRewardChestNearBoss(
-                chest
+        if not chest
+            or seen[chest]
+            or (
+                beforeSnapshot
+                and beforeSnapshot[chest]
             )
         then
-            seen[chest] = true
-            table.insert(
-                result,
-                chest
-            )
+            return
+        end
+
+        local nearBoss =
+            true
+
+        if State.cellFarm.lastBossPosition then
+            nearBoss =
+                F.isCellRewardChestNearBoss(
+                    chest
+                )
+        end
+
+        if not nearBoss then
+            return
+        end
+
+        seen[chest] = true
+
+        table.insert(
+            result,
+            chest
+        )
+    end
+
+    for _, object in ipairs(
+        workspace:GetDescendants()
+    ) do
+        consider(
+            object
+        )
+    end
+
+    -- Cobalt showed OpenChest receiving a nil-parent Chest instance.
+    -- Do not hard-code its DebugId; scan the live nil-instance set and keep
+    -- the actual Instance reference for this server/run.
+    if type(getnilinstances) == "function" then
+        local ok,
+            objects =
+                pcall(
+                    getnilinstances
+                )
+
+        if ok
+            and type(objects) == "table"
+        then
+            for _, object in ipairs(
+                objects
+            ) do
+                if F.isCellNilRewardChestCandidate(
+                    object
+                ) then
+                    consider(
+                        object
+                    )
+                end
+            end
         end
     end
 
@@ -21488,9 +22501,7 @@ function F.countCellRewardDrops(beforeSnapshot)
 end
 
 function F.isCellRewardChestOpened(chest)
-    if not chest
-        or not chest.Parent
-    then
+    if not chest then
         return true
     end
 
@@ -21586,10 +22597,21 @@ function F.openCellRewardChest(chest, token, beforeDropSnapshot)
     end
 
     if not chest
-        or not chest.Parent
+        or typeof(chest) ~= "Instance"
     then
-        return true
+        return false
     end
+
+    local initialParent =
+        chest.Parent
+
+    local debugId =
+        F.getCellInstanceDebugId(
+            chest
+        )
+
+    State.cellFarm.rewardLastChestDebugId =
+        debugId
 
     local chestCFrame =
         F.getDropCFrame(
@@ -21599,11 +22621,8 @@ function F.openCellRewardChest(chest, token, beforeDropSnapshot)
     if chestCFrame then
         F.setCellFarmStage(
             "OPENING REWARD CHEST",
-            "Flying to "
-                .. tostring(
-                    chest.Name
-                )
-                .. " for E interaction"
+            "Moving to Chest "
+                .. tostring(debugId)
         )
 
         local reached =
@@ -21624,8 +22643,25 @@ function F.openCellRewardChest(chest, token, beforeDropSnapshot)
 
     F.stopCellRewardMovement()
 
-    -- The live Cell reward chest is opened by the player's normal E input.
-    -- Do not fire ProximityPrompt / ClickDetector directly here.
+    local remotes =
+        F.getCellRemotes()
+
+    local interactPrompt =
+        remotes
+        and remotes.InteractPrompt
+
+    if not interactPrompt
+        or not interactPrompt:IsA(
+            "RemoteEvent"
+        )
+    then
+        F.recordCellFailure(
+            "InteractPromptEvent unavailable for Cell reward chest"
+        )
+
+        return false
+    end
+
     for attempt = 1,
         Config.CELL_REWARD_CHEST_OPEN_RETRIES
     do
@@ -21633,11 +22669,9 @@ function F.openCellRewardChest(chest, token, beforeDropSnapshot)
             return false
         end
 
-        if not chest.Parent
-            or F.isCellRewardChestOpened(
-                chest
-            )
-        then
+        if F.isCellRewardChestOpened(
+            chest
+        ) then
             return true
         end
 
@@ -21646,37 +22680,58 @@ function F.openCellRewardChest(chest, token, beforeDropSnapshot)
                 beforeDropSnapshot
             )
 
+        local itemNotifyBefore =
+            State.cellFarm.itemNotifyEvents
+            or 0
+
+        local itemCountBefore =
+            State.cellFarm.itemNotifyItems
+            or 0
+
         F.setCellFarmStage(
             "OPENING REWARD CHEST",
-            "Pressing E on chest "
+            "Exact OpenChest remote "
                 .. tostring(attempt)
                 .. "/"
                 .. tostring(
                     Config.CELL_REWARD_CHEST_OPEN_RETRIES
                 )
+                .. " | DebugId="
+                .. tostring(debugId)
         )
 
-        State.movementTelemetry.lastAction =
-            "Reward chest: physical E "
-            .. tostring(attempt)
+        local sent =
+            pcall(function()
+                local Event =
+                    game:GetService(
+                        "ReplicatedStorage"
+                    ).Remotes.InteractPromptEvent
 
-        local pressed =
-            F.pressVirtualKey(
-                Enum.KeyCode.E,
-                0x45,
-                Config.CELL_REWARD_CHEST_E_HOLD,
-                "Reward chest: E"
-            )
+                Event:FireServer(
+                    "OpenChest",
+                    chest
+                )
+            end)
 
-        if not pressed then
+        if sent then
+            State.cellFarm.rewardChestRemoteCalls =
+                (
+                    State.cellFarm.rewardChestRemoteCalls
+                    or 0
+                )
+                + 1
+
+            State.movementTelemetry.lastRemote =
+                'InteractPromptEvent:FireServer("OpenChest", Chest)'
+        else
             F.recordCellFailure(
-                "Could not send E to Cell reward chest"
+                "Exact OpenChest remote call failed"
             )
         end
 
         if not F.cellFarmWait(
             token,
-            Config.CELL_REWARD_CHEST_AFTER_E_DELAY
+            Config.CELL_REWARD_CHEST_REMOTE_SETTLE
         ) then
             return false
         end
@@ -21688,11 +22743,21 @@ function F.openCellRewardChest(chest, token, beforeDropSnapshot)
         while F.isCellFarmActive(token)
             and os.clock() < deadline
         do
-            if not chest.Parent
-                or F.isCellRewardChestOpened(
-                    chest
-                )
+            if F.isCellRewardChestOpened(
+                chest
+            ) then
+                State.cellFarm.status =
+                    "CONFIRMED chest opened by state flag/prompt"
+
+                return true
+            end
+
+            if initialParent
+                and not chest.Parent
             then
+                State.cellFarm.status =
+                    "CONFIRMED chest opened: parent removed"
+
                 return true
             end
 
@@ -21702,10 +22767,30 @@ function F.openCellRewardChest(chest, token, beforeDropSnapshot)
                 )
 
             if dropsNow > dropsBefore then
+                State.cellFarm.status =
+                    "CONFIRMED chest opened: new world drops"
+
                 return true
             end
 
-            task.wait(0.12)
+            local itemNotifyNow =
+                State.cellFarm.itemNotifyEvents
+                or 0
+
+            local itemCountNow =
+                State.cellFarm.itemNotifyItems
+                or 0
+
+            if itemNotifyNow > itemNotifyBefore
+                or itemCountNow > itemCountBefore
+            then
+                State.cellFarm.status =
+                    "CONFIRMED chest opened: ItemNotifyEvent received"
+
+                return true
+            end
+
+            task.wait(0.10)
         end
 
         if not F.cellFarmWait(
@@ -21716,17 +22801,13 @@ function F.openCellRewardChest(chest, token, beforeDropSnapshot)
         end
     end
 
-    return
-        not chest.Parent
-        or F.isCellRewardChestOpened(
-            chest
-        )
+    return false
 end
 
 function F.waitForCellRewardDropsStable(token, beforeDropSnapshot)
     F.setCellFarmStage(
-        "WAITING REWARD DROPS",
-        "Waiting until chest loot stops spawning"
+        "WAITING REWARD DROP WAVES",
+        "Waiting for every chest-loot layer to finish spawning"
     )
 
     local lastCount =
@@ -21734,8 +22815,18 @@ function F.waitForCellRewardDropsStable(token, beforeDropSnapshot)
             beforeDropSnapshot
         )
 
+    State.cellFarm.rewardDropCount =
+        lastCount
+
+    State.cellFarm.rewardDropWaves =
+        lastCount > 0
+        and 1
+        or 0
+
     local stableSince =
         os.clock()
+
+    local guardSince = nil
 
     local lastNotice =
         os.clock()
@@ -21748,39 +22839,87 @@ function F.waitForCellRewardDropsStable(token, beforeDropSnapshot)
                 beforeDropSnapshot
             )
 
+        State.cellFarm.rewardDropCount =
+            currentCount
+
         if currentCount ~= lastCount then
-            lastCount = currentCount
-            stableSince = os.clock()
+            lastCount =
+                currentCount
+
+            stableSince =
+                os.clock()
+
+            guardSince =
+                nil
+
+            State.cellFarm.rewardDropWaves =
+                (State.cellFarm.rewardDropWaves or 0)
+                + 1
 
             State.cellFarm.status =
-                "Chest loot spawning: "
+                "Chest loot wave "
+                .. tostring(
+                    State.cellFarm.rewardDropWaves
+                )
+                .. " detected | "
                 .. tostring(currentCount)
                 .. " drops"
 
             if F.updateCellFarmUI then
                 F.updateCellFarmUI()
             end
-        elseif currentCount > 0
-            and os.clock() - stableSince
-                >= Config.CELL_REWARD_DROP_STABLE_WINDOW
-        then
-            return true, currentCount
+        elseif currentCount > 0 then
+            if not guardSince
+                and os.clock() - stableSince
+                    >= Config.CELL_REWARD_DROP_STABLE_WINDOW
+            then
+                guardSince =
+                    os.clock()
+
+                State.cellFarm.status =
+                    "Loot quiet for "
+                    .. tostring(
+                        Config.CELL_REWARD_DROP_STABLE_WINDOW
+                    )
+                    .. "s; final delayed-wave guard running"
+
+                if F.updateCellFarmUI then
+                    F.updateCellFarmUI()
+                end
+            elseif guardSince
+                and os.clock() - guardSince
+                    >= Config.CELL_REWARD_DROP_FINAL_GUARD
+            then
+                return
+                    true,
+                    currentCount
+            end
+        else
+            guardSince = nil
         end
 
         if os.clock() - lastNotice
             >= Config.CELL_REWARD_DROP_NOTICE
         then
-            lastNotice = os.clock()
+            lastNotice =
+                os.clock()
 
             if currentCount == 0 then
                 F.recordCellFailure(
-                    "Reward chests opened but no drops detected yet; still waiting instead of hopping"
+                    "All reward chests opened but no drops detected yet; still waiting and hop remains blocked"
+                )
+            else
+                F.recordDiagnosticEvent(
+                    "CellFarm",
+                    "Still guarding for delayed reward-drop layers; no server hop."
                 )
             end
         end
     end
 
-    return false, lastCount
+    return
+        false,
+        lastCount
 end
 
 function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapshot)
@@ -21806,11 +22945,10 @@ function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapsho
     local firstChestAt = nil
     local lastNewChestAt = os.clock()
     local lastNotice = os.clock()
+    local lastNilScan = 0
 
     local function registerCandidate(object)
-        if not object
-            or not object.Parent
-        then
+        if not object then
             return
         end
 
@@ -21820,7 +22958,6 @@ function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapsho
             )
 
         if not chest
-            or not chest.Parent
             or beforeChestSnapshot[chest]
             or discovered[chest]
             or not F.isCellRewardChestNearBoss(
@@ -21891,9 +23028,32 @@ function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapsho
         end
     end
 
+    local function rescanRewardChests()
+        if os.clock() - lastNilScan
+            < Config.CELL_REWARD_CHEST_NIL_SCAN_INTERVAL
+        then
+            return
+        end
+
+        lastNilScan =
+            os.clock()
+
+        for _, chest in ipairs(
+            F.collectCellRewardChestCandidates(
+                beforeChestSnapshot
+            )
+        ) do
+            registerCandidate(
+                chest
+            )
+        end
+    end
+
     -- Do not leave this server while the death/reward sequence has not
     -- produced either reward chests or actual new drops.
     while F.isCellFarmActive(token) do
+        rescanRewardChests()
+
         local newDropCount =
             F.countCellRewardDrops(
                 beforeDropSnapshot
@@ -21905,23 +23065,20 @@ function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapsho
             break
         end
 
+        -- Do not continue on a partial batch. The Cell reward sequence is
+        -- expected to produce five chests; wait until all five are observed.
         if newDropCount > 0
-            and #discoveredOrder == 0
+            and #discoveredOrder
+                < Config.CELL_REWARD_CHEST_EXPECTED
         then
-            -- Compatibility path if a future game update auto-opens the
-            -- reward containers. We still wait for drop stability below.
-            break
-        end
-
-        if firstChestAt
-            and os.clock() - firstChestAt
-                >= Config.CELL_REWARD_CHEST_FIRST_BATCH_WAIT
-            and #discoveredOrder > 0
-        then
-            -- Open the chests we have instead of waiting forever for a
-            -- replication-delayed fifth chest. The watcher remains active
-            -- while opening, so a late chest is still captured.
-            break
+            State.cellFarm.status =
+                "Loot appeared but only "
+                .. tostring(#discoveredOrder)
+                .. "/"
+                .. tostring(
+                    Config.CELL_REWARD_CHEST_EXPECTED
+                )
+                .. " reward chests confirmed - still waiting"
         end
 
         if os.clock() - lastNotice
@@ -21949,6 +23106,8 @@ function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapsho
     local noNewDeadline = nil
 
     while F.isCellFarmActive(token) do
+        rescanRewardChests()
+
         local chest =
             discoveredOrder[index]
 
@@ -21997,29 +23156,22 @@ function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapsho
                 break
             end
 
-            local newDropCount =
-                F.countCellRewardDrops(
-                    beforeDropSnapshot
+            State.cellFarm.status =
+                "Opened "
+                .. tostring(
+                    State.cellFarm.rewardChestsOpened
                 )
+                .. "/"
+                .. tostring(
+                    Config.CELL_REWARD_CHEST_EXPECTED
+                )
+                .. " reward chests - waiting for remaining chest(s)"
 
-            if newDropCount > 0
-                and State.cellFarm.rewardChestsOpened > 0
-            then
-                if not noNewDeadline then
-                    noNewDeadline =
-                        os.clock()
-                        + Config.CELL_REWARD_CHEST_NO_NEW_WINDOW
-                elseif os.clock()
-                    >= noNewDeadline
-                then
-                    -- If the game produced fewer than five replicated
-                    -- chest instances but loot is already spawning, stop
-                    -- waiting for another chest and wait for loot stability.
-                    break
-                end
-            else
-                noNewDeadline = nil
+            if F.updateCellFarmUI then
+                F.updateCellFarmUI()
             end
+
+            noNewDeadline = nil
 
             task.wait(0.15)
         end
@@ -22031,18 +23183,27 @@ function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapsho
         return false
     end
 
+    if State.cellFarm.rewardChestsOpened
+        < Config.CELL_REWARD_CHEST_EXPECTED
+    then
+        F.setCellFarmStage(
+            "REWARD CHESTS INCOMPLETE",
+            "Fewer than five reward chests opened - hop blocked"
+        )
+
+        return false
+    end
+
     State.cellFarm.status =
-        "Reward chests opened: "
+        "Reward chests complete: "
         .. tostring(
             State.cellFarm.rewardChestsOpened
         )
         .. "/"
         .. tostring(
-            math.max(
-                Config.CELL_REWARD_CHEST_EXPECTED,
-                State.cellFarm.rewardChestsFound
-            )
+            Config.CELL_REWARD_CHEST_EXPECTED
         )
+        .. " | waiting for every loot wave"
 
     if F.updateCellFarmUI then
         F.updateCellFarmUI()
@@ -22285,6 +23446,7 @@ function F.openCellBundles(token)
         F.getEquippedWeaponTool()
 
     local opened = 0
+    local emptyChecks = 0
 
     while F.isCellFarmActive(token)
         and opened
@@ -22302,8 +23464,36 @@ function F.openCellBundles(token)
         end
 
         if not bundle then
-            break
+            emptyChecks =
+                emptyChecks + 1
+
+            F.setCellFarmStage(
+                "BUNDLE LAYER CHECK",
+                "No Bundle visible; checking for delayed/nested bundle layer "
+                    .. tostring(emptyChecks)
+                    .. "/"
+                    .. tostring(
+                        Config.CELL_BUNDLE_EMPTY_RECHECKS
+                    )
+            )
+
+            F.waitForCellInventoryStable(
+                token,
+                Config.CELL_BUNDLE_EMPTY_STABLE_WINDOW,
+                Config.CELL_BUNDLE_EMPTY_STABLE_WINDOW + 2
+            )
+
+            if emptyChecks
+                >= Config.CELL_BUNDLE_EMPTY_RECHECKS
+            then
+                break
+            end
+
+            task.wait(0.20)
+            continue
         end
+
+        emptyChecks = 0
 
         local itemName =
             tostring(bundle.Name)
@@ -22715,22 +23905,51 @@ function F.updateCellFarmUI()
         .. tostring(State.cellFarm.menuLastMethod or "None")
         .. "\nMenu hit: "
         .. tostring(State.cellFarm.menuLastHit or "None")
+        .. "\nHub: "
+        .. (
+            State.cellFarm.keepHubHidden
+            and (
+                State.cellFarm.hubManuallyOpened
+                and "OPEN VIA RIGHTSHIFT"
+                or "HIDDEN DURING FULL AUTO"
+            )
+            or "NORMAL"
+        )
         .. "\nTravel input: "
         .. tostring(State.cellFarm.cradleTravelInput or "OFF")
         .. " | Daily Reward: "
         .. tostring(State.cellFarm.dailyRewardStatus or "Not checked")
         .. "\nLast callback: "
         .. tostring(State.cellFarm.menuLastCallback or "None")
+        .. "\nCradle DialogPart: "
+        .. string.format(
+            "%.2f",
+            tonumber(State.cellFarm.cradleDialogPartDistance)
+            or -1
+        )
+        .. " studs"
         .. "\nNPC interact: "
         .. tostring(State.cellFarm.npcInteractionMethod or "None")
         .. " | found="
         .. tostring(State.cellFarm.npcInteractionFunctionFound == true)
         .. " call="
         .. tostring(State.cellFarm.npcInteractionCallOk == true)
+        .. "\nPrompt(E): "
+        .. tostring(State.cellFarm.cradleInteractPromptVisible == true)
+        .. " | tries="
+        .. tostring(State.cellFarm.cradleInteractPromptAttempts or 0)
+        .. " | "
+        .. tostring(State.cellFarm.cradleInteractPromptText or "None")
         .. "\nDialog: start="
         .. tostring(State.cellFarm.dialogStartSent == true)
         .. " ui="
         .. tostring(State.cellFarm.dialogUiConfirmed == true)
+        .. " title="
+        .. tostring(State.cellFarm.dialogTitleConfirmed == true)
+        .. " body="
+        .. tostring(State.cellFarm.dialogBodyConfirmed == true)
+        .. " opts="
+        .. tostring(State.cellFarm.dialogOptionsConfirmed == true)
         .. " release="
         .. tostring(State.cellFarm.dialogReleaseVisible == true)
         .. " option="
@@ -22770,7 +23989,25 @@ function F.updateCellFarmUI()
         .. tostring(State.cellFarm.rewardChestsOpened or 0)
         .. "/"
         .. tostring(State.cellFarm.rewardChestsFound or 0)
-        .. " | Bundles: "
+        .. " | OpenRemote: "
+        .. tostring(State.cellFarm.rewardChestRemoteCalls or 0)
+        .. " | Drop waves: "
+        .. tostring(State.cellFarm.rewardDropWaves or 0)
+        .. " | Drops: "
+        .. tostring(State.cellFarm.rewardDropCount or 0)
+        .. "\nBossDefeat RX: "
+        .. tostring(State.cellFarm.bossDefeatEvents or 0)
+        .. " confirmed="
+        .. tostring(State.cellFarm.bossDefeatEventConfirmed == true)
+        .. " | ItemNotify RX: "
+        .. tostring(State.cellFarm.itemNotifyEvents or 0)
+        .. " items="
+        .. tostring(State.cellFarm.itemNotifyItems or 0)
+        .. "\nLast item: "
+        .. tostring(State.cellFarm.itemNotifyLast or "None")
+        .. " | Chest DebugId: "
+        .. tostring(State.cellFarm.rewardLastChestDebugId or "None")
+        .. "\nBundles: "
         .. tostring(State.cellFarm.bundlesOpened)
         .. "\nSold: "
         .. tostring(State.cellFarm.itemsSold)
@@ -22904,7 +24141,9 @@ function F.runCellFarm(token, resumed)
     local boss =
         F.getCellBoss()
 
-    if not boss then
+    while F.isCellFarmActive(token)
+        and not boss
+    do
         local reached =
             F.flyToCellCradle(
                 token
@@ -22912,31 +24151,54 @@ function F.runCellFarm(token, resumed)
 
         if not reached then
             F.recordCellFailure(
-                "Could not reach The Cradle"
+                "Could not reach The Cradle; retrying same server"
             )
-            return F.cellFarmHop(
+
+            F.setCellFarmStage(
+                "CRADLE RETRY",
+                "Cradle unavailable temporarily - NO SERVER HOP"
+            )
+
+            if not F.cellFarmWait(
                 token,
-                "Cradle unavailable"
-            )
-        end
+                Config.CELL_CRADLE_SAME_SERVER_RETRY
+            ) then
+                return false
+            end
+        else
+            local summonOk,
+                summonedBoss =
+                    F.summonCellBoss(
+                        token
+                    )
 
-        local summonOk,
-            summonedBoss =
-                F.summonCellBoss(
-                    token
-                )
+            if summonOk
+                and summonedBoss
+            then
+                boss =
+                    summonedBoss
+                break
+            end
 
-        if not summonOk then
             F.recordCellFailure(
-                "Cell summon timeout / server already cleared"
+                "Cell summon not confirmed; retrying same server instead of hopping"
             )
-            return F.cellFarmHop(
-                token,
-                "Cell unavailable in this server"
-            )
-        end
 
-        boss = summonedBoss
+            F.setCellFarmStage(
+                "SUMMON RETRY",
+                "Conversation/boss not confirmed - staying in this server"
+            )
+
+            if not F.cellFarmWait(
+                token,
+                Config.CELL_CRADLE_SAME_SERVER_RETRY
+            ) then
+                return false
+            end
+
+            boss =
+                F.getCellBoss()
+        end
     end
 
     if not F.isCellFarmActive(token) then
@@ -22951,6 +24213,21 @@ function F.runCellFarm(token, resumed)
 
     State.cellFarm.rewardChestsFound = 0
     State.cellFarm.rewardChestsOpened = 0
+    State.cellFarm.rewardChestRemoteCalls = 0
+    State.cellFarm.rewardLastChestDebugId = "None"
+    State.cellFarm.rewardDropWaves = 0
+    State.cellFarm.rewardDropCount = 0
+    State.cellFarm.bossDefeatEventConfirmed = false
+    State.cellFarm.bossDefeatEvents = 0
+    State.cellFarm.bossDefeatLast = "None"
+    State.cellFarm.itemNotifyEvents = 0
+    State.cellFarm.itemNotifyItems = 0
+    State.cellFarm.itemNotifyLast = "None"
+
+    local rewardEventObserver =
+        F.startCellRewardEventObserver(
+            token
+        )
 
     local fought =
         F.fightCellBoss(
@@ -22959,17 +24236,81 @@ function F.runCellFarm(token, resumed)
         )
 
     if not F.isCellFarmActive(token) then
+        F.stopCellRewardEventObserver(
+            rewardEventObserver
+        )
+
         return false
     end
 
     if not fought then
         F.recordCellFailure(
-            "Cell fight timeout or recovery failed"
+            "Cell fight recovery interrupted; staying in the same server"
         )
-        return F.cellFarmHop(
-            token,
-            "Fight failed"
+
+        F.setCellFarmStage(
+            "FIGHT RECOVERY",
+            "Fight interrupted - waiting/reacquiring The Cell Of Life; NO HOP"
         )
+
+        while F.isCellFarmActive(token)
+            and not fought
+        do
+            local liveBoss =
+                F.getCellBoss()
+
+            if liveBoss then
+                boss =
+                    liveBoss
+
+                fought =
+                    F.fightCellBoss(
+                        token,
+                        boss
+                    )
+            elseif State.cellFarm.lastBossHealthState
+                    == "DEFEATED"
+                or (
+                    tonumber(
+                        State.cellFarm.lastBossMaxHealth
+                    )
+                    or 0
+                ) > 0
+                and (
+                    tonumber(
+                        State.cellFarm.lastBossHealth
+                    )
+                    or 0
+                ) <= 0
+            then
+                fought = true
+                break
+            else
+                local rewardCandidates =
+                    F.collectCellRewardChestCandidates(
+                        rewardChestSnapshot
+                    )
+
+                if #rewardCandidates > 0 then
+                    fought = true
+                    break
+                end
+
+                State.cellFarm.status =
+                    "Waiting for boss/reward evidence - staying in this server"
+
+                if not F.cellFarmWait(
+                    token,
+                    1.00
+                ) then
+                    return false
+                end
+            end
+        end
+
+        if not F.isCellFarmActive(token) then
+            return false
+        end
     end
 
     State.cellFarm.kills =
@@ -22984,8 +24325,10 @@ function F.runCellFarm(token, resumed)
     end
 
     F.setCellFarmStage(
-        "DEFEATED",
-        "CREATION UNDONE - waiting for reward chests"
+        "BOSS DEATH / REWARD WATCH",
+        State.cellFarm.bossDefeatEventConfirmed
+            and "CONFIRMED CREATION UNDONE - watching for all 5 reward chests"
+            or "Boss death detected - waiting for BossDefeatLabel and all 5 reward chests"
     )
 
     local rewardsReady =
@@ -22996,6 +24339,10 @@ function F.runCellFarm(token, resumed)
         )
 
     if not F.isCellFarmActive(token) then
+        F.stopCellRewardEventObserver(
+            rewardEventObserver
+        )
+
         return false
     end
 
@@ -23007,8 +24354,17 @@ function F.runCellFarm(token, resumed)
             "REWARD WAIT",
             "Reward sequence incomplete - hop blocked"
         )
+
+        F.stopCellRewardEventObserver(
+            rewardEventObserver
+        )
+
         return false
     end
+
+    F.stopCellRewardEventObserver(
+        rewardEventObserver
+    )
 
     F.collectCellBossLoot(
         token,
@@ -23165,11 +24521,9 @@ function F.stopCellFarm(restorePrevious, reason)
     State.cellFarm.launchFromMenu =
         false
 
-    if F.setCellMenuHubHidden then
-        F.setCellMenuHubHidden(
-            false
-        )
-    end
+    F.setCellFarmHubHidden(
+        false
+    )
 
     F.updateCellFarmUI()
     F.markConfigDirty()
@@ -23210,6 +24564,16 @@ function F.startCellFarm(resumed)
         State.cellFarm.lootCollected = 0
         State.cellFarm.rewardChestsFound = 0
         State.cellFarm.rewardChestsOpened = 0
+        State.cellFarm.rewardChestRemoteCalls = 0
+        State.cellFarm.rewardLastChestDebugId = "None"
+        State.cellFarm.rewardDropWaves = 0
+        State.cellFarm.rewardDropCount = 0
+        State.cellFarm.bossDefeatEventConfirmed = false
+        State.cellFarm.bossDefeatEvents = 0
+        State.cellFarm.bossDefeatLast = "None"
+        State.cellFarm.itemNotifyEvents = 0
+        State.cellFarm.itemNotifyItems = 0
+        State.cellFarm.itemNotifyLast = "None"
         State.cellFarm.bundlesOpened = 0
         State.cellFarm.itemsSold = 0
         State.cellFarm.hops = 0
@@ -23221,10 +24585,18 @@ function F.startCellFarm(resumed)
         State.cellFarm.lastBossHealthState = "WAITING"
         State.cellFarm.lastBossHealthUIAt = 0
         State.cellFarm.dialogStartSent = false
+        State.cellFarm.dialogTitleConfirmed = false
+        State.cellFarm.dialogBodyConfirmed = false
+        State.cellFarm.dialogOptionsConfirmed = false
         State.cellFarm.npcInteractionFunctionFound = false
         State.cellFarm.npcInteractionCallOk = false
         State.cellFarm.npcInteractionMethod = "None"
         State.cellFarm.npcInteractionSource = "None"
+        State.cellFarm.cradleDialogPartDistance = -1
+        State.cellFarm.cradleDialogPartPath = "None"
+        State.cellFarm.cradleInteractPromptVisible = false
+        State.cellFarm.cradleInteractPromptText = "None"
+        State.cellFarm.cradleInteractPromptAttempts = 0
         State.cellFarm.dialogUiConfirmed = false
         State.cellFarm.dialogReleaseVisible = false
         State.cellFarm.dialogOptionSent = false
@@ -23246,6 +24618,12 @@ function F.startCellFarm(resumed)
 
     State.cellFarm.enabled = true
     State.cellFarm.running = true
+
+    -- Teleport-resumed runs also stay hidden automatically.
+    F.setCellFarmHubHidden(
+        true
+    )
+
     F.setCellResumeFlag(true)
     State.cellFarm.stage =
         resumed
@@ -27192,7 +28570,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics 30 FPS / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("Drops v6.4.20: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
+print("Drops v6.4.27: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -27212,14 +28590,14 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.4.20.")
+    warn("[The Veil Hub] loadstring is required to launch v6.4.27.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.4.20 compile failed:", compileError)
+    warn("[The Veil Hub] v6.4.27 compile failed:", compileError)
     return
 end
 
