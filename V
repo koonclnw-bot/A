@@ -1,6 +1,7 @@
--- The Veil Hub v6.4.34 Player Near Boss Instant Hop
--- If another live player is within 120 studs of The Cell Of Life during the
--- fight, combat stops and the Cell resume-safe server hop starts immediately.
+-- The Veil Hub v6.4.35 Background Cradle Input
+-- Physical E/1 is still attempted normally.
+-- If Roblox is unfocused/minimized, exact Cradle DialogEvent equivalents are
+-- used as background-safe fallbacks until the next verified state is reached.
 
 local runtimeSource = [==============[
 -- =========================================================
@@ -57,6 +58,20 @@ local runtimeSource = [==============[
 -- =========================================================
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
+
+-- Local window-focus tracker. VirtualInputManager is still attempted in the
+-- background, but a minimized/unfocused Roblox client may not deliver physical
+-- key semantics reliably, so Cradle has exact remote equivalents as fallback.
+local RobloxWindowFocused = true
+
+UserInputService.WindowFocused:Connect(function()
+    RobloxWindowFocused = true
+end)
+
+UserInputService.WindowFocusReleased:Connect(function()
+    RobloxWindowFocused = false
+end)
+
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService = game:GetService("TweenService")
@@ -318,6 +333,7 @@ local Config = {
     CELL_CRADLE_E_SPAM_HOLD = 0.06,
     CELL_CRADLE_ONE_SPAM_INTERVAL = 0.18,
     CELL_CRADLE_ONE_SPAM_HOLD = 0.06,
+    CELL_CRADLE_BACKGROUND_REMOTE_INTERVAL = 0.35,
     CELL_CRADLE_SPAM_RECHECK_POSITION_EVERY = 4.0,
     CELL_CRADLE_RECORDER_ONLY = false,
     CELL_CRADLE_RECORDER_MANUAL_WAIT = 60.0,
@@ -374,7 +390,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.4.34 Player Near Boss Instant Hop",
+    HUB_VERSION = "v6.4.35 Background Cradle Input",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -801,6 +817,10 @@ local State = {
         cradleESpamCount = 0,
         cradleOneSpamCount = 0,
         cradleSpamPhase = "OFF",
+        cradleBackgroundMode = false,
+        cradleBackgroundStartCalls = 0,
+        cradleBackgroundOptionCalls = 0,
+        cradleBackgroundLastAction = "None",
         dialogClientEvents = 0,
         dialogLastClientEvent = "None",
         bossSpawnConfirmed = false,
@@ -5223,7 +5243,7 @@ State.cellStopButton = F.createActionRow(
     "STOP NOW"
 )
 
-State.cellStatusCard = F.createCard(State.cellFarmSection, 550)
+State.cellStatusCard = F.createCard(State.cellFarmSection, 590)
 State.cellStatusLabel = F.createTextLabel(
     State.cellStatusCard,
     "Cell Farm: OFF",
@@ -19426,6 +19446,125 @@ function F.settleCellAtCradle(token)
 end
 
 
+
+function F.fireCellCradleBackgroundStart()
+    local npcs =
+        workspace:FindFirstChild(
+            "NPCs"
+        )
+
+    local npcCradle =
+        npcs
+        and npcs:FindFirstChild(
+            "The Cradle"
+        )
+
+    local remotes =
+        game:GetService(
+            "ReplicatedStorage"
+        ):FindFirstChild(
+            "Remotes"
+        )
+
+    local event =
+        remotes
+        and remotes:FindFirstChild(
+            "DialogEvent"
+        )
+
+    if not npcCradle
+        or not event
+        or not event:IsA("RemoteEvent")
+    then
+        return false
+    end
+
+    local ok =
+        pcall(function()
+            event:FireServer(
+                "start",
+                npcCradle,
+                10
+            )
+        end)
+
+    if ok then
+        State.cellFarm.cradleBackgroundStartCalls =
+            (
+                State.cellFarm.cradleBackgroundStartCalls
+                or 0
+            )
+            + 1
+
+        State.cellFarm.cradleBackgroundLastAction =
+            'DialogEvent("start", The Cradle, 10)'
+    end
+
+    return ok
+end
+
+function F.fireCellCradleBackgroundRelease()
+    local systems =
+        workspace:FindFirstChild(
+            "Systems"
+        )
+
+    local junk =
+        systems
+        and systems:FindFirstChild(
+            "CellOfLifeJunk"
+        )
+
+    local worldCradle =
+        junk
+        and junk:FindFirstChild(
+            "The Cradle"
+        )
+
+    local remotes =
+        game:GetService(
+            "ReplicatedStorage"
+        ):FindFirstChild(
+            "Remotes"
+        )
+
+    local event =
+        remotes
+        and remotes:FindFirstChild(
+            "DialogEvent"
+        )
+
+    if not worldCradle
+        or not event
+        or not event:IsA("RemoteEvent")
+    then
+        return false
+    end
+
+    local ok =
+        pcall(function()
+            event:FireServer(
+                "option",
+                worldCradle,
+                5
+            )
+        end)
+
+    if ok then
+        State.cellFarm.cradleBackgroundOptionCalls =
+            (
+                State.cellFarm.cradleBackgroundOptionCalls
+                or 0
+            )
+            + 1
+
+        State.cellFarm.cradleBackgroundLastAction =
+            'DialogEvent("option", The Cradle, 5)'
+    end
+
+    return ok
+end
+
 function F.runCellCradlePhysicalSpamSequence(
     token,
     bossWatcher,
@@ -19540,6 +19679,28 @@ function F.runCellCradlePhysicalSpamSequence(
                 or 0
             )
             + 1
+
+        State.cellFarm.cradleBackgroundMode =
+            RobloxWindowFocused == false
+
+        if RobloxWindowFocused == false then
+            local now =
+                os.clock()
+
+            State.cellFarm._lastBackgroundStartAt =
+                State.cellFarm._lastBackgroundStartAt
+                or 0
+
+            if now
+                - State.cellFarm._lastBackgroundStartAt
+                >= Config.CELL_CRADLE_BACKGROUND_REMOTE_INTERVAL
+            then
+                State.cellFarm._lastBackgroundStartAt =
+                    now
+
+                F.fireCellCradleBackgroundStart()
+            end
+        end
 
         State.cellFarm.status =
             "E spam "
@@ -19662,6 +19823,28 @@ function F.runCellCradlePhysicalSpamSequence(
                 )
                 + 1
 
+            State.cellFarm.cradleBackgroundMode =
+                RobloxWindowFocused == false
+
+            if RobloxWindowFocused == false then
+                local now =
+                    os.clock()
+
+                State.cellFarm._lastBackgroundOptionAt =
+                    State.cellFarm._lastBackgroundOptionAt
+                    or 0
+
+                if now
+                    - State.cellFarm._lastBackgroundOptionAt
+                    >= Config.CELL_CRADLE_BACKGROUND_REMOTE_INTERVAL
+                then
+                    State.cellFarm._lastBackgroundOptionAt =
+                        now
+
+                    F.fireCellCradleBackgroundRelease()
+                end
+            end
+
             State.cellFarm.dialogOptionSent =
                 true
 
@@ -19780,6 +19963,10 @@ function F.summonCellBoss(token)
     State.cellFarm.cradleESpamCount = 0
     State.cellFarm.cradleOneSpamCount = 0
     State.cellFarm.cradleSpamPhase = "OFF"
+    State.cellFarm.cradleBackgroundMode = false
+    State.cellFarm.cradleBackgroundStartCalls = 0
+    State.cellFarm.cradleBackgroundOptionCalls = 0
+    State.cellFarm.cradleBackgroundLastAction = "None"
     State.cellFarm.dialogClientEvents = 0
     State.cellFarm.dialogLastClientEvent = "None"
     State.cellFarm.bossSpawnConfirmed = false
@@ -26421,6 +26608,20 @@ function F.updateCellFarmUI()
         .. tostring(State.cellFarm.cradleESpamCount or 0)
         .. " | 1="
         .. tostring(State.cellFarm.cradleOneSpamCount or 0)
+        .. "\nWindow: "
+        .. (
+            RobloxWindowFocused
+            and "FOCUSED"
+            or "UNFOCUSED/MINIMIZED"
+        )
+        .. " | bg="
+        .. tostring(State.cellFarm.cradleBackgroundMode == true)
+        .. " | start="
+        .. tostring(State.cellFarm.cradleBackgroundStartCalls or 0)
+        .. " | option="
+        .. tostring(State.cellFarm.cradleBackgroundOptionCalls or 0)
+        .. "\nBG last: "
+        .. tostring(State.cellFarm.cradleBackgroundLastAction or "None")
         .. "\nDialog RX: "
         .. tostring(State.cellFarm.dialogClientEvents or 0)
         .. " | "
@@ -27196,6 +27397,10 @@ function F.startCellFarm(resumed)
         State.cellFarm.cradleESpamCount = 0
         State.cellFarm.cradleOneSpamCount = 0
         State.cellFarm.cradleSpamPhase = "OFF"
+        State.cellFarm.cradleBackgroundMode = false
+        State.cellFarm.cradleBackgroundStartCalls = 0
+        State.cellFarm.cradleBackgroundOptionCalls = 0
+        State.cellFarm.cradleBackgroundLastAction = "None"
         State.cellFarm.dialogClientEvents = 0
         State.cellFarm.dialogLastClientEvent = "None"
         State.cellFarm.bossSpawnConfirmed = false
@@ -31172,7 +31377,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics 30 FPS / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("Drops v6.4.34: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
+print("Drops v6.4.35: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -31192,14 +31397,14 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.4.34.")
+    warn("[The Veil Hub] loadstring is required to launch v6.4.35.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.4.34 compile failed:", compileError)
+    warn("[The Veil Hub] v6.4.35 compile failed:", compileError)
     return
 end
 
