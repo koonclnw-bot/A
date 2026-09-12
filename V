@@ -1,6 +1,6 @@
--- The Veil Hub v6.4.32 Cradle E+1 Physical Spam
--- E repeats until exact Cradle dialogue is confirmed.
--- Then 1 repeats until The Cell Of Life is observed and alive-confirmed.
+-- The Veil Hub v6.4.34 Player Near Boss Instant Hop
+-- If another live player is within 120 studs of The Cell Of Life during the
+-- fight, combat stops and the Cell resume-safe server hop starts immediately.
 
 local runtimeSource = [==============[
 -- =========================================================
@@ -38,7 +38,7 @@ local runtimeSource = [==============[
 --   - Auto Sell by Rarity + Never Sell names
 --   - Dynamic nearest Merchant discovery from workspace.NPCs
 --   - Supports every NPC whose name contains Merchant; nearest one is selected
---   - Inventory 150/150 detection + Auto Farm full-inventory sell recovery
+--   - Inventory-full / confirmed-pickup-block detection + Merchant sell recovery
 --   - Farm target names are automatically protected from selling
 --   - Auto Silver Gacha anywhere + 20-minute auto cycle + cooldown probing
 --   - Auto Night Call inventory detection + one confirmed use per server
@@ -243,6 +243,9 @@ local Config = {
     CELL_FIGHT_TIMEOUT = 420,
     CELL_BOSS_HP_UI_INTERVAL = 0.20,
     CELL_RESPAWN_WAIT = 22,
+    CELL_PLAYER_NEAR_BOSS_HOP_RADIUS = 120,
+    CELL_PLAYER_NEAR_BOSS_CHECK_INTERVAL = 0.15,
+    CELL_PLAYER_NEAR_BOSS_HOP_RETRY = 1.25,
 
     -- Cell death/reward sequence. The Cell does not award loot at HP 0;
     -- five World Boss reward chests appear after its death animation.
@@ -371,7 +374,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.4.32 Cradle E+1 Physical Spam",
+    HUB_VERSION = "v6.4.34 Player Near Boss Instant Hop",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -837,6 +840,11 @@ local State = {
         lastBossHealthState = "WAITING",
         lastBossHealthUIAt = 0,
         lastBossPosition = nil,
+        nearbyBossPlayerName = "None",
+        nearbyBossPlayerDistance = -1,
+        nearbyBossPlayerEvidence = "None",
+        playerAvoidHopTriggered = false,
+        playerAvoidHopAttempts = 0,
         startedAt = 0,
     },
     cellFarmToggle = nil,
@@ -934,7 +942,6 @@ local State = {
     sellRarityCard = nil,
     neverSellNames = {},
     neverSellOrder = {},
-    sellThreshold = 8,
     sellBeforeHop = true,
     sellStatus = "Idle",
     soldCount = 0,
@@ -944,7 +951,6 @@ local State = {
     inventoryCapacityLabel = nil,
     sellToggle = nil,
     sellBeforeHopToggle = nil,
-    sellThresholdSlider = nil,
     neverSellInput = nil,
     sellStatusLabel = nil,
     sellNowButton = nil,
@@ -4587,7 +4593,7 @@ local sellSection =
 State.sellToggle = F.createToggle(
     sellSection,
     "Auto Sell",
-    "Sell matching items by threshold. At 150/150 or pickup failure, Auto Farm sells; if Merchant is not streamed, it resets to town once and retries.",
+    "No item-count threshold. Keep collecting normally; sell only when inventory is full or a real pickup cannot be confirmed. If Merchant is not streamed, reset to town once and retry.",
     false
 )
 
@@ -4638,16 +4644,6 @@ State.neverSellInput = F.createAutocompleteTags(
             State.updateSellStatus()
         end
     end
-)
-
-State.sellThresholdSlider = F.createSlider(
-    sellSection,
-    "Sell Threshold",
-    1,
-    30,
-    State.sellThreshold,
-    " items",
-    1
 )
 
 State.sellBeforeHopToggle = F.createToggle(
@@ -5227,7 +5223,7 @@ State.cellStopButton = F.createActionRow(
     "STOP NOW"
 )
 
-State.cellStatusCard = F.createCard(State.cellFarmSection, 525)
+State.cellStatusCard = F.createCard(State.cellFarmSection, 550)
 State.cellStatusLabel = F.createTextLabel(
     State.cellStatusCard,
     "Cell Farm: OFF",
@@ -9482,15 +9478,31 @@ function F.runAutoFarmStep()
             F.isInventoryFull()
 
     if isFull then
-        F.setFarmState("SELLING", "Inventory full - selling")
-        F.tryAutoSellForFarm(
-            "Inventory full "
-            .. tostring(capacityCurrent)
-            .. "/"
-            .. tostring(capacityMax)
-            .. " - selling"
-        )
+        if State.sellEnabled then
+            F.setFarmState(
+                "SELLING",
+                "Inventory full - flying to Merchant"
+            )
 
+            F.tryAutoSellForFarm(
+                "Inventory full "
+                .. tostring(capacityCurrent)
+                .. "/"
+                .. tostring(capacityMax)
+                .. " - selling"
+            )
+        else
+            F.setFarmState(
+                "INVENTORY_FULL",
+                "Inventory full "
+                    .. tostring(capacityCurrent)
+                    .. "/"
+                    .. tostring(capacityMax)
+                    .. " | Auto Sell OFF"
+            )
+        end
+
+        F.updateFarmStatus()
         return
     end
 
@@ -9543,25 +9555,63 @@ function F.runAutoFarmStep()
                 maxNow =
                     F.isInventoryFull()
 
-            F.setFarmState(
-                fullNow and "SELLING" or "RECOVERING",
+            local pickupBlocked =
+                (State.farmPickupFailureCount or 0) > 0
+
+            if (
                 fullNow
-                and (
-                    "Inventory full "
-                    .. tostring(currentNow)
-                    .. "/"
-                    .. tostring(maxNow)
+                or pickupBlocked
+            )
+                and State.sellEnabled
+            then
+                F.setFarmState(
+                    "SELLING",
+                    fullNow
+                    and (
+                        "Inventory full "
+                        .. tostring(currentNow)
+                        .. "/"
+                        .. tostring(maxNow)
+                        .. " - flying to Merchant"
+                    )
+                    or "Pickup could not be confirmed - flying to Merchant"
                 )
-                or "Pickup failed - checking inventory"
-            )
 
-            F.updateFarmStatus()
+                F.updateFarmStatus()
 
-            F.tryAutoSellForFarm(
-                fullNow
-                and "Inventory full - selling"
-                or "Pickup failed - selling for space"
-            )
+                F.tryAutoSellForFarm(
+                    fullNow
+                    and "Inventory full - selling"
+                    or "Pickup blocked after all retries - selling for space"
+                )
+            elseif fullNow then
+                F.setFarmState(
+                    "INVENTORY_FULL",
+                    "Inventory full "
+                        .. tostring(currentNow)
+                        .. "/"
+                        .. tostring(maxNow)
+                        .. " | Auto Sell OFF"
+                )
+
+                F.updateFarmStatus()
+            elseif pickupBlocked then
+                F.setFarmState(
+                    "PICKUP_BLOCKED",
+                    "Pickup blocked after all retries | Auto Sell OFF"
+                )
+
+                F.updateFarmStatus()
+            else
+                -- Flight/path interruption is not proof that inventory is
+                -- blocked. Retry farming without wasting a Merchant trip.
+                F.setFarmState(
+                    "RECOVERING",
+                    "Movement/route failed - retrying without selling"
+                )
+
+                F.updateFarmStatus()
+            end
         end
 
         State.farmBusy = false
@@ -10032,8 +10082,7 @@ function F.updateSellStatus()
         .. tostring(capacityCurrent)
         .. "/"
         .. tostring(capacityMax)
-        .. " | Threshold: "
-        .. tostring(State.sellThreshold)
+        .. " | Mode: FULL/BLOCKED ONLY"
         .. " | Sold confirmed: "
         .. tostring(State.soldCount)
 end
@@ -10486,16 +10535,9 @@ function F.runAutoSell(forceSell, options)
         return true
     end
 
-    if not forceSell
-        and #candidates < State.sellThreshold
-    then
-        State.sellStatus =
-            "Waiting for threshold"
-
-        F.updateSellStatus()
-        return false
-    end
-
+    -- No item-count threshold. If this function is called, sell the
+    -- currently eligible items. Automatic callers only invoke it when the
+    -- inventory is full or a confirmed pickup is blocked.
     -- Lock Auto Farm while we search/reset/sell so the character
     -- cannot be moved away by another automation step.
     State.sellBusy = true
@@ -10800,6 +10842,8 @@ function F.tryAutoSellForFarm(reason)
             F.getInventoryCapacity()
 
     if success then
+        State.farmPickupFailureCount = 0
+
         State.farmStatus =
             "Sold for space "
             .. tostring(afterCurrent)
@@ -14128,7 +14172,6 @@ function F.captureProfileSettings()
             enabled = profileSellEnabled,
             rarities = F.exportRaritySet(State.sellRaritySet),
             neverSell = F.deepCopySerializable(State.neverSellOrder),
-            threshold = State.sellThreshold,
             beforeHop = State.sellBeforeHop,
         },
         Combat = {
@@ -14274,7 +14317,6 @@ function F.applyProfileSettings(profile)
     for _, name in ipairs(State.neverSellOrder) do
         State.neverSellNames[string.lower(tostring(name))] = true
     end
-    State.sellThreshold = math.clamp(tonumber(sell.threshold) or 8, 1, 30)
     State.sellBeforeHop = sell.beforeHop ~= false
 
     State.monsterLockEnabled = combat.monsterLock == true
@@ -14706,8 +14748,6 @@ function F.getConfigData()
             ),
         neverSell =
             State.neverSellOrder,
-        sellThreshold =
-            State.sellThreshold,
         sellBeforeHop =
             State.sellBeforeHop,
 
@@ -14841,7 +14881,6 @@ function F.loadFarmConfig()
         decoded.sellEnabled = sell.enabled
         decoded.sellRarities = sell.rarities
         decoded.neverSell = sell.neverSell
-        decoded.sellThreshold = sell.threshold
         decoded.sellBeforeHop = sell.beforeHop
         decoded.monsterLockEnabled = combat.monsterLock
         decoded.monsterLockHeight = combat.height
@@ -15121,15 +15160,6 @@ function F.loadFarmConfig()
             end
         end
     end
-
-    State.sellThreshold =
-        math.clamp(
-            tonumber(
-                decoded.sellThreshold
-            ) or 8,
-            1,
-            30
-        )
 
     State.sellBeforeHop =
         decoded.sellBeforeHop ~= false
@@ -15447,11 +15477,6 @@ function F.applyFarmConfigToUI()
         )
     end
 
-    if State.sellThresholdSlider then
-        State.sellThresholdSlider:Set(
-            State.sellThreshold
-        )
-    end
 end
 
 function F.getQueueOnTeleport()
@@ -23434,6 +23459,309 @@ function F.restoreCellPreviousState()
     F.updateNightCallStatus()
 end
 
+
+function F.getNearbyCellBossPlayer(boss)
+    if not boss
+        or not boss.Parent
+    then
+        return nil
+    end
+
+    local bossPart =
+        F.getMonsterPart(
+            boss
+        )
+
+    if not bossPart then
+        return nil
+    end
+
+    local nearestPlayer = nil
+    local nearestDistance = math.huge
+    local nearestEvidence = "None"
+
+    for _, player in ipairs(
+        Players:GetPlayers()
+    ) do
+        if player ~= LocalPlayer then
+            local character =
+                player.Character
+
+            local root =
+                character
+                and (
+                    character:FindFirstChild(
+                        "HumanoidRootPart"
+                    )
+                    or character.PrimaryPart
+                )
+
+            local humanoid =
+                character
+                and character:FindFirstChildOfClass(
+                    "Humanoid"
+                )
+
+            if root
+                and root:IsA("BasePart")
+                and humanoid
+                and humanoid.Health > 0
+            then
+                local distance =
+                    (
+                        root.Position
+                        - bossPart.Position
+                    ).Magnitude
+
+                if distance
+                    <= Config.CELL_PLAYER_NEAR_BOSS_HOP_RADIUS
+                    and distance
+                    < nearestDistance
+                then
+                    local evidence =
+                        "NEAR CELL BOSS"
+
+                    -- The game can expose an `enemy` object on a character /
+                    -- humanoid. If it points at The Cell Of Life, record the
+                    -- stronger evidence. Proximity alone still triggers the
+                    -- requested privacy hop so a player does not need to land
+                    -- a hit before we leave.
+                    local enemyObject =
+                        humanoid:FindFirstChild(
+                            "enemy"
+                        )
+                        or character:FindFirstChild(
+                            "enemy",
+                            true
+                        )
+
+                    if enemyObject
+                        and enemyObject:IsA(
+                            "ObjectValue"
+                        )
+                        and enemyObject.Value
+                            == boss
+                    then
+                        evidence =
+                            "TARGETING THE CELL OF LIFE"
+                    end
+
+                    nearestPlayer =
+                        player
+
+                    nearestDistance =
+                        distance
+
+                    nearestEvidence =
+                        evidence
+                end
+            end
+        end
+    end
+
+    if nearestPlayer then
+        return
+            nearestPlayer,
+            nearestDistance,
+            nearestEvidence
+    end
+
+    return nil
+end
+
+function F.stopCellCombatForPlayerHop()
+    State.monsterLockEnabled = false
+    State.weaponAutoAttackEnabled = false
+    State.finisherEnabled = false
+    State.lockedMonster = nil
+
+    F.stopMovementFlight(
+        "MONSTER_LOCK"
+    )
+
+    F.releaseMovement(
+        "MONSTER_LOCK"
+    )
+
+    if monsterLockToggle then
+        monsterLockToggle:SetSilent(
+            false
+        )
+    end
+
+    if weaponToggle then
+        weaponToggle:SetSilent(
+            false
+        )
+    end
+
+    if finisherToggle then
+        finisherToggle:SetSilent(
+            false
+        )
+    end
+
+    State.updateMonsterButtons()
+    State.updateCombatStatus()
+end
+
+function F.handleCellBossPlayerAvoidance(
+    token,
+    boss
+)
+    local player,
+        distance,
+        evidence =
+            F.getNearbyCellBossPlayer(
+                boss
+            )
+
+    if not player then
+        return false
+    end
+
+    State.cellFarm.nearbyBossPlayerName =
+        tostring(
+            player.Name
+        )
+
+    State.cellFarm.nearbyBossPlayerDistance =
+        tonumber(distance)
+        or -1
+
+    State.cellFarm.nearbyBossPlayerEvidence =
+        tostring(
+            evidence
+            or "NEAR CELL BOSS"
+        )
+
+    State.cellFarm.playerAvoidHopTriggered =
+        true
+
+    F.stopCellCombatForPlayerHop()
+
+    while F.isCellFarmActive(token) do
+        local currentPlayer,
+            currentDistance,
+            currentEvidence =
+                F.getNearbyCellBossPlayer(
+                    boss
+                )
+
+        if not currentPlayer then
+            -- If hop could not start and the player left before the next
+            -- attempt, resume the fight rather than abandoning the run.
+            State.cellFarm.nearbyBossPlayerName =
+                "None"
+
+            State.cellFarm.nearbyBossPlayerDistance =
+                -1
+
+            State.cellFarm.nearbyBossPlayerEvidence =
+                "Player left before hop"
+
+            State.cellFarm.playerAvoidHopTriggered =
+                false
+
+            F.setCellFarmStage(
+                "FIGHTING",
+                "Nearby player left before hop - resuming Cell fight"
+            )
+
+            F.prepareCellFight(
+                boss,
+                token
+            )
+
+            return false
+        end
+
+        State.cellFarm.nearbyBossPlayerName =
+            tostring(
+                currentPlayer.Name
+            )
+
+        State.cellFarm.nearbyBossPlayerDistance =
+            tonumber(currentDistance)
+            or -1
+
+        State.cellFarm.nearbyBossPlayerEvidence =
+            tostring(
+                currentEvidence
+                or "NEAR CELL BOSS"
+            )
+
+        F.setCellFarmStage(
+            "PLAYER NEAR BOSS - HOP",
+            tostring(
+                currentPlayer.Name
+            )
+                .. " @ "
+                .. string.format(
+                    "%.1f",
+                    tonumber(currentDistance)
+                    or -1
+                )
+                .. " studs | "
+                .. tostring(
+                    currentEvidence
+                    or "NEAR CELL BOSS"
+                )
+                .. " | finding a new server now"
+        )
+
+        if F.updateCellFarmUI then
+            F.updateCellFarmUI()
+        end
+
+        if not State.serverHopBusy then
+            State.cellFarm.playerAvoidHopAttempts =
+                (
+                    State.cellFarm.playerAvoidHopAttempts
+                    or 0
+                )
+                + 1
+
+            local hopStarted =
+                F.cellFarmHop(
+                    token,
+                    "Other player near The Cell Of Life: "
+                        .. tostring(
+                            currentPlayer.Name
+                        )
+                        .. " ("
+                        .. string.format(
+                            "%.1f",
+                            tonumber(currentDistance)
+                            or -1
+                        )
+                        .. " studs)"
+                )
+
+            if not hopStarted then
+                F.setCellFarmStage(
+                    "PLAYER HOP RETRY",
+                    "Could not start server hop yet - retrying while player remains near boss"
+                )
+            end
+        end
+
+        -- If TeleportToPlaceInstance succeeds this runtime is replaced.
+        -- If it fails/times out, serverHopBusy clears and the loop retries
+        -- another server while the other player is still nearby.
+        if not F.cellFarmWait(
+            token,
+            State.serverHopBusy
+            and 0.25
+            or Config.CELL_PLAYER_NEAR_BOSS_HOP_RETRY
+        ) then
+            return true
+        end
+    end
+
+    return true
+end
+
 function F.prepareCellFight(boss, token)
     if not boss
         or not boss.Parent
@@ -23483,6 +23811,14 @@ function F.prepareCellFight(boss, token)
 end
 
 function F.fightCellBoss(token, boss)
+    -- Do not even engage if another live player is already close to the boss.
+    if F.handleCellBossPlayerAvoidance(
+        token,
+        boss
+    ) then
+        return false
+    end
+
     if not F.prepareCellFight(
         boss,
         token
@@ -23510,6 +23846,39 @@ function F.fightCellBoss(token, boss)
             )
         then
             return true
+        end
+
+        local nearbyPlayer,
+            nearbyDistance,
+            nearbyEvidence =
+                F.getNearbyCellBossPlayer(
+                    boss
+                )
+
+        if nearbyPlayer then
+            State.cellFarm.nearbyBossPlayerName =
+                tostring(
+                    nearbyPlayer.Name
+                )
+
+            State.cellFarm.nearbyBossPlayerDistance =
+                tonumber(
+                    nearbyDistance
+                )
+                or -1
+
+            State.cellFarm.nearbyBossPlayerEvidence =
+                tostring(
+                    nearbyEvidence
+                    or "NEAR CELL BOSS"
+                )
+
+            if F.handleCellBossPlayerAvoidance(
+                token,
+                boss
+            ) then
+                return false
+            end
         end
 
         local part =
@@ -23641,7 +24010,9 @@ function F.fightCellBoss(token, boss)
                 "Long fight - continuing until The Cell Of Life is actually defeated"
         end
 
-        task.wait(0.10)
+        task.wait(
+            Config.CELL_PLAYER_NEAR_BOSS_CHECK_INTERVAL
+        )
     end
 
     return false
@@ -26075,6 +26446,18 @@ function F.updateCellFarmUI()
         .. tostring(State.cellFarm.fightHeight)
         .. " | Travel: "
         .. string.format("%.1fx", State.cellFarm.travelSpeed)
+        .. "\nPlayer avoid: "
+        .. tostring(State.cellFarm.nearbyBossPlayerName or "None")
+        .. " @ "
+        .. string.format(
+            "%.1f",
+            tonumber(State.cellFarm.nearbyBossPlayerDistance)
+            or -1
+        )
+        .. " studs | "
+        .. tostring(State.cellFarm.nearbyBossPlayerEvidence or "None")
+        .. " | hop tries="
+        .. tostring(State.cellFarm.playerAvoidHopAttempts or 0)
         .. "\nRuns: "
         .. tostring(State.cellFarm.runs)
         .. " | Kills: "
@@ -26353,6 +26736,11 @@ function F.runCellFarm(token, resumed)
     State.cellFarm.itemNotifyEvents = 0
     State.cellFarm.itemNotifyItems = 0
     State.cellFarm.itemNotifyLast = "None"
+    State.cellFarm.nearbyBossPlayerName = "None"
+    State.cellFarm.nearbyBossPlayerDistance = -1
+    State.cellFarm.nearbyBossPlayerEvidence = "None"
+    State.cellFarm.playerAvoidHopTriggered = false
+    State.cellFarm.playerAvoidHopAttempts = 0
 
     local rewardEventObserver =
         F.startCellRewardEventObserver(
@@ -26371,6 +26759,42 @@ function F.runCellFarm(token, resumed)
         )
 
         return false
+    end
+
+    if not fought
+        and State.cellFarm.playerAvoidHopTriggered
+    then
+        F.setCellFarmStage(
+            "PLAYER HOP ACTIVE",
+            "Other player detected near The Cell Of Life - normal fight recovery is blocked"
+        )
+
+        while F.isCellFarmActive(token)
+            and State.cellFarm.playerAvoidHopTriggered
+        do
+            if State.serverHopBusy then
+                task.wait(0.25)
+            else
+                -- The avoidance helper normally handles retries. This guard
+                -- prevents accidental same-server recovery if a future edit
+                -- returns from it early.
+                local avoidStillActive =
+                    F.handleCellBossPlayerAvoidance(
+                        token,
+                        boss
+                    )
+
+                if not avoidStillActive then
+                    State.cellFarm.playerAvoidHopTriggered =
+                        false
+                    break
+                end
+            end
+        end
+
+        if State.cellFarm.playerAvoidHopTriggered then
+            return false
+        end
     end
 
     if not fought then
@@ -26735,6 +27159,11 @@ function F.startCellFarm(resumed)
         State.cellFarm.lastBossHealthPercent = 0
         State.cellFarm.lastBossHealthState = "WAITING"
         State.cellFarm.lastBossHealthUIAt = 0
+        State.cellFarm.nearbyBossPlayerName = "None"
+        State.cellFarm.nearbyBossPlayerDistance = -1
+        State.cellFarm.nearbyBossPlayerEvidence = "None"
+        State.cellFarm.playerAvoidHopTriggered = false
+        State.cellFarm.playerAvoidHopAttempts = 0
         State.cellFarm.dialogStartSent = false
         State.cellFarm.dialogTitleConfirmed = false
         State.cellFarm.dialogBodyConfirmed = false
@@ -29865,12 +30294,6 @@ State.sellToggle:OnChanged(function(state)
     )
 end)
 
-State.sellThresholdSlider:OnChanged(function(value)
-    State.sellThreshold = value
-    F.markConfigDirty()
-    F.updateSellStatus()
-end)
-
 State.sellBeforeHopToggle:OnChanged(function(state)
     State.sellBeforeHop = state
     F.markConfigDirty()
@@ -30315,16 +30738,29 @@ task.spawn(function()
             and not State.farmBusy
             and not State.serverHopBusy
         then
-            local candidates =
-                F.collectSellCandidates()
+            local isFull,
+                current,
+                maximum =
+                    F.isInventoryFull()
 
-            if #candidates
-                >= State.sellThreshold
-            then
-                F.runBoundary("AutoSell", F.runAutoSell, false)
+            if isFull then
+                State.sellStatus =
+                    "Inventory full "
+                    .. tostring(current)
+                    .. "/"
+                    .. tostring(maximum)
+                    .. " - selling"
+
+                F.updateSellStatus()
+
+                F.runBoundary(
+                    "AutoSellCapacity",
+                    F.runAutoSell,
+                    true
+                )
             else
                 State.sellStatus =
-                    "Monitoring"
+                    "Collecting until inventory is full"
 
                 F.updateSellStatus()
             end
@@ -30736,7 +31172,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics 30 FPS / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("Drops v6.4.32: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
+print("Drops v6.4.34: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -30756,14 +31192,14 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.4.32.")
+    warn("[The Veil Hub] loadstring is required to launch v6.4.34.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.4.32 compile failed:", compileError)
+    warn("[The Veil Hub] v6.4.34 compile failed:", compileError)
     return
 end
 
