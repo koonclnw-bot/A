@@ -1,11 +1,11 @@
--- The Veil Hub v6.4.35 Background Cradle Input
--- Physical E/1 is still attempted normally.
--- If Roblox is unfocused/minimized, exact Cradle DialogEvent equivalents are
--- used as background-safe fallbacks until the next verified state is reached.
-
+-- The Veil Hub v6.4.36 reviewed loader
+-- Keeps a clean local runtime copy for teleport resume, then executes it.
 local runtimeSource = [==============[
+
 -- =========================================================
 -- THE VEIL HUB
+-- v6.4.36 Reviewed Runtime
+-- Cleaned from a corrupted multi-version export.
 -- Sidebar UI + Collapse + ESP
 --
 -- Features:
@@ -390,7 +390,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.4.35 Background Cradle Input",
+    HUB_VERSION = "v6.4.36 Reviewed Standalone",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -31129,7 +31129,12 @@ end)
 -- CLOSE HUB
 -- =========================================================
 
-closeBtn.MouseButton1Click:Connect(function()
+function F.shutdown()
+    if State.shutdownStarted then
+        return
+    end
+
+    State.shutdownStarted = true
     State.runtime.Active = false
     State.loopRunning = false
 
@@ -31156,14 +31161,22 @@ closeBtn.MouseButton1Click:Connect(function()
     State.gachaRequestInFlight = false
     State.blockInsanityEnabled = false
     insanityBlockState.Enabled = false
+
+    if cradleTraceState then
+        cradleTraceState.Enabled = false
+        cradleTraceState.Armed = false
+    end
+
     if F.setCellResumeFlag then
         F.setCellResumeFlag(false)
     end
-    F.stopLootLock()
-    F.stopMovementFlight()
-    F.releaseMovement(State.movement.owner)
-    F.disconnectConnections(State.dropCacheConnections)
-    F.disconnectConnections(State.monsterCacheConnections)
+
+    pcall(F.stopLootLock)
+    pcall(F.stopMovementFlight)
+    pcall(F.releaseMovement, State.movement.owner)
+    pcall(F.disconnectConnections, State.dropCacheConnections)
+    pcall(F.disconnectConnections, State.monsterCacheConnections)
+
     for _, entry in pairs(State.monsterCache) do
         if entry.healthConnection then
             pcall(function() entry.healthConnection:Disconnect() end)
@@ -31187,22 +31200,29 @@ closeBtn.MouseButton1Click:Connect(function()
     end
 
     if State.lockConnection then
-        State.lockConnection:Disconnect()
+        pcall(function() State.lockConnection:Disconnect() end)
         State.lockConnection = nil
     end
 
     if State.lootLockConnection then
-        State.lootLockConnection:Disconnect()
+        pcall(function() State.lootLockConnection:Disconnect() end)
         State.lootLockConnection = nil
     end
 
     if State.gachaNotifyConnection then
-        State.gachaNotifyConnection:Disconnect()
+        pcall(function() State.gachaNotifyConnection:Disconnect() end)
         State.gachaNotifyConnection = nil
     end
 
-    screenGui:Destroy()
-end)
+    if screenGui and screenGui.Parent then
+        screenGui:Destroy()
+    end
+end
+
+-- Re-execution and the Close button now share the same complete cleanup path.
+-- This prevents the shorter early-startup fallback from drifting out of sync.
+State.runtime.Stop = F.shutdown
+closeBtn.MouseButton1Click:Connect(F.shutdown)
 
 -- v6.3 lightweight live refresh. Drop tables can change as different monster
 -- templates/instances stream into this server. Refresh only while the Goals page
@@ -31377,7 +31397,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics 30 FPS / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("Drops v6.4.35: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
+print("Drops v6.4.36: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -31391,21 +31411,31 @@ print("==========================================")
 ]==============]
 
 if type(writefile) == "function" then
-    pcall(function()
-        writefile("TheVeilHub_v6_4_CellRuntime.lua", runtimeSource)
-    end)
+    local saved, saveError = pcall(
+        writefile,
+        "TheVeilHub_v6_4_CellRuntime.lua",
+        runtimeSource
+    )
+
+    if not saved then
+        warn("[The Veil Hub] Runtime cache write failed:", saveError)
+    end
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.4.35.")
+    warn("[The Veil Hub] loadstring is required to launch v6.4.36.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.4.35 compile failed:", compileError)
+    warn("[The Veil Hub] v6.4.36 compile failed:", compileError)
     return
 end
 
-chunk()
+local launched, runtimeError = pcall(chunk)
+
+if not launched then
+    warn("[The Veil Hub] v6.4.36 runtime failed:", runtimeError)
+end
