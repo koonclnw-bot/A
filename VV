@@ -1,10 +1,10 @@
--- The Veil Hub v6.4.36 reviewed loader
+-- The Veil Hub v6.4.37 Cradle start fix loader
 -- Keeps a clean local runtime copy for teleport resume, then executes it.
 local runtimeSource = [==============[
 
 -- =========================================================
 -- THE VEIL HUB
--- v6.4.36 Reviewed Runtime
+-- v6.4.37 Cradle start fix: direct start, then bounded dialogue confirmation.
 -- Cleaned from a corrupted multi-version export.
 -- Sidebar UI + Collapse + ESP
 --
@@ -328,7 +328,7 @@ local Config = {
     CELL_CRADLE_PROMPT_NUDGE_HOLD = 0.08,
     CELL_DIALOG_CHECKPOINT_ONLY = false,
     CELL_DIALOG_CHECKPOINT_HEARTBEAT = 2.0,
-    CELL_CRADLE_PHYSICAL_SPAM_MODE = true,
+    CELL_CRADLE_PHYSICAL_SPAM_MODE = false,
     CELL_CRADLE_E_SPAM_INTERVAL = 0.18,
     CELL_CRADLE_E_SPAM_HOLD = 0.06,
     CELL_CRADLE_ONE_SPAM_INTERVAL = 0.18,
@@ -390,7 +390,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.4.36 Reviewed Standalone",
+    HUB_VERSION = "v6.4.37 Cradle Start Fix",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -20171,6 +20171,13 @@ function F.summonCellBoss(token)
         local releaseButton = nil
         local dialogueDetail = "Waiting for Cradle dialogue"
 
+        -- Position refinement above may restart flight/WASD. Settle AFTER it.
+        -- Do not run the prompt-wait helper here: it can inject movement nudges.
+        if not F.settleCellAtCradle(token) then
+            cleanup()
+            return false
+        end
+
         State.cellFarm.cradleInteractPromptAttempts =
             (
                 State.cellFarm.cradleInteractPromptAttempts
@@ -20179,8 +20186,8 @@ function F.summonCellBoss(token)
             + 1
 
         F.setCellFarmStage(
-            "WAITING FOR CRADLE PROMPT",
-            "Waiting for visible Interact (E) before exact Cobalt start "
+            "CRADLE DIRECT START",
+            "Movement stopped; direct dialogue attempt "
                 .. tostring(attempt)
                 .. "/"
                 .. tostring(
@@ -20190,10 +20197,7 @@ function F.summonCellBoss(token)
 
         local promptReady,
             promptText =
-                F.waitForCellCradleInteractPrompt(
-                    token,
-                    Config.CELL_CRADLE_PROMPT_WAIT
-                )
+                F.getCellCradleInteractPromptEvidence()
 
         State.cellFarm.cradleInteractPromptVisible =
             promptReady == true
@@ -20202,11 +20206,8 @@ function F.summonCellBoss(token)
             promptText
             or "None"
 
-        -- IMPORTANT: do not press E here. The user confirmed physical E did
-        -- not open the dialogue reliably. The visible Interact(E) prompt is
-        -- used only as proof that the game's NPC controller is in a ready
-        -- proximity/input state before the exact, manually-proven Cobalt
-        -- DialogEvent start is fired.
+        -- Prompt visibility is diagnostic only. The user verified this exact
+        -- start command independently; send once per attempt regardless of focus.
         State.cellFarm.npcInteractionFunctionFound =
             false
 
@@ -20216,7 +20217,7 @@ function F.summonCellBoss(token)
         State.cellFarm.npcInteractionMethod =
             promptReady
             and "Prompt-ready exact Cobalt start"
-            or "Prompt-timeout exact Cobalt start"
+            or "Direct Cobalt start (prompt not detected)"
 
         State.cellFarm.npcInteractionSource =
             'DialogEvent:FireServer("start", workspace.NPCs["The Cradle"], 10)'
@@ -20228,13 +20229,18 @@ function F.summonCellBoss(token)
             )
         else
             F.setCellFarmStage(
-                "CRADLE PROMPT TIMEOUT",
-                "Prompt not confirmed; still trying exact Cobalt start once"
+                "CRADLE DIRECT START",
+                "Prompt not detected; sending direct start once after settling"
             )
         end
 
         -- Exact Cobalt snippet supplied by the user and manually verified:
-        local startOk =
+        if not F.isCellFarmActive(token) then
+            cleanup()
+            return false
+        end
+
+        local startOk, startError =
             pcall(function()
                 local Event =
                     game:GetService(
@@ -20251,6 +20257,9 @@ function F.summonCellBoss(token)
         State.cellFarm.dialogStartSent =
             startOk == true
 
+        -- This means local dispatch succeeded, NOT server acceptance.
+        State.cellFarm.npcInteractionCallOk = startOk == true
+
         if startOk then
             State.movementTelemetry.lastRemote =
                 'DialogEvent("start", workspace.NPCs["The Cradle"], 10)'
@@ -20258,14 +20267,14 @@ function F.summonCellBoss(token)
             State.cellFarm.status =
                 promptReady
                 and "Exact Cobalt start sent after confirmed Interact (E) readiness"
-                or "Exact Cobalt start sent after prompt timeout"
+                or "Direct start sent after settling; waiting for dialogue UI"
         else
             F.recordCellFailure(
-                "Exact Cobalt DialogEvent start failed"
+                "Exact Cobalt DialogEvent start failed: " .. tostring(startError)
             )
 
             State.cellFarm.status =
-                "Exact Cobalt start pcall failed"
+                "Direct start dispatch failed: " .. tostring(startError)
         end
 
         if F.updateCellFarmUI then
@@ -20317,9 +20326,9 @@ function F.summonCellBoss(token)
         then
             F.setCellFarmStage(
                 "DIALOG NOT CONFIRMED",
-                promptReady
-                    and "Prompt was ready but exact Cobalt start did not produce Release UI"
-                    or "Prompt was not ready and exact Cobalt start did not produce Release UI"
+                "Attempt " .. tostring(attempt) .. "/"
+                    .. tostring(Config.CELL_CRADLE_DIALOG_ATTEMPTS)
+                    .. ": " .. tostring(dialogueDetail)
             )
 
             if attempt
@@ -31397,7 +31406,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics 30 FPS / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("Drops v6.4.36: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
+print("Drops v6.4.37: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -31423,19 +31432,19 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.4.36.")
+    warn("[The Veil Hub] loadstring is required to launch v6.4.37.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.4.36 compile failed:", compileError)
+    warn("[The Veil Hub] v6.4.37 compile failed:", compileError)
     return
 end
 
 local launched, runtimeError = pcall(chunk)
 
 if not launched then
-    warn("[The Veil Hub] v6.4.36 runtime failed:", runtimeError)
+    warn("[The Veil Hub] v6.4.37 runtime failed:", runtimeError)
 end
