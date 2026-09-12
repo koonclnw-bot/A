@@ -1,6 +1,6 @@
--- The Veil Hub v6.4.27 Cradle E Prompt Start Assist
--- Upload this entire file to your public GitHub "V" file.
--- The short public GitHub loadstring remains unchanged.
+-- The Veil Hub v6.4.32 Cradle E+1 Physical Spam
+-- E repeats until exact Cradle dialogue is confirmed.
+-- Then 1 repeats until The Cell Of Life is observed and alive-confirmed.
 
 local runtimeSource = [==============[
 -- =========================================================
@@ -266,6 +266,11 @@ local Config = {
     CELL_DROP_DISCOVERY_SECONDS = 5.0,
     CELL_DROP_RADIUS = 260,
     CELL_MAX_LOOT_PER_RUN = 90,
+    CELL_LOOT_MOVE_RETRIES = 3,
+    CELL_LOOT_DIRECT_MOVE_TIMEOUT = 45,
+    CELL_LOOT_RESCAN_INTERVAL = 0.20,
+    CELL_LOOT_EMPTY_STABLE = 5.0,
+    CELL_LOOT_STUCK_RETRY_DELAY = 0.80,
     CELL_BUNDLE_OPEN_LIMIT = 40,
     CELL_BUNDLE_CONFIRM_TIMEOUT = 1.5,
     CELL_BUNDLE_SETTLE = 0.35,
@@ -298,6 +303,25 @@ local Config = {
     CELL_CRADLE_PREP_E_HOLD = 0.08,
     CELL_CRADLE_PREP_E_DELAY = 0.35,
     CELL_CRADLE_DIALOG_VISIBLE_WAIT = 7.00,
+    CELL_CRADLE_PROMPT_WAIT = 12.0,
+    CELL_CRADLE_PROMPT_STABLE = 0.60,
+    CELL_CRADLE_PROMPT_RECHECK = 0.05,
+    CELL_CRADLE_PROMPT_NUDGE_INTERVAL = 2.0,
+    CELL_CRADLE_PROMPT_NUDGE_HOLD = 0.08,
+    CELL_DIALOG_CHECKPOINT_ONLY = false,
+    CELL_DIALOG_CHECKPOINT_HEARTBEAT = 2.0,
+    CELL_CRADLE_PHYSICAL_SPAM_MODE = true,
+    CELL_CRADLE_E_SPAM_INTERVAL = 0.18,
+    CELL_CRADLE_E_SPAM_HOLD = 0.06,
+    CELL_CRADLE_ONE_SPAM_INTERVAL = 0.18,
+    CELL_CRADLE_ONE_SPAM_HOLD = 0.06,
+    CELL_CRADLE_SPAM_RECHECK_POSITION_EVERY = 4.0,
+    CELL_CRADLE_RECORDER_ONLY = false,
+    CELL_CRADLE_RECORDER_MANUAL_WAIT = 60.0,
+    CELL_CRADLE_RECORDER_POST_E_WAIT = 12.0,
+    CELL_CRADLE_RECORDER_POLL = 0.05,
+    CELL_CRADLE_RECORDER_MAX_REMOTE_CALLS = 120,
+    CELL_CRADLE_RECORDER_REPORT_FILE = "TheVeilHub_CradleInteraction_Report.txt",
     CELL_CRADLE_RELEASE_KEY_HOLD = 0.10,
     CELL_CRADLE_RELEASE_KEY_CONFIRM = 3.00,
     CELL_CRADLE_RELEASE_SETTLE = 0.12,
@@ -347,7 +371,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.4.27 Cradle E Prompt Start Assist",
+    HUB_VERSION = "v6.4.32 Cradle E+1 Physical Spam",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -759,6 +783,21 @@ local State = {
         dialogReleaseVisible = false,
         dialogOptionSent = false,
         dialogOptionConfirmed = false,
+        dialogCheckpointConfirmed = false,
+        dialogCheckpointHolding = false,
+        cradleRecorderStatus = "OFF",
+        cradleRecorderArmed = false,
+        cradleRecorderManualE = 0,
+        cradleRecorderRemoteCalls = 0,
+        cradleRecorderConnectionCount = 0,
+        cradleRecorderCandidateScore = -1,
+        cradleRecorderCandidate = "None",
+        cradleRecorderLastRemote = "None",
+        cradleRecorderReportPath = "None",
+        cradleRecorderResult = "None",
+        cradleESpamCount = 0,
+        cradleOneSpamCount = 0,
+        cradleSpamPhase = "OFF",
         dialogClientEvents = 0,
         dialogLastClientEvent = "None",
         bossSpawnConfirmed = false,
@@ -776,6 +815,11 @@ local State = {
         rewardLastChestDebugId = "None",
         rewardDropWaves = 0,
         rewardDropCount = 0,
+        lootMoveTarget = "None",
+        lootMoveDistance = -1,
+        lootMoveAttempts = 0,
+        lootMoveConfirmed = false,
+        lootKnownRemaining = 0,
         bossDefeatEventConfirmed = false,
         bossDefeatEvents = 0,
         bossDefeatLast = "None",
@@ -1350,6 +1394,273 @@ end
 -- Some executors can stall while installing hooks during startup.
 local insanityHookSupported =
     globalEnv.__TheVeilHub_InsanityHookSupported == true
+
+if not globalEnv.__TheVeilHub_CradleTraceState then
+    globalEnv.__TheVeilHub_CradleTraceState = {
+        Enabled = false,
+        Armed = false,
+        StartedAt = 0,
+        Calls = {},
+        ManualECount = 0,
+        ManualEAt = -1,
+        LastRemote = "None",
+        MaxCalls = 120,
+    }
+end
+
+local cradleTraceState =
+    globalEnv.__TheVeilHub_CradleTraceState
+
+function F.installCradleTraceHook()
+    if globalEnv.__TheVeilHub_CradleTraceHookInstalled then
+        return
+            globalEnv.__TheVeilHub_CradleTraceHookSupported
+            == true
+    end
+
+    if type(hookmetamethod) ~= "function"
+        or type(getnamecallmethod) ~= "function"
+    then
+        globalEnv.__TheVeilHub_CradleTraceHookSupported =
+            false
+
+        return false
+    end
+
+    local oldNamecall = nil
+
+    local function describeTraceArg(value)
+        local valueType =
+            typeof(value)
+
+        if valueType == "Instance" then
+            local fullName =
+                tostring(value)
+
+            pcall(function()
+                fullName =
+                    value:GetFullName()
+            end)
+
+            return
+                "Instance<"
+                .. tostring(value.ClassName)
+                .. ">:"
+                .. fullName
+        end
+
+        if valueType == "string" then
+            local text =
+                tostring(value)
+
+            if #text > 120 then
+                text =
+                    string.sub(
+                        text,
+                        1,
+                        117
+                    )
+                    .. "..."
+            end
+
+            return
+                string.format(
+                    "%q",
+                    text
+                )
+        end
+
+        if valueType == "table" then
+            local count = 0
+
+            for _ in pairs(value) do
+                count = count + 1
+
+                if count >= 20 then
+                    break
+                end
+            end
+
+            return
+                "table(~"
+                .. tostring(count)
+                .. ")"
+        end
+
+        return
+            valueType
+            .. ":"
+            .. tostring(value)
+    end
+
+    local function interceptNamecall(self, ...)
+        local method = nil
+
+        pcall(function()
+            method =
+                getnamecallmethod()
+        end)
+
+        local traceState =
+            globalEnv.__TheVeilHub_CradleTraceState
+
+        if traceState
+            and traceState.Enabled
+            and (
+                method == "FireServer"
+                or method == "InvokeServer"
+            )
+            and typeof(self) == "Instance"
+            and (
+                self:IsA("RemoteEvent")
+                or self:IsA("RemoteFunction")
+            )
+        then
+            local include = false
+
+            pcall(function()
+                include =
+                    self:IsDescendantOf(
+                        game:GetService(
+                            "ReplicatedStorage"
+                        )
+                    )
+            end)
+
+            if include then
+                local calls =
+                    traceState.Calls
+
+                if type(calls) ~= "table" then
+                    calls = {}
+                    traceState.Calls = calls
+                end
+
+                local maxCalls =
+                    tonumber(
+                        traceState.MaxCalls
+                    )
+                    or 120
+
+                if #calls < maxCalls then
+                    local argCount =
+                        select(
+                            "#",
+                            ...
+                        )
+
+                    local parts = {}
+
+                    for index = 1,
+                        math.min(
+                            argCount,
+                            8
+                        )
+                    do
+                        table.insert(
+                            parts,
+                            describeTraceArg(
+                                select(
+                                    index,
+                                    ...
+                                )
+                            )
+                        )
+                    end
+
+                    local remoteName =
+                        tostring(self)
+
+                    pcall(function()
+                        remoteName =
+                            self:GetFullName()
+                    end)
+
+                    local elapsed =
+                        os.clock()
+                        - (
+                            tonumber(
+                                traceState.StartedAt
+                            )
+                            or os.clock()
+                        )
+
+                    local record = {
+                        t = elapsed,
+                        method = tostring(method),
+                        remote = remoteName,
+                        args =
+                            table.concat(
+                                parts,
+                                ", "
+                            ),
+                    }
+
+                    table.insert(
+                        calls,
+                        record
+                    )
+
+                    traceState.LastRemote =
+                        tostring(method)
+                        .. " "
+                        .. remoteName
+                        .. "("
+                        .. record.args
+                        .. ")"
+                end
+            end
+        end
+
+        return oldNamecall(
+            self,
+            ...
+        )
+    end
+
+    local wrapped =
+        interceptNamecall
+
+    if type(newcclosure) == "function" then
+        wrapped =
+            newcclosure(
+                interceptNamecall
+            )
+    end
+
+    local ok,
+        previous =
+            pcall(function()
+                return hookmetamethod(
+                    game,
+                    "__namecall",
+                    wrapped
+                )
+            end)
+
+    if not ok
+        or type(previous) ~= "function"
+    then
+        globalEnv.__TheVeilHub_CradleTraceHookInstalled =
+            false
+
+        globalEnv.__TheVeilHub_CradleTraceHookSupported =
+            false
+
+        return false
+    end
+
+    oldNamecall =
+        previous
+
+    globalEnv.__TheVeilHub_CradleTraceHookInstalled =
+        true
+
+    globalEnv.__TheVeilHub_CradleTraceHookSupported =
+        true
+
+    return true
+end
 
 -- =========================================================
 -- BASIC HELPERS
@@ -4795,7 +5106,7 @@ State.cellFarmSection = F.createSection(State.cellFarmBody)
 State.cellFarmToggle = F.createToggle(
     State.cellFarmSection,
     "Full Auto The Cell Of Life",
-    "Wait real menu -> aim lower inside menu buttons -> fly to Cradle with W/A/S/D -> stand still 2s -> E + RegisterNPCInteraction + Dialog start -> verify dialogue -> option -> fight -> rewards.",
+    "Physical sequence: reach The Cradle -> spam E until exact dialog is confirmed -> spam 1 until The Cell Of Life is observed/alive -> continue fight/reward flow.",
     false
 )
 
@@ -4916,7 +5227,7 @@ State.cellStopButton = F.createActionRow(
     "STOP NOW"
 )
 
-State.cellStatusCard = F.createCard(State.cellFarmSection, 390)
+State.cellStatusCard = F.createCard(State.cellFarmSection, 525)
 State.cellStatusLabel = F.createTextLabel(
     State.cellStatusCard,
     "Cell Farm: OFF",
@@ -16815,6 +17126,1061 @@ function F.callNativeCradleInteraction(
 end
 
 
+
+function F.describeCradleRecorderValue(value)
+    local valueType =
+        typeof(value)
+
+    if valueType == "Instance" then
+        local fullName =
+            tostring(value)
+
+        pcall(function()
+            fullName =
+                value:GetFullName()
+        end)
+
+        return
+            "Instance<"
+            .. tostring(value.ClassName)
+            .. ">:"
+            .. fullName
+    end
+
+    if valueType == "function" then
+        return
+            "function:"
+            .. F.getCellFunctionDebugName(
+                value
+            )
+            .. " @ "
+            .. F.getCellFunctionDebugSource(
+                value
+            )
+    end
+
+    if valueType == "table" then
+        local keys = {}
+        local total = 0
+
+        for key, _ in pairs(value) do
+            total = total + 1
+
+            if #keys < 8 then
+                table.insert(
+                    keys,
+                    tostring(key)
+                )
+            end
+        end
+
+        return
+            "table("
+            .. tostring(total)
+            .. ")["
+            .. table.concat(
+                keys,
+                ","
+            )
+            .. "]"
+    end
+
+    local text =
+        tostring(value)
+
+    if #text > 160 then
+        text =
+            string.sub(
+                text,
+                1,
+                157
+            )
+            .. "..."
+    end
+
+    return
+        valueType
+        .. ":"
+        .. text
+end
+
+function F.captureCradleFunctionSnapshot(fn, label)
+    local snapshot = {
+        label = tostring(label or "SNAPSHOT"),
+        lines = {},
+        upvalues = {},
+    }
+
+    if type(fn) ~= "function" then
+        table.insert(
+            snapshot.lines,
+            snapshot.label
+                .. ": no function candidate"
+        )
+
+        return snapshot
+    end
+
+    table.insert(
+        snapshot.lines,
+        snapshot.label
+            .. " function: "
+            .. F.getCellFunctionDebugName(fn)
+            .. " | "
+            .. F.getCellFunctionDebugSource(fn)
+    )
+
+    local constantsFn =
+        type(getconstants) == "function"
+        and getconstants
+        or (
+            debug
+            and type(debug.getconstants) == "function"
+            and debug.getconstants
+            or nil
+        )
+
+    if constantsFn then
+        local ok,
+            constants =
+                pcall(
+                    constantsFn,
+                    fn
+                )
+
+        if ok
+            and type(constants) == "table"
+        then
+            local values = {}
+
+            for index, value in ipairs(
+                constants
+            ) do
+                if #values >= 40 then
+                    break
+                end
+
+                if type(value) == "string"
+                    or type(value) == "number"
+                    or type(value) == "boolean"
+                then
+                    table.insert(
+                        values,
+                        tostring(index)
+                            .. "="
+                            .. F.describeCradleRecorderValue(
+                                value
+                            )
+                    )
+                end
+            end
+
+            table.insert(
+                snapshot.lines,
+                "Constants: "
+                    .. (
+                        #values > 0
+                        and table.concat(
+                            values,
+                            " | "
+                        )
+                        or "(none captured)"
+                    )
+            )
+        end
+    end
+
+    local upvaluesFn =
+        type(getupvalues) == "function"
+        and getupvalues
+        or (
+            debug
+            and type(debug.getupvalues) == "function"
+            and debug.getupvalues
+            or nil
+        )
+
+    if upvaluesFn then
+        local ok,
+            upvalues =
+                pcall(
+                    upvaluesFn,
+                    fn
+                )
+
+        if ok
+            and type(upvalues) == "table"
+        then
+            for key, value in pairs(
+                upvalues
+            ) do
+                snapshot.upvalues[
+                    tostring(key)
+                ] =
+                    F.describeCradleRecorderValue(
+                        value
+                    )
+            end
+
+            local keys = {}
+
+            for key in pairs(
+                snapshot.upvalues
+            ) do
+                table.insert(
+                    keys,
+                    key
+                )
+            end
+
+            table.sort(keys)
+
+            for _, key in ipairs(keys) do
+                table.insert(
+                    snapshot.lines,
+                    "Upvalue["
+                        .. key
+                        .. "] = "
+                        .. snapshot.upvalues[key]
+                )
+            end
+        end
+    end
+
+    return snapshot
+end
+
+function F.captureCradleConnectionSummary()
+    local result = {
+        lines = {},
+        count = 0,
+    }
+
+    if type(getconnections) ~= "function" then
+        table.insert(
+            result.lines,
+            "getconnections unavailable"
+        )
+
+        return result
+    end
+
+    local function addSignal(name, signal)
+        if not signal then
+            return
+        end
+
+        local ok,
+            connections =
+                pcall(
+                    getconnections,
+                    signal
+                )
+
+        if not ok
+            or type(connections) ~= "table"
+        then
+            return
+        end
+
+        table.insert(
+            result.lines,
+            name
+                .. " connections="
+                .. tostring(
+                    #connections
+                )
+        )
+
+        result.count =
+            result.count
+            + #connections
+
+        for index, connection in ipairs(
+            connections
+        ) do
+            if index > 12 then
+                table.insert(
+                    result.lines,
+                    "  ... "
+                        .. tostring(
+                            #connections - 12
+                        )
+                        .. " more"
+                )
+
+                break
+            end
+
+            local fn = nil
+
+            pcall(function()
+                fn =
+                    connection.Function
+            end)
+
+            table.insert(
+                result.lines,
+                "  ["
+                    .. tostring(index)
+                    .. "] "
+                    .. F.getCellFunctionDebugName(
+                        fn
+                    )
+                    .. " | "
+                    .. F.getCellFunctionDebugSource(
+                        fn
+                    )
+            )
+        end
+    end
+
+    addSignal(
+        "UserInputService.InputBegan",
+        UserInputService.InputBegan
+    )
+
+    addSignal(
+        "UserInputService.InputEnded",
+        UserInputService.InputEnded
+    )
+
+    local playerGui =
+        LocalPlayer:FindFirstChildOfClass(
+            "PlayerGui"
+        )
+
+    local promptGui =
+        playerGui
+        and playerGui:FindFirstChild(
+            "InteractPromptBillboard_NPC"
+        )
+
+    if promptGui then
+        for _, object in ipairs(
+            promptGui:GetDescendants()
+        ) do
+            if object:IsA("GuiObject") then
+                addSignal(
+                    object:GetFullName()
+                        .. ".InputBegan",
+                    object.InputBegan
+                )
+            end
+
+            if object:IsA("GuiButton") then
+                addSignal(
+                    object:GetFullName()
+                        .. ".Activated",
+                    object.Activated
+                )
+
+                addSignal(
+                    object:GetFullName()
+                        .. ".MouseButton1Click",
+                    object.MouseButton1Click
+                )
+            end
+        end
+    end
+
+    pcall(function()
+        local actions =
+            game:GetService(
+                "ContextActionService"
+            ):GetAllBoundActionInfo()
+
+        for actionName, info in pairs(actions) do
+            local inputText =
+                tostring(
+                    info
+                    and info.inputTypes
+                    or ""
+                )
+
+            if string.find(
+                string.upper(inputText),
+                "KEYCODE.E",
+                1,
+                true
+            )
+            then
+                table.insert(
+                    result.lines,
+                    "ContextAction E: "
+                        .. tostring(actionName)
+                        .. " | "
+                        .. inputText
+                )
+            end
+        end
+    end)
+
+    return result
+end
+
+function F.buildCradleRecorderReport(recorder, result, detail)
+    local lines = {}
+
+    table.insert(lines, "============================================================")
+    table.insert(lines, "THE VEIL HUB - CRADLE MANUAL-E INTERACTION RECORDER")
+    table.insert(lines, "Version: " .. tostring(Config.HUB_VERSION))
+    table.insert(lines, "Result: " .. tostring(result or "UNKNOWN"))
+    table.insert(lines, "Detail: " .. tostring(detail or "None"))
+
+    table.insert(
+        lines,
+        "Prompt visible: "
+            .. tostring(
+                State.cellFarm.cradleInteractPromptVisible
+                == true
+            )
+            .. " | "
+            .. tostring(
+                State.cellFarm.cradleInteractPromptText
+                or "None"
+            )
+    )
+
+    table.insert(
+        lines,
+        "Manual E count: "
+            .. tostring(
+                recorder
+                and recorder.manualECount
+                or 0
+            )
+            .. " | first E at "
+            .. tostring(
+                recorder
+                and recorder.manualEAt
+                or -1
+            )
+            .. "s"
+    )
+
+    table.insert(
+        lines,
+        "Dialog exact flags: ui="
+            .. tostring(State.cellFarm.dialogUiConfirmed == true)
+            .. " title="
+            .. tostring(State.cellFarm.dialogTitleConfirmed == true)
+            .. " body="
+            .. tostring(State.cellFarm.dialogBodyConfirmed == true)
+            .. " options="
+            .. tostring(State.cellFarm.dialogOptionsConfirmed == true)
+            .. " release="
+            .. tostring(State.cellFarm.dialogReleaseVisible == true)
+    )
+
+    table.insert(
+        lines,
+        "DialogEvent OnClientEvent RX: "
+            .. tostring(State.cellFarm.dialogClientEvents or 0)
+            .. " | "
+            .. tostring(State.cellFarm.dialogLastClientEvent or "None")
+    )
+
+    table.insert(lines, "------------------------------------------------------------")
+    table.insert(lines, "CONNECTION SNAPSHOT")
+
+    if recorder
+        and recorder.connections
+    then
+        for _, line in ipairs(
+            recorder.connections.lines
+            or {}
+        ) do
+            table.insert(lines, line)
+        end
+    end
+
+    table.insert(lines, "------------------------------------------------------------")
+    table.insert(lines, "TRY START NPC INTERACTION CANDIDATE")
+
+    table.insert(
+        lines,
+        "Candidate: "
+            .. tostring(
+                recorder
+                and recorder.candidateDetail
+                or "None"
+            )
+            .. " | score="
+            .. tostring(
+                recorder
+                and recorder.candidateScore
+                or -1
+            )
+    )
+
+    if recorder
+        and recorder.beforeSnapshot
+    then
+        for _, line in ipairs(
+            recorder.beforeSnapshot.lines
+            or {}
+        ) do
+            table.insert(lines, line)
+        end
+    end
+
+    if recorder
+        and recorder.afterSnapshot
+    then
+        for _, line in ipairs(
+            recorder.afterSnapshot.lines
+            or {}
+        ) do
+            table.insert(lines, line)
+        end
+    end
+
+    if recorder
+        and recorder.beforeSnapshot
+        and recorder.afterSnapshot
+    then
+        table.insert(lines, "UPVALUE CHANGES:")
+
+        local keys = {}
+
+        for key in pairs(
+            recorder.beforeSnapshot.upvalues
+            or {}
+        ) do
+            keys[key] = true
+        end
+
+        for key in pairs(
+            recorder.afterSnapshot.upvalues
+            or {}
+        ) do
+            keys[key] = true
+        end
+
+        local ordered = {}
+
+        for key in pairs(keys) do
+            table.insert(ordered, key)
+        end
+
+        table.sort(ordered)
+
+        local changed = 0
+
+        for _, key in ipairs(ordered) do
+            local before =
+                recorder.beforeSnapshot.upvalues[key]
+
+            local after =
+                recorder.afterSnapshot.upvalues[key]
+
+            if before ~= after then
+                changed = changed + 1
+
+                table.insert(
+                    lines,
+                    "  ["
+                        .. key
+                        .. "] "
+                        .. tostring(before)
+                        .. " -> "
+                        .. tostring(after)
+                )
+            end
+        end
+
+        if changed == 0 then
+            table.insert(
+                lines,
+                "  (no textual upvalue changes captured)"
+            )
+        end
+    end
+
+    table.insert(lines, "------------------------------------------------------------")
+    table.insert(lines, "REMOTE NAMECALL TRACE")
+
+    local traceState =
+        globalEnv.__TheVeilHub_CradleTraceState
+
+    local calls =
+        traceState
+        and traceState.Calls
+        or {}
+
+    if type(calls) == "table"
+        and #calls > 0
+    then
+        for index, record in ipairs(calls) do
+            table.insert(
+                lines,
+                string.format(
+                    "%03d | +%.3fs | %s | %s | %s",
+                    index,
+                    tonumber(record.t) or -1,
+                    tostring(record.method),
+                    tostring(record.remote),
+                    tostring(record.args)
+                )
+            )
+        end
+    else
+        table.insert(
+            lines,
+            "(no RemoteEvent/RemoteFunction namecalls captured)"
+        )
+    end
+
+    table.insert(lines, "============================================================")
+
+    return table.concat(lines, "\n")
+end
+
+function F.beginCradleInteractionRecorder(token, npcCradle)
+    if not F.isCellFarmActive(token) then
+        return nil
+    end
+
+    local traceState =
+        globalEnv.__TheVeilHub_CradleTraceState
+
+    traceState.Enabled = false
+    traceState.Armed = false
+    traceState.StartedAt = os.clock()
+    traceState.Calls = {}
+    traceState.ManualECount = 0
+    traceState.ManualEAt = -1
+    traceState.LastRemote = "None"
+    traceState.MaxCalls =
+        Config.CELL_CRADLE_RECORDER_MAX_REMOTE_CALLS
+
+    local traceSupported =
+        F.installCradleTraceHook()
+
+    local candidateFn,
+        candidateDetail,
+        candidateScore =
+            F.findTryStartNPCInteraction(
+                npcCradle
+            )
+
+    local recorder = {
+        traceSupported = traceSupported,
+        candidateFn = candidateFn,
+        candidateDetail = candidateDetail,
+        candidateScore = candidateScore,
+        connections =
+            F.captureCradleConnectionSummary(),
+        beforeSnapshot =
+            F.captureCradleFunctionSnapshot(
+                candidateFn,
+                "BEFORE MANUAL E"
+            ),
+        inputConnection = nil,
+        manualECount = 0,
+        manualEAt = -1,
+    }
+
+    State.cellFarm.cradleRecorderCandidateScore =
+        tonumber(candidateScore)
+        or -1
+
+    State.cellFarm.cradleRecorderCandidate =
+        tostring(candidateDetail or "None")
+
+    State.cellFarm.cradleRecorderConnectionCount =
+        tonumber(
+            recorder.connections
+            and recorder.connections.count
+        )
+        or 0
+
+    State.cellFarm.cradleRecorderRemoteCalls = 0
+    State.cellFarm.cradleRecorderLastRemote = "None"
+
+    State.cellFarm.cradleRecorderStatus =
+        traceSupported
+        and "TRACE READY"
+        or "TRACE PARTIAL (namecall hook unavailable)"
+
+    recorder.inputConnection =
+        UserInputService.InputBegan:Connect(
+            function(input, gameProcessed)
+                if not F.isCellFarmActive(token)
+                    or not traceState.Enabled
+                    or not traceState.Armed
+                then
+                    return
+                end
+
+                if input.KeyCode
+                    == Enum.KeyCode.E
+                then
+                    recorder.manualECount =
+                        recorder.manualECount + 1
+
+                    traceState.ManualECount =
+                        recorder.manualECount
+
+                    if recorder.manualEAt < 0 then
+                        recorder.manualEAt =
+                            os.clock()
+                            - traceState.StartedAt
+
+                        traceState.ManualEAt =
+                            recorder.manualEAt
+                    end
+
+                    State.cellFarm.cradleRecorderManualE =
+                        recorder.manualECount
+
+                    State.cellFarm.cradleRecorderStatus =
+                        "MANUAL E CAPTURED"
+                            .. (
+                                gameProcessed
+                                and " (gameProcessed)"
+                                or ""
+                            )
+
+                    if F.updateCellFarmUI then
+                        F.updateCellFarmUI()
+                    end
+                end
+            end
+        )
+
+    traceState.Enabled = true
+
+    return recorder
+end
+
+function F.finishCradleInteractionRecorder(
+    recorder,
+    result,
+    detail
+)
+    local traceState =
+        globalEnv.__TheVeilHub_CradleTraceState
+
+    if traceState then
+        traceState.Enabled = false
+        traceState.Armed = false
+    end
+
+    if recorder
+        and recorder.inputConnection
+    then
+        pcall(function()
+            recorder.inputConnection:Disconnect()
+        end)
+
+        recorder.inputConnection = nil
+    end
+
+    if recorder then
+        recorder.afterSnapshot =
+            F.captureCradleFunctionSnapshot(
+                recorder.candidateFn,
+                "AFTER MANUAL E"
+            )
+    end
+
+    local report =
+        F.buildCradleRecorderReport(
+            recorder,
+            result,
+            detail
+        )
+
+    globalEnv.__TheVeilHub_LastCradleReport =
+        report
+
+    local reportPath =
+        "Console only"
+
+    if type(writefile) == "function" then
+        local ok =
+            pcall(
+                writefile,
+                Config.CELL_CRADLE_RECORDER_REPORT_FILE,
+                report
+            )
+
+        if ok then
+            reportPath =
+                Config.CELL_CRADLE_RECORDER_REPORT_FILE
+        end
+    end
+
+    State.cellFarm.cradleRecorderReportPath =
+        reportPath
+
+    State.cellFarm.cradleRecorderResult =
+        tostring(result or "UNKNOWN")
+
+    State.cellFarm.cradleRecorderStatus =
+        "COMPLETE: "
+        .. tostring(result or "UNKNOWN")
+
+    State.cellFarm.cradleRecorderRemoteCalls =
+        traceState
+        and type(traceState.Calls) == "table"
+        and #traceState.Calls
+        or 0
+
+    State.cellFarm.cradleRecorderLastRemote =
+        traceState
+        and tostring(
+            traceState.LastRemote
+            or "None"
+        )
+        or "None"
+
+    print(report)
+
+    if F.updateCellFarmUI then
+        F.updateCellFarmUI()
+    end
+
+    return report
+end
+
+function F.runCradleManualERecorderCheckpoint(
+    token,
+    npcCradle
+)
+    local recorder =
+        F.beginCradleInteractionRecorder(
+            token,
+            npcCradle
+        )
+
+    if not recorder then
+        return false, "Recorder could not start"
+    end
+
+    State.cellFarm.cradleRecorderStatus =
+        "WAITING FOR INTERACT (E) PROMPT"
+
+    F.setCellFarmStage(
+        "RECORDER: WAIT PROMPT",
+        "Read-only recorder active. Waiting for The Cradle Interact (E) prompt."
+    )
+
+    local promptReady,
+        promptText =
+            F.waitForCellCradleInteractPrompt(
+                token,
+                Config.CELL_CRADLE_PROMPT_WAIT
+            )
+
+    State.cellFarm.cradleInteractPromptVisible =
+        promptReady == true
+
+    State.cellFarm.cradleInteractPromptText =
+        promptText
+        or "None"
+
+    if not F.isCellFarmActive(token) then
+        F.finishCradleInteractionRecorder(
+            recorder,
+            "STOPPED",
+            "Farm stopped before manual E"
+        )
+
+        return false, "Stopped"
+    end
+
+    if not promptReady then
+        F.finishCradleInteractionRecorder(
+            recorder,
+            "PROMPT_NOT_CONFIRMED",
+            tostring(promptText)
+        )
+
+        F.setCellFarmStage(
+            "RECORDER HOLD",
+            "Interact (E) prompt was not confirmed. Report captured; no automatic interaction was sent."
+        )
+
+        while F.isCellFarmActive(token)
+            and Config.CELL_CRADLE_RECORDER_ONLY
+        do
+            task.wait(0.20)
+        end
+
+        return false, "Prompt not confirmed"
+    end
+
+    local traceState =
+        globalEnv.__TheVeilHub_CradleTraceState
+
+    traceState.Armed = true
+
+    State.cellFarm.cradleRecorderArmed =
+        true
+
+    State.cellFarm.cradleRecorderStatus =
+        "ARMED - PRESS E MANUALLY ONCE"
+
+    State.cellFarm.npcInteractionMethod =
+        "Manual E Recorder"
+
+    State.cellFarm.npcInteractionSource =
+        "UserInputService + namecall/getconnections/getgc trace"
+
+    F.setCellFarmStage(
+        "RECORDER ARMED",
+        "Interact (E) is ready. PRESS E MANUALLY ONCE. Auto start/Release are disabled."
+    )
+
+    F.notify(
+        "Cradle Recorder",
+        "Interact (E) ready. Press E manually once. Recorder will stop when the exact dialog appears.",
+        "info",
+        5.0
+    )
+
+    local armedAt =
+        os.clock()
+
+    local firstEAt = nil
+    local result = "TIMEOUT"
+    local detail = "No exact Cradle dialogue detected"
+
+    while F.isCellFarmActive(token) do
+        local visible,
+            releaseVisible,
+            _releaseButton,
+            evidenceDetail =
+                F.getCellCradleDialogueEvidence()
+
+        State.cellFarm.dialogUiConfirmed =
+            visible == true
+
+        State.cellFarm.dialogReleaseVisible =
+            releaseVisible == true
+
+        local exactDialog =
+            visible
+            and releaseVisible
+            and State.cellFarm.dialogTitleConfirmed
+            and State.cellFarm.dialogBodyConfirmed
+            and State.cellFarm.dialogOptionsConfirmed
+
+        if exactDialog then
+            result = "PASS_EXACT_DIALOG"
+
+            detail =
+                tostring(
+                    evidenceDetail
+                    or "Exact Cradle dialog confirmed"
+                )
+
+            State.cellFarm.dialogCheckpointConfirmed =
+                true
+
+            break
+        end
+
+        if recorder.manualECount > 0
+            and not firstEAt
+        then
+            firstEAt = os.clock()
+        end
+
+        if firstEAt
+            and os.clock() - firstEAt
+                >= Config.CELL_CRADLE_RECORDER_POST_E_WAIT
+        then
+            result =
+                "E_CAPTURED_NO_EXACT_DIALOG"
+
+            detail =
+                tostring(
+                    evidenceDetail
+                    or "Manual E captured but exact dialog did not appear"
+                )
+
+            break
+        end
+
+        if os.clock() - armedAt
+            >= Config.CELL_CRADLE_RECORDER_MANUAL_WAIT
+        then
+            result =
+                recorder.manualECount > 0
+                and "E_CAPTURED_TIMEOUT"
+                or "NO_MANUAL_E_TIMEOUT"
+
+            detail =
+                tostring(
+                    evidenceDetail
+                    or "Recorder manual-E window expired"
+                )
+
+            break
+        end
+
+        State.cellFarm.cradleRecorderRemoteCalls =
+            traceState
+            and type(traceState.Calls) == "table"
+            and #traceState.Calls
+            or 0
+
+        State.cellFarm.cradleRecorderLastRemote =
+            traceState
+            and tostring(
+                traceState.LastRemote
+                or "None"
+            )
+            or "None"
+
+        task.wait(
+            Config.CELL_CRADLE_RECORDER_POLL
+        )
+    end
+
+    State.cellFarm.cradleRecorderArmed =
+        false
+
+    F.finishCradleInteractionRecorder(
+        recorder,
+        result,
+        detail
+    )
+
+    State.cellFarm.dialogCheckpointHolding =
+        true
+
+    if result == "PASS_EXACT_DIALOG" then
+        F.setCellFarmStage(
+            "RECORDER PASS - HOLD",
+            "Exact Cradle dialog confirmed from MANUAL E. Report saved. Release/boss remain disabled."
+        )
+    else
+        F.setCellFarmStage(
+            "RECORDER RESULT - HOLD",
+            tostring(result)
+                .. " | report saved; no automatic interaction will run."
+        )
+    end
+
+    while F.isCellFarmActive(token)
+        and Config.CELL_CRADLE_RECORDER_ONLY
+    do
+        task.wait(0.20)
+    end
+
+    State.cellFarm.dialogCheckpointHolding =
+        false
+
+    return
+        result == "PASS_EXACT_DIALOG",
+        detail
+end
+
 function F.getCellCradleInteractPromptEvidence()
     local playerGui =
         LocalPlayer:FindFirstChildOfClass(
@@ -16912,6 +18278,98 @@ function F.getCellCradleInteractPromptEvidence()
     end
 
     return false, combined
+end
+
+
+function F.waitForCellCradleInteractPrompt(token, timeout)
+    local deadline =
+        os.clock()
+        + math.max(
+            0.5,
+            tonumber(timeout)
+                or Config.CELL_CRADLE_PROMPT_WAIT
+        )
+
+    local stableSince = nil
+    local lastNudge =
+        os.clock()
+
+    local lastText =
+        "Waiting for Interact (E)"
+
+    while F.isCellFarmActive(token)
+        and os.clock() < deadline
+    do
+        local visible,
+            text =
+                F.getCellCradleInteractPromptEvidence()
+
+        lastText =
+            text
+            or lastText
+
+        State.cellFarm.cradleInteractPromptVisible =
+            visible == true
+
+        State.cellFarm.cradleInteractPromptText =
+            lastText
+
+        if visible then
+            stableSince =
+                stableSince
+                or os.clock()
+
+            if os.clock() - stableSince
+                >= Config.CELL_CRADLE_PROMPT_STABLE
+            then
+                State.cellFarm.status =
+                    "CONFIRMED Interact (E) prompt stable - Cradle is ready"
+
+                if F.updateCellFarmUI then
+                    F.updateCellFarmUI()
+                end
+
+                return true, lastText
+            end
+        else
+            stableSince = nil
+        end
+
+        -- A very small ordinary movement pulse can help the game's NPC
+        -- proximity/input controller refresh its prompt. It is only used
+        -- while waiting for the prompt, never after the prompt is confirmed.
+        if os.clock() - lastNudge
+            >= Config.CELL_CRADLE_PROMPT_NUDGE_INTERVAL
+        then
+            lastNudge =
+                os.clock()
+
+            F.pressVirtualKey(
+                Enum.KeyCode.W,
+                0x57,
+                Config.CELL_CRADLE_PROMPT_NUDGE_HOLD,
+                "Cradle prompt readiness nudge"
+            )
+
+            F.stopCellCradleTravelInput()
+        end
+
+        task.wait(
+            Config.CELL_CRADLE_PROMPT_RECHECK
+        )
+    end
+
+    State.cellFarm.cradleInteractPromptVisible =
+        false
+
+    State.cellFarm.status =
+        "Interact (E) prompt not confirmed before timeout"
+
+    if F.updateCellFarmUI then
+        F.updateCellFarmUI()
+    end
+
+    return false, lastText
 end
 
 function F.getCellCradleDialogueEvidence()
@@ -17942,6 +19400,269 @@ function F.settleCellAtCradle(token)
     return true
 end
 
+
+function F.runCellCradlePhysicalSpamSequence(
+    token,
+    bossWatcher,
+    npcCradle,
+    worldCradle
+)
+    if not F.isCellFarmActive(token) then
+        return false
+    end
+
+    State.cellFarm.cradleESpamCount = 0
+    State.cellFarm.cradleOneSpamCount = 0
+    State.cellFarm.cradleSpamPhase = "E UNTIL DIALOG"
+
+    State.cellFarm.npcInteractionMethod =
+        "Physical E spam -> Physical 1 spam"
+
+    State.cellFarm.npcInteractionSource =
+        "pressVirtualKey physical input chain"
+
+    F.setCellFarmStage(
+        "CRADLE E SPAM",
+        "Pressing E repeatedly until the exact The Cradle dialog appears"
+    )
+
+    local lastPositionRecheck =
+        os.clock()
+
+    while F.isCellFarmActive(token) do
+        local alreadyBoss =
+            F.getCellBoss()
+
+        if alreadyBoss then
+            State.cellFarm.bossSpawnConfirmed =
+                true
+
+            State.cellFarm.bossSpawnSource =
+                "Already present during E spam"
+
+            State.cellFarm.cradleSpamPhase =
+                "COMPLETE"
+
+            return true, alreadyBoss
+        end
+
+        local dialogVisible,
+            releaseVisible,
+            _releaseButton,
+            dialogDetail =
+                F.getCellCradleDialogueEvidence()
+
+        local exactDialog =
+            dialogVisible
+            and releaseVisible
+            and State.cellFarm.dialogTitleConfirmed
+            and State.cellFarm.dialogBodyConfirmed
+            and State.cellFarm.dialogOptionsConfirmed
+
+        if exactDialog then
+            State.cellFarm.dialogUiConfirmed =
+                true
+
+            State.cellFarm.dialogReleaseVisible =
+                true
+
+            State.cellFarm.dialogCheckpointConfirmed =
+                true
+
+            State.cellFarm.status =
+                "CONFIRMED exact Cradle dialog after "
+                .. tostring(
+                    State.cellFarm.cradleESpamCount
+                    or 0
+                )
+                .. " E presses"
+
+            if F.updateCellFarmUI then
+                F.updateCellFarmUI()
+            end
+
+            break
+        end
+
+        if os.clock() - lastPositionRecheck
+            >= Config.CELL_CRADLE_SPAM_RECHECK_POSITION_EVERY
+        then
+            lastPositionRecheck =
+                os.clock()
+
+            pcall(function()
+                F.refineCellCradleDialogPosition(
+                    token,
+                    npcCradle,
+                    worldCradle
+                )
+            end)
+
+            F.stopCellCradleTravelInput()
+        end
+
+        local inputOk =
+            F.pressVirtualKey(
+                Enum.KeyCode.E,
+                0x45,
+                Config.CELL_CRADLE_E_SPAM_HOLD,
+                "Cradle E spam until dialog"
+            )
+
+        State.cellFarm.cradleESpamCount =
+            (
+                State.cellFarm.cradleESpamCount
+                or 0
+            )
+            + 1
+
+        State.cellFarm.status =
+            "E spam "
+            .. tostring(
+                State.cellFarm.cradleESpamCount
+            )
+            .. " | "
+            .. tostring(
+                dialogDetail
+                or "waiting for exact dialog"
+            )
+            .. (
+                inputOk
+                and ""
+                or " | input send failed"
+            )
+
+        if F.updateCellFarmUI then
+            F.updateCellFarmUI()
+        end
+
+        if not F.cellFarmWait(
+            token,
+            Config.CELL_CRADLE_E_SPAM_INTERVAL
+        ) then
+            return false
+        end
+    end
+
+    if not F.isCellFarmActive(token) then
+        return false
+    end
+
+    State.cellFarm.cradleSpamPhase =
+        "1 UNTIL CELL SPAWNS"
+
+    F.setCellFarmStage(
+        "CRADLE 1 SPAM",
+        "Dialog confirmed - pressing 1 repeatedly until The Cell Of Life spawns"
+    )
+
+    while F.isCellFarmActive(token) do
+        local rawBoss =
+            (
+                bossWatcher
+                and bossWatcher.model
+            )
+            or F.findCellBossModelRaw()
+
+        if rawBoss
+            and rawBoss.Parent
+        then
+            State.cellFarm.bossSpawnConfirmed =
+                true
+
+            State.cellFarm.bossSpawnSource =
+                "Observed during physical 1 spam"
+
+            State.cellFarm.dialogOptionSent =
+                true
+
+            State.cellFarm.dialogOptionConfirmed =
+                true
+
+            State.cellFarm.cradleSpamPhase =
+                "BOSS OBSERVED"
+
+            State.cellFarm.status =
+                "Cell model appeared after "
+                .. tostring(
+                    State.cellFarm.cradleOneSpamCount
+                    or 0
+                )
+                .. " key-1 presses; confirming alive"
+
+            if F.updateCellFarmUI then
+                F.updateCellFarmUI()
+            end
+
+            local confirmedBoss =
+                F.waitForCellBossConfirmed(
+                    token,
+                    bossWatcher,
+                    Config.CELL_CRADLE_BOSS_ALIVE_WAIT
+                )
+
+            if confirmedBoss then
+                State.cellFarm.cradleSpamPhase =
+                    "COMPLETE"
+
+                State.cellFarm.status =
+                    "CONFIRMED The Cell Of Life spawned and is alive"
+
+                return true, confirmedBoss
+            end
+
+            F.setCellFarmStage(
+                "WAITING CELL ALIVE",
+                "Cell model observed but not alive-confirmed; same server, no hop"
+            )
+
+            if not F.cellFarmWait(
+                token,
+                0.50
+            ) then
+                return false
+            end
+        else
+            F.pressVirtualKey(
+                Enum.KeyCode.One,
+                0x31,
+                Config.CELL_CRADLE_ONE_SPAM_HOLD,
+                "Cradle key 1 spam until Cell spawns"
+            )
+
+            State.cellFarm.cradleOneSpamCount =
+                (
+                    State.cellFarm.cradleOneSpamCount
+                    or 0
+                )
+                + 1
+
+            State.cellFarm.dialogOptionSent =
+                true
+
+            State.cellFarm.status =
+                "1 spam "
+                .. tostring(
+                    State.cellFarm.cradleOneSpamCount
+                )
+                .. " | waiting for The Cell Of Life"
+
+            if F.updateCellFarmUI then
+                F.updateCellFarmUI()
+            end
+
+            if not F.cellFarmWait(
+                token,
+                Config.CELL_CRADLE_ONE_SPAM_INTERVAL
+            ) then
+                return false
+            end
+        end
+    end
+
+    return false
+end
+
 function F.summonCellBoss(token)
     if not F.isCellFarmActive(token) then
         return false
@@ -18019,6 +19740,21 @@ function F.summonCellBoss(token)
     State.cellFarm.dialogReleaseVisible = false
     State.cellFarm.dialogOptionSent = false
     State.cellFarm.dialogOptionConfirmed = false
+    State.cellFarm.dialogCheckpointConfirmed = false
+    State.cellFarm.dialogCheckpointHolding = false
+    State.cellFarm.cradleRecorderStatus = "OFF"
+    State.cellFarm.cradleRecorderArmed = false
+    State.cellFarm.cradleRecorderManualE = 0
+    State.cellFarm.cradleRecorderRemoteCalls = 0
+    State.cellFarm.cradleRecorderConnectionCount = 0
+    State.cellFarm.cradleRecorderCandidateScore = -1
+    State.cellFarm.cradleRecorderCandidate = "None"
+    State.cellFarm.cradleRecorderLastRemote = "None"
+    State.cellFarm.cradleRecorderReportPath = "None"
+    State.cellFarm.cradleRecorderResult = "None"
+    State.cellFarm.cradleESpamCount = 0
+    State.cellFarm.cradleOneSpamCount = 0
+    State.cellFarm.cradleSpamPhase = "OFF"
     State.cellFarm.dialogClientEvents = 0
     State.cellFarm.dialogLastClientEvent = "None"
     State.cellFarm.bossSpawnConfirmed = false
@@ -18048,6 +19784,79 @@ function F.summonCellBoss(token)
         F.stopCellBossSpawnWatcher(
             bossWatcher
         )
+    end
+
+    if Config.CELL_CRADLE_PHYSICAL_SPAM_MODE then
+        if not F.settleCellAtCradle(
+            token
+        ) then
+            cleanup()
+            return false
+        end
+
+        pcall(function()
+            F.refineCellCradleDialogPosition(
+                token,
+                npcCradle,
+                worldCradle
+            )
+        end)
+
+        local spamOk,
+            spamBoss =
+                F.runCellCradlePhysicalSpamSequence(
+                    token,
+                    bossWatcher,
+                    npcCradle,
+                    worldCradle
+                )
+
+        cleanup()
+
+        if spamOk
+            and spamBoss
+        then
+            return true, spamBoss
+        end
+
+        return false
+    end
+
+    if Config.CELL_CRADLE_RECORDER_ONLY then
+        if not F.settleCellAtCradle(
+            token
+        ) then
+            cleanup()
+            return false
+        end
+
+        pcall(function()
+            F.refineCellCradleDialogPosition(
+                token,
+                npcCradle,
+                worldCradle
+            )
+        end)
+
+        local recorderPassed,
+            recorderDetail =
+                F.runCradleManualERecorderCheckpoint(
+                    token,
+                    npcCradle
+                )
+
+        State.cellFarm.dialogCheckpointConfirmed =
+            recorderPassed == true
+
+        State.cellFarm.status =
+            tostring(
+                recorderDetail
+                or State.cellFarm.status
+            )
+
+        cleanup()
+
+        return false
     end
 
     for attempt = 1,
@@ -18150,181 +19959,145 @@ function F.summonCellBoss(token)
         local releaseButton = nil
         local dialogueDetail = "Waiting for Cradle dialogue"
 
-        local promptVisible,
+        State.cellFarm.cradleInteractPromptAttempts =
+            (
+                State.cellFarm.cradleInteractPromptAttempts
+                or 0
+            )
+            + 1
+
+        F.setCellFarmStage(
+            "WAITING FOR CRADLE PROMPT",
+            "Waiting for visible Interact (E) before exact Cobalt start "
+                .. tostring(attempt)
+                .. "/"
+                .. tostring(
+                    Config.CELL_CRADLE_DIALOG_ATTEMPTS
+                )
+        )
+
+        local promptReady,
             promptText =
-                F.getCellCradleInteractPromptEvidence()
+                F.waitForCellCradleInteractPrompt(
+                    token,
+                    Config.CELL_CRADLE_PROMPT_WAIT
+                )
 
         State.cellFarm.cradleInteractPromptVisible =
-            promptVisible == true
+            promptReady == true
 
         State.cellFarm.cradleInteractPromptText =
             promptText
             or "None"
 
-        if promptVisible then
-            State.cellFarm.cradleInteractPromptAttempts =
-                (
-                    State.cellFarm.cradleInteractPromptAttempts
-                    or 0
-                )
-                + 1
+        -- IMPORTANT: do not press E here. The user confirmed physical E did
+        -- not open the dialogue reliably. The visible Interact(E) prompt is
+        -- used only as proof that the game's NPC controller is in a ready
+        -- proximity/input state before the exact, manually-proven Cobalt
+        -- DialogEvent start is fired.
+        State.cellFarm.npcInteractionFunctionFound =
+            false
 
-            State.cellFarm.npcInteractionMethod =
-                "Visible Interact (E) prompt"
+        State.cellFarm.npcInteractionCallOk =
+            false
 
-            State.cellFarm.npcInteractionSource =
-                "InteractPromptBillboard_NPC"
+        State.cellFarm.npcInteractionMethod =
+            promptReady
+            and "Prompt-ready exact Cobalt start"
+            or "Prompt-timeout exact Cobalt start"
 
+        State.cellFarm.npcInteractionSource =
+            'DialogEvent:FireServer("start", workspace.NPCs["The Cradle"], 10)'
+
+        if promptReady then
             F.setCellFarmStage(
-                "CRADLE INTERACT (E)",
-                "Visible Interact (E) prompt found - pressing E before exact Cobalt start"
+                "CRADLE PROMPT CONFIRMED",
+                "Interact (E) is stable; firing exact Cobalt start now"
             )
-
-            F.pressVirtualKey(
-                Enum.KeyCode.E,
-                0x45,
-                Config.CELL_CRADLE_PREP_E_HOLD,
-                "Cradle Interact (E)"
+        else
+            F.setCellFarmStage(
+                "CRADLE PROMPT TIMEOUT",
+                "Prompt not confirmed; still trying exact Cobalt start once"
             )
-
-            dialogueConfirmed,
-                releaseVisible,
-                releaseButton,
-                dialogueDetail =
-                    F.waitForCellCradleDialogue(
-                        token,
-                        Config.CELL_CRADLE_DIALOGUE_DETECT_TIMEOUT,
-                        true
-                    )
-
-            State.cellFarm.dialogUiConfirmed =
-                dialogueConfirmed == true
-
-            State.cellFarm.dialogReleaseVisible =
-                releaseVisible == true
-
-            if dialogueConfirmed
-                and releaseVisible
-            then
-                State.cellFarm.status =
-                    "CONFIRMED: Interact (E) opened the exact Cradle Release dialogue"
-
-                if F.updateCellFarmUI then
-                    F.updateCellFarmUI()
-                end
-            end
         end
 
-        if not dialogueConfirmed
-            or not releaseVisible
-        then
-            F.setCellFarmStage(
-                "EXACT COBALT DIALOG START",
-                "DialogPart "
-                    .. string.format(
-                        "%.2f",
-                        State.cellFarm.cradleDialogPartDistance
-                        or -1
-                    )
-                    .. " studs | running exact Cobalt start "
-                    .. tostring(attempt)
-                    .. "/"
-                    .. tostring(
-                        Config.CELL_CRADLE_DIALOG_ATTEMPTS
-                    )
-            )
+        -- Exact Cobalt snippet supplied by the user and manually verified:
+        local startOk =
+            pcall(function()
+                local Event =
+                    game:GetService(
+                        "ReplicatedStorage"
+                    ).Remotes.DialogEvent
 
-            -- Exact Cobalt snippet supplied by the user. This start is executed
-            -- directly and is not routed through any other interaction helper.
-            local startOk =
-                pcall(function()
-                    local Event =
-                        game:GetService(
-                            "ReplicatedStorage"
-                        ).Remotes.DialogEvent
-
-                    Event:FireServer(
-                        "start",
-                        workspace.NPCs["The Cradle"],
-                        10
-                    )
-                end)
-
-            State.cellFarm.dialogStartSent =
-                startOk == true
-
-            State.cellFarm.npcInteractionFunctionFound =
-                false
-
-            State.cellFarm.npcInteractionCallOk =
-                false
-
-            State.cellFarm.npcInteractionMethod =
-                "Exact Cobalt DialogEvent start"
-
-            State.cellFarm.npcInteractionSource =
-                'DialogEvent:FireServer("start", workspace.NPCs["The Cradle"], 10)'
-
-            if startOk then
-                State.movementTelemetry.lastRemote =
-                    'DialogEvent("start", workspace.NPCs["The Cradle"], 10)'
-
-                State.cellFarm.status =
-                    "Exact Cobalt start sent; waiting for real Release UI"
-            else
-                F.recordCellFailure(
-                    "Exact Cobalt DialogEvent start failed"
+                Event:FireServer(
+                    "start",
+                    workspace.NPCs["The Cradle"],
+                    10
                 )
+            end)
 
-                State.cellFarm.status =
-                    "Exact Cobalt start pcall failed"
-            end
+        State.cellFarm.dialogStartSent =
+            startOk == true
 
-            if F.updateCellFarmUI then
-                F.updateCellFarmUI()
-            end
-
-            -- This is the authoritative start confirmation. We do NOT send
-            -- option merely because FireServer returned without error.
-            dialogueConfirmed,
-                releaseVisible,
-                releaseButton,
-                dialogueDetail =
-                    F.waitForCellCradleDialogue(
-                        token,
-                        Config.CELL_CRADLE_DIALOG_VISIBLE_WAIT,
-                        true
-                    )
-
-            State.cellFarm.dialogUiConfirmed =
-                dialogueConfirmed == true
-
-            State.cellFarm.dialogReleaseVisible =
-                releaseVisible == true
+        if startOk then
+            State.movementTelemetry.lastRemote =
+                'DialogEvent("start", workspace.NPCs["The Cradle"], 10)'
 
             State.cellFarm.status =
-                dialogueConfirmed
-                and (
-                    "CONFIRMED: Release UI rendered"
-                    .. (
-                        releaseButton
-                        and (
-                            " | "
-                            .. releaseButton:GetFullName()
-                        )
-                        or ""
-                    )
-                )
-                or (
-                    "NOT CONFIRMED: "
-                    .. tostring(
-                        dialogueDetail
-                    )
+                promptReady
+                and "Exact Cobalt start sent after confirmed Interact (E) readiness"
+                or "Exact Cobalt start sent after prompt timeout"
+        else
+            F.recordCellFailure(
+                "Exact Cobalt DialogEvent start failed"
+            )
+
+            State.cellFarm.status =
+                "Exact Cobalt start pcall failed"
+        end
+
+        if F.updateCellFarmUI then
+            F.updateCellFarmUI()
+        end
+
+        dialogueConfirmed,
+            releaseVisible,
+            releaseButton,
+            dialogueDetail =
+                F.waitForCellCradleDialogue(
+                    token,
+                    Config.CELL_CRADLE_DIALOG_VISIBLE_WAIT,
+                    true
                 )
 
-            if F.updateCellFarmUI then
-                F.updateCellFarmUI()
-            end
+        State.cellFarm.dialogUiConfirmed =
+            dialogueConfirmed == true
+
+        State.cellFarm.dialogReleaseVisible =
+            releaseVisible == true
+
+        State.cellFarm.status =
+            dialogueConfirmed
+            and (
+                "CONFIRMED: exact Cradle Release dialogue rendered"
+                .. (
+                    releaseButton
+                    and (
+                        " | "
+                        .. releaseButton:GetFullName()
+                    )
+                    or ""
+                )
+            )
+            or (
+                "NOT CONFIRMED after exact Cobalt start: "
+                .. tostring(
+                    dialogueDetail
+                )
+            )
+
+        if F.updateCellFarmUI then
+            F.updateCellFarmUI()
         end
 
         if not dialogueConfirmed
@@ -18332,7 +20105,9 @@ function F.summonCellBoss(token)
         then
             F.setCellFarmStage(
                 "DIALOG NOT CONFIRMED",
-                "Interact (E) and exact Cobalt start did not produce the Release UI"
+                promptReady
+                    and "Prompt was ready but exact Cobalt start did not produce Release UI"
+                    or "Prompt was not ready and exact Cobalt start did not produce Release UI"
             )
 
             if attempt
@@ -18350,6 +20125,73 @@ function F.summonCellBoss(token)
             end
 
             cleanup()
+            return false
+        end
+
+        State.cellFarm.dialogCheckpointConfirmed =
+            true
+
+        if Config.CELL_DIALOG_CHECKPOINT_ONLY then
+            State.cellFarm.dialogCheckpointHolding =
+                true
+
+            F.setCellFarmStage(
+                "DIALOG CHECKPOINT PASSED",
+                "CONFIRMED exact The Cradle dialogue. Holding here; Release is intentionally disabled in this test build."
+            )
+
+            State.cellFarm.status =
+                "CHECKPOINT 1 PASS: The Cradle dialog is confirmed. Do not press Release yet."
+
+            if F.updateCellFarmUI then
+                F.updateCellFarmUI()
+            end
+
+            local lastHeartbeat =
+                os.clock()
+
+            while F.isCellFarmActive(token)
+                and Config.CELL_DIALOG_CHECKPOINT_ONLY
+            do
+                if os.clock() - lastHeartbeat
+                    >= Config.CELL_DIALOG_CHECKPOINT_HEARTBEAT
+                then
+                    lastHeartbeat =
+                        os.clock()
+
+                    local stillVisible,
+                        stillReleaseVisible,
+                        _button,
+                        detail =
+                            F.getCellCradleDialogueEvidence()
+
+                    State.cellFarm.dialogUiConfirmed =
+                        stillVisible == true
+
+                    State.cellFarm.dialogReleaseVisible =
+                        stillReleaseVisible == true
+
+                    State.cellFarm.status =
+                        stillVisible
+                        and "CHECKPOINT 1 PASS: Dialog still visible - waiting for user confirmation"
+                        or (
+                            "CHECKPOINT 1 LOST: "
+                            .. tostring(detail)
+                        )
+
+                    if F.updateCellFarmUI then
+                        F.updateCellFarmUI()
+                    end
+                end
+
+                task.wait(0.10)
+            end
+
+            State.cellFarm.dialogCheckpointHolding =
+                false
+
+            cleanup()
+
             return false
         end
 
@@ -21030,17 +22872,123 @@ function F.updateCellBossHealthSnapshot(boss)
     return hp, maxHp, percent, stateText
 end
 
+
+function F.getCellDropFolders()
+    local result = {}
+    local seen = {}
+
+    local wantedNames = {
+        drops = true,
+        drop = true,
+        loot = true,
+        lootdrops = true,
+        worlddrops = true,
+        worldloot = true,
+    }
+
+    local function add(object)
+        if not object
+            or not object.Parent
+            or seen[object]
+        then
+            return
+        end
+
+        if not (
+            object:IsA("Folder")
+            or object:IsA("Model")
+        ) then
+            return
+        end
+
+        seen[object] = true
+
+        table.insert(
+            result,
+            object
+        )
+    end
+
+    add(State.dropsFolder)
+    add(workspace:FindFirstChild("Drops"))
+    add(workspace:FindFirstChild("Drop"))
+
+    for _, object in ipairs(
+        workspace:GetDescendants()
+    ) do
+        if object:IsA("Folder")
+            or object:IsA("Model")
+        then
+            local key =
+                string.lower(
+                    tostring(
+                        object.Name
+                        or ""
+                    )
+                ):gsub(
+                    "%s+",
+                    ""
+                )
+
+            if wantedNames[key] then
+                add(object)
+            end
+        end
+    end
+
+    return result
+end
+
+function F.collectCellLootCandidates(beforeSnapshot)
+    local result = {}
+    local seen = {}
+
+    for _, folder in ipairs(
+        F.getCellDropFolders()
+    ) do
+        for _, drop in ipairs(
+            F.collectDropObjects(folder)
+        ) do
+            if not seen[drop]
+                and not (
+                    beforeSnapshot
+                    and beforeSnapshot[drop]
+                )
+                and F.isDropPresent(drop)
+            then
+                local include = true
+
+                local dropCFrame =
+                    F.getDropCFrame(drop)
+
+                if State.cellFarm.lastBossPosition
+                    and dropCFrame
+                then
+                    include =
+                        (
+                            dropCFrame.Position
+                            - State.cellFarm.lastBossPosition
+                        ).Magnitude
+                        <= Config.CELL_DROP_RADIUS
+                end
+
+                if include then
+                    seen[drop] = true
+                    table.insert(result, drop)
+                end
+            end
+        end
+    end
+
+    return result
+end
+
 function F.captureCellDropSnapshot()
     local snapshot = {}
 
-    local folder =
-        State.dropsFolder
-        or (
-            F.findDropsFolder
-            and F.findDropsFolder()
-        )
-
-    if folder then
+    for _, folder in ipairs(
+        F.getCellDropFolders()
+    ) do
         for _, drop in ipairs(
             F.collectDropObjects(folder)
         ) do
@@ -21712,155 +23660,252 @@ function F.collectCellDropConfirmed(drop, token)
         F.resetCamera()
     end
 
-    if not F.acquireMovement(
-        "CELL",
-        4
-    ) then
-        return false
-    end
+    F.stopMovementFlight("MONSTER_LOCK")
+    F.releaseMovement("MONSTER_LOCK")
+    F.stopLootLock("CELL")
 
-    local lockToken =
-        F.startLootLock(
-            drop,
-            "CELL"
-        )
-
-    if not lockToken then
-        F.releaseMovement("CELL")
-        return false
-    end
-
-    local arrived =
-        F.waitForLootFlightArrival(
-            drop,
-            "CELL",
-            lockToken
-        )
-
-    if not arrived then
-        F.stopLootLock(
-            "CELL",
-            lockToken
-        )
-        return false
-    end
-
-    for _ = 1, Config.LOOT_RETRY_COUNT do
+    for moveAttempt = 1,
+        Config.CELL_LOOT_MOVE_RETRIES
+    do
         if not F.isCellFarmActive(token) then
-            F.stopLootLock(
-                "CELL",
-                lockToken
-            )
             return false
         end
 
         if not F.isDropPresent(drop) then
-            F.stopLootLock(
-                "CELL",
-                lockToken
-            )
             return true
         end
 
-        if not F.isLootLockActive(
-            drop,
-            "CELL",
-            lockToken
-        ) then
-            lockToken =
-                F.startLootLock(
-                    drop,
-                    "CELL"
-                )
+        local target =
+            F.getDropStandCFrame(drop)
 
-            if not lockToken then
+        local root =
+            F.getCharacterRoot()
+
+        if not target
+            or not root
+        then
+            State.cellFarm.status =
+                "LOOT MOVE: target/root unavailable"
+
+            if not F.cellFarmWait(
+                token,
+                Config.CELL_LOOT_STUCK_RETRY_DELAY
+            ) then
                 return false
             end
 
-            if not F.waitForLootFlightArrival(
-                drop,
-                "CELL",
-                lockToken
-            ) then
-                break
-            end
+            continue
         end
 
-        State.applyLootLockPosition()
-        task.wait(
-            Config.LOOT_INTERACT_DELAY
+        local distance =
+            (
+                target.Position
+                - root.Position
+            ).Magnitude
+
+        State.cellFarm.lootMoveTarget =
+            tostring(drop.Name)
+
+        State.cellFarm.lootMoveDistance =
+            distance
+
+        State.cellFarm.lootMoveAttempts =
+            (State.cellFarm.lootMoveAttempts or 0)
+            + 1
+
+        State.cellFarm.lootMoveConfirmed =
+            false
+
+        F.setCellFarmStage(
+            "LOOT MOVE",
+            "Flying to "
+                .. tostring(drop.Name)
+                .. " | "
+                .. string.format("%.1f", distance)
+                .. " studs | attempt "
+                .. tostring(moveAttempt)
+                .. "/"
+                .. tostring(
+                    Config.CELL_LOOT_MOVE_RETRIES
+                )
         )
 
-        F.fireDirectDropPickup(
-            drop
-        )
-
-        local remoteDeadline =
-            os.clock()
-            + Config.LOOT_REMOTE_CONFIRM_TIMEOUT
-
-        while F.isCellFarmActive(token)
-            and os.clock() < remoteDeadline
-            and F.isDropPresent(drop)
-        do
-            if F.isLootLockActive(
-                drop,
+        local arrived =
+            F.flyToCFrame(
+                target,
                 "CELL",
-                lockToken
-            ) then
-                State.applyLootLockPosition()
-            end
-
-            task.wait(
-                Config.LOOT_CONFIRM_POLL
+                F.getLootArrivalDistance(drop),
+                Config.CELL_LOOT_DIRECT_MOVE_TIMEOUT,
+                "Cell"
             )
+
+        if not F.isCellFarmActive(token) then
+            return false
         end
 
         if not F.isDropPresent(drop) then
-            F.stopLootLock(
-                "CELL",
-                lockToken
-            )
+            State.cellFarm.lootMoveConfirmed =
+                true
+
             return true
         end
 
-        State.applyLootLockPosition()
-        F.pressLootInteractKey()
-
-        local deadline =
-            os.clock()
-            + Config.LOOT_CONFIRM_TIMEOUT
-
-        while F.isCellFarmActive(token)
-            and os.clock() < deadline
-            and F.isDropPresent(drop)
-        do
-            if F.isLootLockActive(
-                drop,
+        if not arrived then
+            if F.acquireMovement(
                 "CELL",
-                lockToken
+                4
             ) then
-                State.applyLootLockPosition()
+                local lockToken =
+                    F.startLootLock(
+                        drop,
+                        "CELL"
+                    )
+
+                if lockToken then
+                    arrived =
+                        F.waitForLootFlightArrival(
+                            drop,
+                            "CELL",
+                            lockToken
+                        )
+
+                    F.stopLootLock(
+                        "CELL",
+                        lockToken
+                    )
+                else
+                    F.releaseMovement("CELL")
+                end
+            end
+        end
+
+        if not arrived then
+            State.cellFarm.status =
+                "LOOT MOVE FAILED: "
+                .. tostring(drop.Name)
+                .. " - retrying"
+
+            if not F.cellFarmWait(
+                token,
+                Config.CELL_LOOT_STUCK_RETRY_DELAY
+            ) then
+                return false
             end
 
-            task.wait(
-                Config.LOOT_CONFIRM_POLL
-            )
+            continue
         end
 
-        if not F.isDropPresent(drop) then
-            F.stopLootLock(
-                "CELL",
-                lockToken
+        State.cellFarm.lootMoveConfirmed =
+            true
+
+        local currentRoot =
+            F.getCharacterRoot()
+
+        local currentTarget =
+            F.getDropStandCFrame(drop)
+
+        if currentRoot
+            and currentTarget
+        then
+            State.cellFarm.lootMoveDistance =
+                (
+                    currentTarget.Position
+                    - currentRoot.Position
+                ).Magnitude
+        end
+
+        F.setCellFarmStage(
+            "LOOT ARRIVED",
+            "Reached "
+                .. tostring(drop.Name)
+                .. " - requesting pickup"
+        )
+
+        for pickupAttempt = 1,
+            Config.LOOT_RETRY_COUNT
+        do
+            if not F.isCellFarmActive(token) then
+                return false
+            end
+
+            if not F.isDropPresent(drop) then
+                return true
+            end
+
+            F.setCellFarmStage(
+                "LOOT PICKUP",
+                tostring(drop.Name)
+                    .. " | pickup "
+                    .. tostring(pickupAttempt)
+                    .. "/"
+                    .. tostring(
+                        Config.LOOT_RETRY_COUNT
+                    )
             )
-            return true
+
+            task.wait(
+                Config.LOOT_INTERACT_DELAY
+            )
+
+            F.fireDirectDropPickup(drop)
+
+            local remoteDeadline =
+                os.clock()
+                + Config.LOOT_REMOTE_CONFIRM_TIMEOUT
+
+            while F.isCellFarmActive(token)
+                and os.clock() < remoteDeadline
+                and F.isDropPresent(drop)
+            do
+                task.wait(
+                    Config.LOOT_CONFIRM_POLL
+                )
+            end
+
+            if not F.isDropPresent(drop) then
+                State.cellFarm.status =
+                    "CONFIRMED loot collected: "
+                    .. tostring(drop.Name)
+
+                return true
+            end
+
+            F.pressLootInteractKey()
+
+            local confirmDeadline =
+                os.clock()
+                + Config.LOOT_CONFIRM_TIMEOUT
+
+            while F.isCellFarmActive(token)
+                and os.clock() < confirmDeadline
+                and F.isDropPresent(drop)
+            do
+                task.wait(
+                    Config.LOOT_CONFIRM_POLL
+                )
+            end
+
+            if not F.isDropPresent(drop) then
+                State.cellFarm.status =
+                    "CONFIRMED loot collected after interact: "
+                    .. tostring(drop.Name)
+
+                return true
+            end
+        end
+
+        if not F.cellFarmWait(
+            token,
+            Config.CELL_LOOT_STUCK_RETRY_DELAY
+        ) then
+            return false
         end
     end
 
-    F.stopLootLock(
-        "CELL",
-        lockToken
-    )
+    State.cellFarm.status =
+        "LOOT STILL PRESENT: "
+        .. tostring(drop.Name)
+        .. " - collection incomplete"
 
     return false
 end
@@ -22454,50 +24499,9 @@ function F.captureCellRewardChestSnapshot()
 end
 
 function F.countCellRewardDrops(beforeSnapshot)
-    local count = 0
-
-    local folder =
-        State.dropsFolder
-        or (
-            F.findDropsFolder
-            and F.findDropsFolder()
-        )
-
-    if not folder then
-        return 0
-    end
-
-    for _, drop in ipairs(
-        F.collectDropObjects(
-            folder
-        )
-    ) do
-        if not beforeSnapshot[drop] then
-            local include = true
-
-            local cf =
-                F.getDropCFrame(
-                    drop
-                )
-
-            if State.cellFarm.lastBossPosition
-                and cf
-            then
-                include =
-                    (
-                        cf.Position
-                        - State.cellFarm.lastBossPosition
-                    ).Magnitude
-                    <= Config.CELL_DROP_RADIUS
-            end
-
-            if include then
-                count = count + 1
-            end
-        end
-    end
-
-    return count
+    return #F.collectCellLootCandidates(
+        beforeSnapshot
+    )
 end
 
 function F.isCellRewardChestOpened(chest)
@@ -23227,138 +25231,202 @@ end
 
 function F.collectCellBossLoot(token, beforeSnapshot)
     F.setCellFarmStage(
-        "LOOTING",
-        "Waiting for Cell drops"
+        "LOOT RESCAN",
+        "Finding every post-chest drop before Bundle/Sell"
     )
 
-    F.stopMovementFlight(
-        "MONSTER_LOCK"
-    )
-    F.releaseMovement(
-        "MONSTER_LOCK"
-    )
+    F.stopMovementFlight("MONSTER_LOCK")
+    F.releaseMovement("MONSTER_LOCK")
+    F.stopLootLock("CELL")
 
-    task.wait(1.10)
-
-    local found = {}
-    local foundSet = {}
-    local discoveryDeadline =
-        os.clock()
-        + Config.CELL_DROP_DISCOVERY_SECONDS
-
-    while F.isCellFarmActive(token)
-        and os.clock() < discoveryDeadline
-    do
-        local folder =
-            State.dropsFolder
-            or (
-                F.findDropsFolder
-                and F.findDropsFolder()
-            )
-
-        if folder then
-            for _, drop in ipairs(
-                F.collectDropObjects(folder)
-            ) do
-                if not beforeSnapshot[drop]
-                    and not foundSet[drop]
-                then
-                    local include = true
-                    local dropCFrame =
-                        F.getDropCFrame(
-                            drop
-                        )
-
-                    if State.cellFarm.lastBossPosition
-                        and dropCFrame
-                    then
-                        include =
-                            (
-                                dropCFrame.Position
-                                - State.cellFarm.lastBossPosition
-                            ).Magnitude
-                            <= Config.CELL_DROP_RADIUS
-                    end
-
-                    if include then
-                        foundSet[drop] = true
-                        table.insert(
-                            found,
-                            drop
-                        )
-                    end
-                end
-            end
-        end
-
-        task.wait(0.15)
-    end
-
-    table.sort(
-        found,
-        function(a, b)
-            local root =
-                F.getCharacterRoot()
-
-            if not root then
-                return tostring(a.Name)
-                    < tostring(b.Name)
-            end
-
-            local aCf =
-                F.getDropCFrame(a)
-            local bCf =
-                F.getDropCFrame(b)
-
-            local aDistance =
-                aCf
-                and (
-                    aCf.Position
-                    - root.Position
-                ).Magnitude
-                or math.huge
-
-            local bDistance =
-                bCf
-                and (
-                    bCf.Position
-                    - root.Position
-                ).Magnitude
-                or math.huge
-
-            return aDistance < bDistance
-        end
-    )
+    task.wait(0.25)
 
     local collected = 0
+    local quietSince = nil
+    local failureCounts = {}
 
-    for _, drop in ipairs(found) do
-        if not F.isCellFarmActive(token)
-            or collected
-                >= Config.CELL_MAX_LOOT_PER_RUN
-        then
-            break
+    while F.isCellFarmActive(token) do
+        local candidates =
+            F.collectCellLootCandidates(
+                beforeSnapshot
+            )
+
+        table.sort(
+            candidates,
+            function(a, b)
+                local root =
+                    F.getCharacterRoot()
+
+                if not root then
+                    return tostring(a.Name)
+                        < tostring(b.Name)
+                end
+
+                local aCf =
+                    F.getDropCFrame(a)
+
+                local bCf =
+                    F.getDropCFrame(b)
+
+                local aDistance =
+                    aCf
+                    and (
+                        aCf.Position
+                        - root.Position
+                    ).Magnitude
+                    or math.huge
+
+                local bDistance =
+                    bCf
+                    and (
+                        bCf.Position
+                        - root.Position
+                    ).Magnitude
+                    or math.huge
+
+                return
+                    aDistance
+                    < bDistance
+            end
+        )
+
+        State.cellFarm.lootKnownRemaining =
+            #candidates
+
+        if #candidates == 0 then
+            quietSince =
+                quietSince
+                or os.clock()
+
+            local quietFor =
+                os.clock()
+                - quietSince
+
+            F.setCellFarmStage(
+                "LOOT RESCAN",
+                "No remaining drops | quiet "
+                    .. string.format(
+                        "%.1f",
+                        quietFor
+                    )
+                    .. "/"
+                    .. string.format(
+                        "%.1f",
+                        Config.CELL_LOOT_EMPTY_STABLE
+                    )
+                    .. "s"
+            )
+
+            if quietFor
+                >= Config.CELL_LOOT_EMPTY_STABLE
+            then
+                F.stopLootLock("CELL")
+                F.stopMovementFlight("CELL")
+                F.releaseMovement("CELL")
+
+                State.cellFarm.lootMoveTarget =
+                    "Complete"
+
+                State.cellFarm.lootMoveDistance =
+                    0
+
+                State.cellFarm.lootKnownRemaining =
+                    0
+
+                F.markConfigDirty()
+
+                return
+                    collected,
+                    true
+            end
+
+            task.wait(
+                Config.CELL_LOOT_RESCAN_INTERVAL
+            )
+
+            continue
         end
 
-        if F.isDropPresent(drop)
-            and F.collectCellDropConfirmed(
+        quietSince = nil
+
+        if collected
+            >= Config.CELL_MAX_LOOT_PER_RUN
+        then
+            F.setCellFarmStage(
+                "LOOT LIMIT HOLD",
+                "Loot limit reached while drops remain - hop blocked"
+            )
+
+            return
+                collected,
+                false
+        end
+
+        local drop =
+            candidates[1]
+
+        State.cellFarm.lootMoveTarget =
+            tostring(drop.Name)
+
+        local success =
+            F.collectCellDropConfirmed(
                 drop,
                 token
             )
-        then
-            collected = collected + 1
+
+        if not F.isCellFarmActive(token) then
+            return
+                collected,
+                false
+        end
+
+        if success then
+            collected =
+                collected + 1
+
+            failureCounts[drop] = nil
+
             State.cellFarm.lootCollected =
                 State.cellFarm.lootCollected + 1
+
             State.sessionStats.lootConfirmed =
                 State.sessionStats.lootConfirmed + 1
+        else
+            failureCounts[drop] =
+                (failureCounts[drop] or 0)
+                + 1
+
+            F.setCellFarmStage(
+                "LOOT RETRY",
+                tostring(drop.Name)
+                    .. " still exists | retry cycle "
+                    .. tostring(
+                        failureCounts[drop]
+                    )
+                    .. " | hop blocked"
+            )
+
+            if not F.cellFarmWait(
+                token,
+                Config.CELL_LOOT_STUCK_RETRY_DELAY
+            ) then
+                return
+                    collected,
+                    false
+            end
         end
+
+        task.wait(
+            Config.CELL_LOOT_RESCAN_INTERVAL
+        )
     end
 
     F.stopLootLock("CELL")
     F.releaseMovement("CELL")
-    F.markConfigDirty()
 
-    return collected
+    return
+        collected,
+        false
 end
 
 function F.isBundleItem(item)
@@ -23954,6 +26022,34 @@ function F.updateCellFarmUI()
         .. tostring(State.cellFarm.dialogReleaseVisible == true)
         .. " option="
         .. tostring(State.cellFarm.dialogOptionConfirmed == true)
+        .. "\nDialog checkpoint: "
+        .. tostring(State.cellFarm.dialogCheckpointConfirmed == true)
+        .. " | holding="
+        .. tostring(State.cellFarm.dialogCheckpointHolding == true)
+        .. "\nRecorder: "
+        .. tostring(State.cellFarm.cradleRecorderStatus or "OFF")
+        .. " | armed="
+        .. tostring(State.cellFarm.cradleRecorderArmed == true)
+        .. " | manualE="
+        .. tostring(State.cellFarm.cradleRecorderManualE or 0)
+        .. " | remotes="
+        .. tostring(State.cellFarm.cradleRecorderRemoteCalls or 0)
+        .. "\nRecorder candidate: score="
+        .. tostring(State.cellFarm.cradleRecorderCandidateScore or -1)
+        .. " | connections="
+        .. tostring(State.cellFarm.cradleRecorderConnectionCount or 0)
+        .. "\nRecorder last remote: "
+        .. tostring(State.cellFarm.cradleRecorderLastRemote or "None")
+        .. "\nRecorder report: "
+        .. tostring(State.cellFarm.cradleRecorderReportPath or "None")
+        .. " | result="
+        .. tostring(State.cellFarm.cradleRecorderResult or "None")
+        .. "\nCradle spam: "
+        .. tostring(State.cellFarm.cradleSpamPhase or "OFF")
+        .. " | E="
+        .. tostring(State.cellFarm.cradleESpamCount or 0)
+        .. " | 1="
+        .. tostring(State.cellFarm.cradleOneSpamCount or 0)
         .. "\nDialog RX: "
         .. tostring(State.cellFarm.dialogClientEvents or 0)
         .. " | "
@@ -24007,6 +26103,18 @@ function F.updateCellFarmUI()
         .. tostring(State.cellFarm.itemNotifyLast or "None")
         .. " | Chest DebugId: "
         .. tostring(State.cellFarm.rewardLastChestDebugId or "None")
+        .. "\nLoot move: "
+        .. tostring(State.cellFarm.lootMoveTarget or "None")
+        .. " | dist="
+        .. string.format(
+            "%.1f",
+            tonumber(State.cellFarm.lootMoveDistance)
+            or -1
+        )
+        .. " | move tries="
+        .. tostring(State.cellFarm.lootMoveAttempts or 0)
+        .. " | remaining="
+        .. tostring(State.cellFarm.lootKnownRemaining or 0)
         .. "\nBundles: "
         .. tostring(State.cellFarm.bundlesOpened)
         .. "\nSold: "
@@ -24180,6 +26288,23 @@ function F.runCellFarm(token, resumed)
                 break
             end
 
+            if Config.CELL_DIALOG_CHECKPOINT_ONLY
+                and State.cellFarm.dialogCheckpointConfirmed
+            then
+                F.setCellFarmStage(
+                    "DIALOG CHECKPOINT HOLD",
+                    "Dialog stage complete. Pipeline intentionally paused here."
+                )
+
+                while F.isCellFarmActive(token)
+                    and Config.CELL_DIALOG_CHECKPOINT_ONLY
+                do
+                    task.wait(0.25)
+                end
+
+                return false
+            end
+
             F.recordCellFailure(
                 "Cell summon not confirmed; retrying same server instead of hopping"
             )
@@ -24217,6 +26342,11 @@ function F.runCellFarm(token, resumed)
     State.cellFarm.rewardLastChestDebugId = "None"
     State.cellFarm.rewardDropWaves = 0
     State.cellFarm.rewardDropCount = 0
+    State.cellFarm.lootMoveTarget = "None"
+    State.cellFarm.lootMoveDistance = -1
+    State.cellFarm.lootMoveAttempts = 0
+    State.cellFarm.lootMoveConfirmed = false
+    State.cellFarm.lootKnownRemaining = 0
     State.cellFarm.bossDefeatEventConfirmed = false
     State.cellFarm.bossDefeatEvents = 0
     State.cellFarm.bossDefeatLast = "None"
@@ -24366,14 +26496,30 @@ function F.runCellFarm(token, resumed)
         rewardEventObserver
     )
 
-    F.collectCellBossLoot(
-        token,
-        dropSnapshot
-    )
+    local collectedLoot,
+        lootComplete =
+            F.collectCellBossLoot(
+                token,
+                dropSnapshot
+            )
 
     if not F.isCellFarmActive(token) then
         return false
     end
+
+    if not lootComplete then
+        F.setCellFarmStage(
+            "LOOT INCOMPLETE",
+            "Known post-chest drops remain - Bundle/Sell/Hop blocked"
+        )
+
+        return false
+    end
+
+    State.cellFarm.status =
+        "All post-chest loot collected: "
+        .. tostring(collectedLoot)
+        .. " item(s)"
 
     F.setCellFarmStage(
         "LOOT SETTLE",
@@ -24568,6 +26714,11 @@ function F.startCellFarm(resumed)
         State.cellFarm.rewardLastChestDebugId = "None"
         State.cellFarm.rewardDropWaves = 0
         State.cellFarm.rewardDropCount = 0
+        State.cellFarm.lootMoveTarget = "None"
+        State.cellFarm.lootMoveDistance = -1
+        State.cellFarm.lootMoveAttempts = 0
+        State.cellFarm.lootMoveConfirmed = false
+        State.cellFarm.lootKnownRemaining = 0
         State.cellFarm.bossDefeatEventConfirmed = false
         State.cellFarm.bossDefeatEvents = 0
         State.cellFarm.bossDefeatLast = "None"
@@ -24601,6 +26752,21 @@ function F.startCellFarm(resumed)
         State.cellFarm.dialogReleaseVisible = false
         State.cellFarm.dialogOptionSent = false
         State.cellFarm.dialogOptionConfirmed = false
+        State.cellFarm.dialogCheckpointConfirmed = false
+        State.cellFarm.dialogCheckpointHolding = false
+        State.cellFarm.cradleRecorderStatus = "OFF"
+        State.cellFarm.cradleRecorderArmed = false
+        State.cellFarm.cradleRecorderManualE = 0
+        State.cellFarm.cradleRecorderRemoteCalls = 0
+        State.cellFarm.cradleRecorderConnectionCount = 0
+        State.cellFarm.cradleRecorderCandidateScore = -1
+        State.cellFarm.cradleRecorderCandidate = "None"
+        State.cellFarm.cradleRecorderLastRemote = "None"
+        State.cellFarm.cradleRecorderReportPath = "None"
+        State.cellFarm.cradleRecorderResult = "None"
+        State.cellFarm.cradleESpamCount = 0
+        State.cellFarm.cradleOneSpamCount = 0
+        State.cellFarm.cradleSpamPhase = "OFF"
         State.cellFarm.dialogClientEvents = 0
         State.cellFarm.dialogLastClientEvent = "None"
         State.cellFarm.bossSpawnConfirmed = false
@@ -28570,7 +30736,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics 30 FPS / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("Drops v6.4.27: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
+print("Drops v6.4.32: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -28590,14 +30756,14 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.4.27.")
+    warn("[The Veil Hub] loadstring is required to launch v6.4.32.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.4.27 compile failed:", compileError)
+    warn("[The Veil Hub] v6.4.32 compile failed:", compileError)
     return
 end
 
