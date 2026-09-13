@@ -1,10 +1,10 @@
--- The Veil Hub v6.5.1 Auto Chest loader
+-- The Veil Hub v6.6.2 Performance Hotfix loader
 -- Keeps a clean local runtime copy for teleport resume, then executes it.
 local runtimeSource = [==============[
 
 -- =========================================================
 -- THE VEIL HUB
--- v6.5.1: gradual Auto Chest and zero Hub-owned FPS cap.
+-- v6.6.2: performance hotfix for diagnostics, Auto Chest discovery/loot, cache rebuilds, and scheduler cadence.
 -- Cleaned from a corrupted multi-version export.
 -- Sidebar UI + Collapse + ESP
 --
@@ -62,7 +62,10 @@ local runtimeSource = [==============[
 --   - Optional movement circuit breaker
 --   - Inventory value and Auto Sell preview
 --   - Toggle-controlled Anti-AFK with clean connection lifecycle
---   - Gradual Auto Chest flight with conservative chest detection
+--   - Gradual Auto Chest flight + confirmed chest-loot collection
+--   - v6.6 Bundle Intelligence with live-confirmed evidence separation
+--   - v6.6 Bundle/live + previous-snapshot compatibility diff
+--   - v6.6 managed periodic scheduler + service registry
 -- =========================================================
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -116,11 +119,12 @@ local Config = {
     MAX_MONSTER_HEIGHT = 50,
     SCAN_DELAY = 0.5,
     CACHE_INTEGRITY_INTERVAL = 8,
-    DIAGNOSTICS_INTERVAL = 0.5,
+    DROP_CACHE_REBUILD_DEBOUNCE = 0.08,
+    DIAGNOSTICS_INTERVAL = 1.0,
     MOVEMENT_LEASE_SECONDS = 0.75,
     RECOVERY_BASE_DELAY = 1,
     RECOVERY_MAX_DELAY = 30,
-    CONFIG_SCHEMA_VERSION = 11,
+    CONFIG_SCHEMA_VERSION = 12,
     AUTO_FARM_INTERVAL = 0.07,
     AUTO_SELL_CHECK_INTERVAL = 1.00,
     INVENTORY_MAX_CAPACITY = 150,
@@ -134,6 +138,9 @@ local Config = {
     MERCHANT_INITIAL_WAIT = 6,
     MERCHANT_POST_RESET_WAIT = 20,
     MERCHANT_RETRY_INTERVAL = 0.5,
+    -- Global Workspace merchant scans are allowed only during an active sell
+    -- recovery, never from diagnostics/UI refresh paths.
+    MERCHANT_GLOBAL_SCAN_INTERVAL = 8.0,
     TOWN_RESET_COOLDOWN = 45,
     RESPAWN_TIMEOUT = 15,
 
@@ -144,6 +151,21 @@ local Config = {
     AUTO_CHEST_CONFIRM_TIMEOUT = 3.0,
     AUTO_CHEST_RETRY_COOLDOWN = 12,
     AUTO_CHEST_DEFAULT_SPEED = 0.8,
+    -- Discovery is chunked and expensive ancestor checks are performed only
+    -- for objects with cheap chest evidence. The watcher exists only while
+    -- Auto Chest is enabled.
+    AUTO_CHEST_SCAN_BATCH_SIZE = 750,
+    AUTO_CHEST_SCAN_YIELD = 0.01,
+
+    -- v6.6.2 Auto Chest loot collection. Only drops that appear after a chest
+    -- open attempt are eligible, and they must remain close to that chest.
+    AUTO_CHEST_LOOT_DISCOVERY_SECONDS = 3.0,
+    AUTO_CHEST_LOOT_EMPTY_STABLE = 1.25,
+    AUTO_CHEST_LOOT_RADIUS = 90,
+    AUTO_CHEST_LOOT_MAX_PER_CHEST = 60,
+    AUTO_CHEST_LOOT_MOVE_RETRIES = 3,
+    AUTO_CHEST_LOOT_MOVE_TIMEOUT = 35,
+    AUTO_CHEST_LOOT_RESCAN_INTERVAL = 0.20,
 
     -- Gem Gacha
     GACHA_CYCLE_SECONDS = 20 * 60,
@@ -224,6 +246,23 @@ local Config = {
     GAME_DB_REQUIRE_TIMEOUT = 1.50,
     GAME_DB_DIALOGUE_MAX = 180,
     GAME_DB_SEARCH_MAX_RESULTS = 16,
+
+    -- v6.6 Bundle Intelligence. Bundle data is evidence only; automation never
+    -- invokes a Remote solely because it appeared in an offline snapshot.
+    BUNDLE_AUTO_LOAD = true,
+    BUNDLE_FILE_HINT = "BUNDLE(20260913-043626).json",
+    BUNDLE_FINGERPRINT_FILE = "TheVeilHub_BundleFingerprint_v1.json",
+    BUNDLE_DIFF_SAMPLE_LIMIT = 18,
+    BUNDLE_SEARCH_MAX_RESULTS = 12,
+
+    -- v6.6 managed scheduler. Frame-critical positioning remains on Heartbeat;
+    -- periodic watchdog/automation work is registered here instead of owning
+    -- independent while-loops.
+    SCHEDULER_HEARTBEAT_BUDGET = 24,
+    -- 25 Hz is enough for the fastest 0.07 s periodic job while avoiding a
+    -- scheduler walk every rendered/physics frame.
+    SCHEDULER_TICK_INTERVAL = 0.04,
+
     GAME_DB_MODULE_NAMES = {
         "GameConfig",
         "BeastiaryConfig",
@@ -380,8 +419,8 @@ local Config = {
     CELL_MENU_PROTOCOL_ATTEMPTS = 5,
     CELL_MENU_PROTOCOL_INTERVAL = 1.35,
     CELL_WEAPON_WAIT_TIMEOUT = 12,
-    CELL_RUNTIME_FILE = "TheVeilHub_v6_5_1_Runtime.lua",
-    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_5_1_CellResume.flag",
+    CELL_RUNTIME_FILE = "TheVeilHub_v6_6_2_Runtime.lua",
+    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_6_2_CellResume.flag",
     CELL_DEFAULT_FIGHT_HEIGHT = 20,
     CELL_DEFAULT_TRAVEL_SPEED = 2.0,
 
@@ -404,7 +443,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.5.1 Auto Chest",
+    HUB_VERSION = "v6.6.2 Performance Hotfix",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -573,6 +612,51 @@ local State = {
     lockConnection = nil,
 
     controllers = {},
+    services = {},
+    serviceOrder = {},
+    scheduler = {
+        tasks = {},
+        order = {},
+        connection = nil,
+        started = false,
+        token = 0,
+        dispatches = 0,
+        completed = 0,
+        skippedBusy = 0,
+        errors = 0,
+        lastTask = "None",
+        lastDuration = 0,
+        maxDuration = 0,
+    },
+    bundleIntel = {
+        loaded = false,
+        loading = false,
+        status = "Not loaded",
+        sourceFile = "",
+        generatedAtUtc = "",
+        inspectorVersion = "Unknown",
+        placeId = 0,
+        gameId = 0,
+        placeMismatch = false,
+        gameMismatch = false,
+        remoteIndex = {},
+        remoteList = {},
+        liveRemoteIndex = {},
+        moduleIndex = {},
+        moduleList = {},
+        moduleCategories = {},
+        entityIndex = {},
+        dropSpawnLinks = {},
+        npcDialogueModules = {},
+        remoteGroups = {},
+        counts = {},
+        coverage = {},
+        liveDiff = {},
+        historyDiff = {},
+        fingerprintStatus = "No baseline",
+        lastRefreshAt = 0,
+        lastError = "None",
+    },
     movement = {
         owner = nil,
         leaseUntil = 0,
@@ -1044,7 +1128,7 @@ local State = {
     merchantResetCooldownUntil = 0,
     merchantResetInProgress = false,
 
-    -- v6.5.1 Auto Chest. Cache keys are weak so removed streamed chests do not
+    -- v6.6 Auto Chest. Cache keys are weak so removed streamed chests do not
     -- remain retained by the Hub.
     chestEnabled = false,
     chestBusy = false,
@@ -1053,11 +1137,17 @@ local State = {
     chestStatus = "OFF",
     chestCurrent = nil,
     chestOpenedCount = 0,
+    chestLootedCount = 0,
+    chestLootFailedCount = 0,
     chestFailedCount = 0,
     chestCache = setmetatable({}, {__mode = "k"}),
     chestOpenedCache = setmetatable({}, {__mode = "k"}),
     chestFailedUntil = setmetatable({}, {__mode = "k"}),
     chestConnections = {},
+    chestWatcherEnabled = false,
+    chestScanRunning = false,
+    chestScanToken = 0,
+    chestScanInspected = 0,
     chestToggle = nil,
     chestSpeedSlider = nil,
     chestStatusLabel = nil,
@@ -1262,6 +1352,251 @@ function F.runBoundary(source, callback, ...)
 
     return true, table.unpack(results, 2, results.n)
 end
+
+-- =========================================================
+-- V6.6 MANAGED SCHEDULER + SERVICE REGISTRY
+-- =========================================================
+
+F.Services = State.services
+
+function F.registerService(name, controllerName, stateKey)
+    name = tostring(name or "")
+    controllerName = tostring(controllerName or name)
+
+    if name == "" then
+        return nil
+    end
+
+    local existing = State.services[name]
+    if not existing then
+        existing = {Name = name}
+        State.services[name] = existing
+        table.insert(State.serviceOrder, name)
+    end
+
+    existing.ControllerName = controllerName
+    existing.Controller = F.Controllers[controllerName]
+    existing.StateKey = stateKey
+    existing.RegisteredAt = os.clock()
+    return existing
+end
+
+function F.refreshServiceRegistry()
+    table.clear(State.services)
+    table.clear(State.serviceOrder)
+
+    local definitions = {
+        {"Coordinator", "Coordinator", "movement"},
+        {"Recovery", "Recovery", "recovery"},
+        {"Diagnostics", "Diagnostics", "errors"},
+        {"GameDB", "GameDB", "gameDB"},
+        {"BundleIntel", "BundleIntel", "bundleIntel"},
+        {"NPCIntelligence", "NPCIntelligence", "npcIntel"},
+        {"Interactions", "Interactions", nil},
+        {"GoalFarm", "GoalFarm", "goalFarm"},
+        {"Profiles", "Profiles", "profiles"},
+        {"Movement", "Movement", "movementTelemetry"},
+        {"Waypoints", "Waypoints", "waypoints"},
+        {"Planner", "Planner", nil},
+        {"SystemSafety", "SystemSafety", "movementSafety"},
+        {"AutoChest", "AutoChest", "chestCache"},
+        {"CellFarm", "CellFarm", "cellFarm"},
+        {"World", "World", nil},
+        {"Farm", "Farm", "farmMachine"},
+        {"Sell", "Sell", nil},
+        {"Combat", "Combat", nil},
+        {"LootLock", "LootLock", nil},
+    }
+
+    for _, definition in ipairs(definitions) do
+        local controllerName = definition[2]
+        if F.Controllers[controllerName] then
+            F.registerService(definition[1], controllerName, definition[3])
+        end
+    end
+
+    return #State.serviceOrder
+end
+
+function F.schedulerRegister(name, interval, callback, options)
+    name = tostring(name or "")
+    interval = math.max(0.01, tonumber(interval) or 1)
+    options = type(options) == "table" and options or {}
+
+    if name == "" or type(callback) ~= "function" then
+        return false, "invalid scheduler task"
+    end
+
+    local taskState = State.scheduler.tasks[name]
+    if not taskState then
+        taskState = {Name = name}
+        State.scheduler.tasks[name] = taskState
+        table.insert(State.scheduler.order, name)
+    end
+
+    taskState.Interval = interval
+    taskState.Callback = callback
+    taskState.Enabled = options.Enabled ~= false
+    taskState.RunImmediately = options.RunImmediately ~= false
+    taskState.NextRun = os.clock() + (taskState.RunImmediately and 0 or interval)
+    taskState.Running = false
+    taskState.Runs = taskState.Runs or 0
+    taskState.Errors = taskState.Errors or 0
+    taskState.LastStarted = 0
+    taskState.LastCompleted = 0
+    taskState.LastDuration = 0
+    taskState.MaxDuration = taskState.MaxDuration or 0
+    taskState.LastError = "None"
+    return true, taskState
+end
+
+function F.schedulerSetEnabled(name, enabled)
+    local taskState = State.scheduler.tasks[tostring(name or "")]
+    if not taskState then
+        return false
+    end
+
+    taskState.Enabled = enabled == true
+    if taskState.Enabled then
+        taskState.NextRun = os.clock()
+    end
+    return true
+end
+
+function F.schedulerStep(now)
+    if not State.loopRunning then
+        return
+    end
+
+    now = tonumber(now) or os.clock()
+    local dispatched = 0
+
+    for _, name in ipairs(State.scheduler.order) do
+        if dispatched >= Config.SCHEDULER_HEARTBEAT_BUDGET then
+            break
+        end
+
+        local taskState = State.scheduler.tasks[name]
+        if taskState and taskState.Enabled and now >= (taskState.NextRun or 0) then
+            if taskState.Running then
+                State.scheduler.skippedBusy = State.scheduler.skippedBusy + 1
+            else
+                taskState.Running = true
+                taskState.LastStarted = now
+                taskState.NextRun = math.huge
+                State.scheduler.dispatches = State.scheduler.dispatches + 1
+                State.scheduler.lastTask = name
+                dispatched = dispatched + 1
+
+                task.spawn(function()
+                    local started = os.clock()
+                    local ok, err = xpcall(taskState.Callback, function(message)
+                        return tostring(message)
+                    end)
+                    local finished = os.clock()
+                    local duration = math.max(0, finished - started)
+
+                    taskState.Running = false
+                    taskState.Runs = taskState.Runs + 1
+                    taskState.LastCompleted = finished
+                    taskState.LastDuration = duration
+                    taskState.MaxDuration = math.max(taskState.MaxDuration or 0, duration)
+                    taskState.NextRun = finished + taskState.Interval
+
+                    State.scheduler.completed = State.scheduler.completed + 1
+                    State.scheduler.lastDuration = duration
+                    State.scheduler.maxDuration = math.max(State.scheduler.maxDuration, duration)
+
+                    if not ok then
+                        taskState.Errors = taskState.Errors + 1
+                        taskState.LastError = tostring(err)
+                        State.scheduler.errors = State.scheduler.errors + 1
+                        F.recordError("Scheduler:" .. name, err)
+                    end
+                end)
+            end
+        end
+    end
+end
+
+function F.schedulerStart()
+    if State.scheduler.started then
+        return true
+    end
+
+    State.scheduler.started = true
+    State.scheduler.token = (State.scheduler.token or 0) + 1
+    local token = State.scheduler.token
+
+    -- Periodic jobs do not need frame-rate cadence. A small cooperative loop
+    -- avoids walking the scheduler table every Heartbeat/rendered frame.
+    task.spawn(function()
+        while State.loopRunning
+            and State.scheduler.started
+            and State.scheduler.token == token
+        do
+            F.schedulerStep(os.clock())
+            task.wait(Config.SCHEDULER_TICK_INTERVAL)
+        end
+    end)
+
+    return true
+end
+
+function F.schedulerStop()
+    State.scheduler.started = false
+    State.scheduler.token = (State.scheduler.token or 0) + 1
+
+    -- Compatibility cleanup for a runtime upgraded from an older scheduler.
+    if State.scheduler.connection then
+        pcall(function()
+            State.scheduler.connection:Disconnect()
+        end)
+        State.scheduler.connection = nil
+    end
+
+    for _, taskState in pairs(State.scheduler.tasks) do
+        taskState.Enabled = false
+    end
+end
+
+function F.getSchedulerSummary()
+    local enabled = 0
+    local running = 0
+
+    for _, taskState in pairs(State.scheduler.tasks) do
+        if taskState.Enabled then
+            enabled = enabled + 1
+        end
+        if taskState.Running then
+            running = running + 1
+        end
+    end
+
+    return string.format(
+        "Scheduler: %s | Tasks %d enabled / %d total | Running %d | Dispatch/Done %d/%d | Errors %d | Max %.3fs",
+        State.scheduler.started and "ON" or "OFF",
+        enabled,
+        #State.scheduler.order,
+        running,
+        State.scheduler.dispatches,
+        State.scheduler.completed,
+        State.scheduler.errors,
+        tonumber(State.scheduler.maxDuration) or 0
+    )
+end
+
+F.Controllers.Scheduler = {
+    Register = F.schedulerRegister,
+    Enable = F.schedulerSetEnabled,
+    Start = F.schedulerStart,
+    Stop = F.schedulerStop,
+    Summary = F.getSchedulerSummary,
+}
+
+F.Controllers.Services = {
+    Refresh = F.refreshServiceRegistry,
+}
 
 function F.getMovementOwner()
     if State.movement.owner and os.clock() >= State.movement.leaseUntil then
@@ -4706,7 +5041,7 @@ do
     State.chestToggle = F.createToggle(
         chestSection,
         "Auto Chest",
-        "Find the nearest conservatively identified chest, then fly to it gradually and open it.",
+        "Find the nearest chest, open it, then collect newly spawned loot around that chest before continuing.",
         false
     )
 
@@ -4731,7 +5066,7 @@ do
 
     local _, chestStatusLabel = F.createCompactStatusCard(
         chestSection,
-        "Chest: OFF | Detected: 0 | Opened: 0 | Failed: 0"
+        "Chest: OFF | Detected: 0 | Opened: 0 | Looted: 0 | Failed: 0"
     )
     State.chestStatusLabel = chestStatusLabel
 end
@@ -9752,6 +10087,7 @@ function F.runAutoFarmStep()
     if not State.farmEnabled
         or State.farmBusy
         or State.sellBusy
+        or State.chestBusy
         or State.serverHopBusy
     then
         return
@@ -10588,7 +10924,8 @@ end
 State.updateSellStatus =
     F.updateSellStatus
 
-function F.findMerchant()
+function F.findMerchant(allowGlobalScan)
+    allowGlobalScan = allowGlobalScan == true
     local playerRoot =
         F.getCharacterRoot()
 
@@ -10673,9 +11010,10 @@ function F.findMerchant()
         end
     end
 
-    -- Last-resort fallback for Streaming/layout changes.
-    -- ReplicatedStorage templates are intentionally ignored.
-    if #candidates == 0 then
+    -- Last-resort global fallback is intentionally opt-in. Diagnostics and
+    -- ordinary UI refreshes must never walk the entire streamed Workspace.
+    -- Active sell recovery may request this at a low cadence.
+    if #candidates == 0 and allowGlobalScan then
         for _, instance in ipairs(
             workspace:GetDescendants()
         ) do
@@ -10718,12 +11056,19 @@ function F.waitForMerchant(timeout)
         )
 
     local lastStatusUpdate = 0
+    local nextGlobalScanAt = os.clock()
 
     while State.loopRunning
         and os.clock() < deadline
     do
+        local now = os.clock()
+        local allowGlobalScan = now >= nextGlobalScanAt
         local merchant =
-            F.findMerchant()
+            F.findMerchant(allowGlobalScan)
+
+        if allowGlobalScan then
+            nextGlobalScanAt = now + Config.MERCHANT_GLOBAL_SCAN_INTERVAL
+        end
 
         if merchant then
             return merchant
@@ -10990,6 +11335,7 @@ function F.runAutoSell(forceSell, options)
     options = type(options) == "table" and options or {}
 
     if State.sellBusy
+        or State.chestBusy
         or (
             State.farmBusy
             and not forceSell
@@ -12649,6 +12995,7 @@ function F.getGameDBSummary()
             .. " | Enchants: " .. tostring(counts.Enchants or 0),
         "Known Areas: " .. tostring(counts.Areas or 0)
             .. " | Module Errors: " .. tostring(#db.moduleErrors),
+        F.getBundleSummaryLine and F.getBundleSummaryLine() or "Bundle: adapter unavailable",
         "Last Refresh: "
             .. (db.lastRefreshAt > 0 and os.date("%H:%M:%S", db.lastRefreshAt) or "Never"),
     }, "\n")
@@ -12708,7 +13055,15 @@ function F.refreshGameDB(force)
                 table.insert(db.moduleErrors, moduleName .. ": " .. tostring(err))
             end
         else
-            table.insert(db.moduleErrors, moduleName .. ": missing")
+            local bundleHint = F.getBundleModuleHint and F.getBundleModuleHint(moduleName) or nil
+            if bundleHint then
+                table.insert(
+                    db.moduleErrors,
+                    moduleName .. ": missing live | Bundle hint " .. tostring(bundleHint.Path)
+                )
+            else
+                table.insert(db.moduleErrors, moduleName .. ": missing")
+            end
         end
         task.wait()
     end
@@ -12933,8 +13288,17 @@ function F.searchGameDB(query)
         end
     end
 
+    if F.appendBundleSearchResults then
+        F.appendBundleSearchResults(
+            query,
+            results,
+            seen,
+            Config.GAME_DB_SEARCH_MAX_RESULTS
+        )
+    end
+
     if #results == 0 then
-        table.insert(results, "No GameDB matches for: " .. query)
+        table.insert(results, "No GameDB/Bundle matches for: " .. query)
     end
 
     db.lastSearchText = table.concat(results, "\n")
@@ -12977,6 +13341,608 @@ F.Controllers.GameDB = {
 }
 
 State.updateGameDBUI = F.updateGameDBUI
+
+-- =========================================================
+-- V6.6 BUNDLE INTELLIGENCE ADAPTER
+--
+-- Bundle data is treated as a static observation snapshot. A Remote or Module
+-- becomes "live-confirmed" only after the current client can resolve it.
+-- No automation action is ever fired from bundle-only evidence.
+-- =========================================================
+
+function F.isBundleJsonPath(path)
+    local lower = string.lower(tostring(path or ""))
+    return string.find(lower, "bundle", 1, true) ~= nil
+        and string.sub(lower, -5) == ".json"
+end
+
+function F.collectBundleCandidates()
+    local candidates = {}
+    local seen = {}
+
+    local function add(path)
+        path = tostring(path or "")
+        if path ~= "" and F.isBundleJsonPath(path) and not seen[path] then
+            seen[path] = true
+            table.insert(candidates, path)
+        end
+    end
+
+    add(Config.BUNDLE_FILE_HINT)
+
+    if type(listfiles) == "function" then
+        local rootEntries = {}
+        for _, root in ipairs({"", "."}) do
+            local ok, entries = pcall(listfiles, root)
+            if ok and type(entries) == "table" then
+                for _, entry in ipairs(entries) do
+                    local path = tostring(entry)
+                    if not rootEntries[path] then
+                        rootEntries[path] = true
+                        add(path)
+                    end
+                end
+            end
+        end
+
+        if type(isfolder) == "function" then
+            local scanned = 0
+            for path in pairs(rootEntries) do
+                if scanned >= 40 then
+                    break
+                end
+
+                local lower = string.lower(path)
+                if string.find(lower, "universalinspector", 1, true) then
+                    local folderOk, folder = pcall(isfolder, path)
+                    if folderOk and folder then
+                        scanned = scanned + 1
+                        local ok, entries = pcall(listfiles, path)
+                        if ok and type(entries) == "table" then
+                            for _, entry in ipairs(entries) do
+                                add(entry)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    table.sort(candidates)
+    return candidates
+end
+
+function F.getBundleModuleHint(moduleName)
+    local list = State.bundleIntel.moduleIndex[string.lower(tostring(moduleName or ""))]
+    return type(list) == "table" and list[1] or nil
+end
+
+function F.buildBundleLiveDiff()
+    local intel = State.bundleIntel
+    local diff = {
+        bundleCoreCount = 0,
+        liveCoreCount = 0,
+        bundleMissingLiveCount = 0,
+        liveMissingBundleCount = 0,
+        classMismatchCount = 0,
+        bundleMissingLive = {},
+        liveMissingBundle = {},
+        classMismatches = {},
+    }
+
+    local live = {}
+    F.refreshCoreRemotes()
+
+    if Remotes then
+        for _, child in ipairs(Remotes:GetChildren()) do
+            if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") then
+                live[child.Name] = child.ClassName
+                diff.liveCoreCount = diff.liveCoreCount + 1
+            end
+        end
+    end
+
+    intel.liveRemoteIndex = live
+    local bundleCore = {}
+    local prefix = "game.ReplicatedStorage.Remotes."
+
+    for _, record in ipairs(intel.remoteList) do
+        if string.sub(record.Path, 1, #prefix) == prefix then
+            bundleCore[record.Name] = record.Class
+            record.LiveConfirmed = live[record.Name] == record.Class
+            diff.bundleCoreCount = diff.bundleCoreCount + 1
+        else
+            record.LiveConfirmed = false
+        end
+    end
+
+    local limit = Config.BUNDLE_DIFF_SAMPLE_LIMIT
+
+    for name, className in pairs(bundleCore) do
+        if not live[name] then
+            diff.bundleMissingLiveCount = diff.bundleMissingLiveCount + 1
+            if #diff.bundleMissingLive < limit then
+                table.insert(diff.bundleMissingLive, name)
+            end
+        elseif live[name] ~= className then
+            diff.classMismatchCount = diff.classMismatchCount + 1
+            if #diff.classMismatches < limit then
+                table.insert(diff.classMismatches, name .. " " .. className .. " -> " .. live[name])
+            end
+        end
+    end
+
+    for name in pairs(live) do
+        if not bundleCore[name] then
+            diff.liveMissingBundleCount = diff.liveMissingBundleCount + 1
+            if #diff.liveMissingBundle < limit then
+                table.insert(diff.liveMissingBundle, name)
+            end
+        end
+    end
+
+    table.sort(diff.bundleMissingLive)
+    table.sort(diff.liveMissingBundle)
+    table.sort(diff.classMismatches)
+    intel.liveDiff = diff
+    return diff
+end
+
+function F.makeBundleFingerprint()
+    local intel = State.bundleIntel
+    local fingerprint = {
+        schemaVersion = 1,
+        placeId = intel.placeId,
+        gameId = intel.gameId,
+        generatedAtUtc = intel.generatedAtUtc,
+        inspectorVersion = intel.inspectorVersion,
+        remotes = {},
+        modules = {},
+    }
+
+    local stableRemotePrefix = "game.ReplicatedStorage.Remotes."
+    for _, record in ipairs(intel.remoteList) do
+        if string.sub(record.Path, 1, #stableRemotePrefix) == stableRemotePrefix then
+            table.insert(
+                fingerprint.remotes,
+                tostring(record.Name) .. "|" .. tostring(record.Class) .. "|" .. tostring(record.Path)
+            )
+        end
+    end
+
+    for _, record in ipairs(intel.moduleList) do
+        table.insert(
+            fingerprint.modules,
+            tostring(record.Name) .. "|" .. tostring(record.Category) .. "|" .. tostring(record.Path)
+        )
+    end
+
+    table.sort(fingerprint.remotes)
+    table.sort(fingerprint.modules)
+    return fingerprint
+end
+
+function F.compareBundleFingerprints(previous, current)
+    local result = {
+        comparable = false,
+        addedRemotes = 0,
+        removedRemotes = 0,
+        addedModules = 0,
+        removedModules = 0,
+        addedRemoteSamples = {},
+        removedRemoteSamples = {},
+        addedModuleSamples = {},
+        removedModuleSamples = {},
+    }
+
+    if type(previous) ~= "table" or type(current) ~= "table" then
+        return result
+    end
+
+    if tonumber(previous.placeId) ~= tonumber(current.placeId) then
+        result.reason = "place changed"
+        return result
+    end
+
+    result.comparable = true
+    local limit = Config.BUNDLE_DIFF_SAMPLE_LIMIT
+
+    local function compareArrays(oldArray, newArray, addedKey, removedKey, addedSamplesKey, removedSamplesKey)
+        local oldSet = {}
+        local newSet = {}
+
+        for _, value in ipairs(type(oldArray) == "table" and oldArray or {}) do
+            oldSet[tostring(value)] = true
+        end
+        for _, value in ipairs(type(newArray) == "table" and newArray or {}) do
+            newSet[tostring(value)] = true
+        end
+
+        for value in pairs(newSet) do
+            if not oldSet[value] then
+                result[addedKey] = result[addedKey] + 1
+                if #result[addedSamplesKey] < limit then
+                    table.insert(result[addedSamplesKey], value)
+                end
+            end
+        end
+
+        for value in pairs(oldSet) do
+            if not newSet[value] then
+                result[removedKey] = result[removedKey] + 1
+                if #result[removedSamplesKey] < limit then
+                    table.insert(result[removedSamplesKey], value)
+                end
+            end
+        end
+
+        table.sort(result[addedSamplesKey])
+        table.sort(result[removedSamplesKey])
+    end
+
+    compareArrays(
+        previous.remotes,
+        current.remotes,
+        "addedRemotes",
+        "removedRemotes",
+        "addedRemoteSamples",
+        "removedRemoteSamples"
+    )
+    compareArrays(
+        previous.modules,
+        current.modules,
+        "addedModules",
+        "removedModules",
+        "addedModuleSamples",
+        "removedModuleSamples"
+    )
+
+    return result
+end
+
+function F.updateBundleFingerprintBaseline()
+    local intel = State.bundleIntel
+    local current = F.makeBundleFingerprint()
+    local previous = nil
+
+    if type(readfile) == "function" then
+        local ok, decoded = pcall(function()
+            return HttpService:JSONDecode(readfile(Config.BUNDLE_FINGERPRINT_FILE))
+        end)
+        if ok and type(decoded) == "table" then
+            previous = decoded
+        end
+    end
+
+    intel.historyDiff = F.compareBundleFingerprints(previous, current)
+
+    if previous == nil then
+        intel.fingerprintStatus = "Baseline created"
+    elseif intel.historyDiff.comparable then
+        intel.fingerprintStatus = string.format(
+            "Previous bundle diff: Remotes +%d/-%d | Modules +%d/-%d",
+            intel.historyDiff.addedRemotes,
+            intel.historyDiff.removedRemotes,
+            intel.historyDiff.addedModules,
+            intel.historyDiff.removedModules
+        )
+    else
+        intel.fingerprintStatus = "Baseline replaced: " .. tostring(intel.historyDiff.reason or "not comparable")
+    end
+
+    if type(writefile) == "function" then
+        pcall(function()
+            writefile(
+                Config.BUNDLE_FINGERPRINT_FILE,
+                HttpService:JSONEncode(current)
+            )
+        end)
+    end
+
+    return intel.historyDiff
+end
+
+function F.getBundleSummaryLine()
+    local intel = State.bundleIntel
+    if not intel.loaded then
+        return "Bundle: " .. tostring(intel.status)
+    end
+
+    local diff = intel.liveDiff or {}
+    local coverage = intel.coverage or {}
+    local staticOnly = (coverage.runtimeEvents or 0) == 0
+        and (coverage.outgoingRemotes or 0) == 0
+        and (coverage.actionCorrelations or 0) == 0
+
+    return string.format(
+        "Bundle: Ready | Remotes %d (core %d) | Modules %d | Entities %d | %s | Live diff missing/new/class %d/%d/%d",
+        tonumber((intel.counts or {}).remotes) or 0,
+        tonumber(diff.bundleCoreCount) or 0,
+        tonumber((intel.counts or {}).modules) or 0,
+        tonumber((intel.counts or {}).entities) or 0,
+        staticOnly and "STATIC-ONLY" or "runtime-captured",
+        tonumber(diff.bundleMissingLiveCount) or 0,
+        tonumber(diff.liveMissingBundleCount) or 0,
+        tonumber(diff.classMismatchCount) or 0
+    )
+end
+
+function F.getBundleSummary()
+    local intel = State.bundleIntel
+    local lines = {
+        "=== The Veil Hub Bundle Intelligence ===",
+        "Status: " .. tostring(intel.status)
+            .. " | Source: " .. tostring(intel.sourceFile ~= "" and intel.sourceFile or "None"),
+        "Snapshot: " .. tostring(intel.generatedAtUtc ~= "" and intel.generatedAtUtc or "Unknown")
+            .. " | Inspector: " .. tostring(intel.inspectorVersion),
+        "Place/Game: " .. tostring(intel.placeId) .. "/" .. tostring(intel.gameId)
+            .. " | Current: " .. tostring(game.PlaceId) .. "/" .. tostring(game.GameId),
+        F.getBundleSummaryLine(),
+        "History: " .. tostring(intel.fingerprintStatus),
+        "Policy: bundle-only Remote/module evidence is never invoked automatically.",
+    }
+
+    if intel.lastError ~= "None" then
+        table.insert(lines, "Last Error: " .. tostring(intel.lastError))
+    end
+
+    return table.concat(lines, "\n")
+end
+
+function F.appendBundleSearchResults(query, results, seen, maxResults)
+    local intel = State.bundleIntel
+    if not intel.loaded then
+        return
+    end
+
+    query = string.lower(F.trimText(query))
+    if query == "" then
+        return
+    end
+
+    maxResults = math.max(1, tonumber(maxResults) or Config.GAME_DB_SEARCH_MAX_RESULTS)
+
+    local function matches(value)
+        return string.find(string.lower(tostring(value or "")), query, 1, true) ~= nil
+    end
+
+    local function add(category, name, detail)
+        if #results >= maxResults then
+            return false
+        end
+
+        local key = "Bundle|" .. tostring(category) .. "|" .. tostring(name) .. "|" .. tostring(detail or "")
+        if seen[key] then
+            return true
+        end
+
+        seen[key] = true
+        table.insert(
+            results,
+            "[Bundle:" .. tostring(category) .. "] " .. tostring(name)
+                .. (detail and detail ~= "" and (" - " .. tostring(detail)) or "")
+        )
+        return true
+    end
+
+    for _, record in ipairs(intel.remoteList) do
+        if #results >= maxResults then break end
+        if matches(record.Name) or matches(record.Path) or matches(record.Class) then
+            add(
+                "Remote",
+                record.Name,
+                tostring(record.Class)
+                    .. (record.LiveConfirmed and " | LIVE-CONFIRMED" or " | snapshot-only")
+            )
+        end
+    end
+
+    for _, record in ipairs(intel.moduleList) do
+        if #results >= maxResults then break end
+        if matches(record.Name) or matches(record.Path) or matches(record.Category) then
+            add("Module", record.Name, tostring(record.Category) .. " | " .. tostring(record.Path))
+        end
+    end
+
+    for _, link in ipairs(intel.dropSpawnLinks) do
+        if #results >= maxResults then break end
+        if matches(link.objectPath) or matches(link.spawnName) or matches(link.spawnPath) then
+            add("DropSpawn", link.objectPath or "Unknown", tostring(link.spawnName or "Unknown"))
+        end
+    end
+end
+
+function F.loadBundleIntel(force, explicitPath)
+    local intel = State.bundleIntel
+    if intel.loading then
+        return false, "already loading"
+    end
+
+    if intel.loaded and not force and F.trimText(explicitPath) == "" then
+        return true
+    end
+
+    if type(readfile) ~= "function" then
+        intel.status = "Unavailable: readfile unsupported"
+        intel.lastError = intel.status
+        if F.updateCompatibilityUI then
+            F.updateCompatibilityUI(true)
+        end
+        return false, intel.status
+    end
+
+    intel.loading = true
+    intel.status = "Finding Bundle snapshot"
+    intel.lastError = "None"
+
+    local candidates = {}
+    if F.trimText(explicitPath) ~= "" then
+        table.insert(candidates, tostring(explicitPath))
+    else
+        candidates = F.collectBundleCandidates()
+    end
+
+    local decoded = nil
+    local selectedPath = nil
+    local decodeError = "no candidate could be decoded"
+
+    for index = #candidates, 1, -1 do
+        local path = candidates[index]
+        local ok, result = pcall(function()
+            local raw = readfile(path)
+            return HttpService:JSONDecode(raw)
+        end)
+
+        if ok and type(result) == "table" and type(result.manifest) == "table" then
+            decoded = result
+            selectedPath = path
+            break
+        elseif not ok then
+            decodeError = tostring(result)
+        end
+    end
+
+    if type(decoded) ~= "table" then
+        intel.loading = false
+        intel.loaded = false
+        intel.status = "Bundle not found / unreadable"
+        intel.lastError = decodeError
+        F.recordDiagnosticEvent("BundleIntel", intel.status)
+        if State.updateDiagnostics then
+            State.updateDiagnostics()
+        end
+        if F.updateCompatibilityUI then
+            F.updateCompatibilityUI(true)
+        end
+        return false, intel.lastError
+    end
+
+    local manifest = decoded.manifest
+    intel.sourceFile = tostring(selectedPath or "")
+    intel.generatedAtUtc = tostring(manifest.generatedAtUtc or "")
+    intel.inspectorVersion = tostring(manifest.version or "Unknown")
+    intel.placeId = tonumber(manifest.placeId) or 0
+    intel.gameId = tonumber(manifest.gameId) or 0
+    intel.placeMismatch = intel.placeId ~= 0 and intel.placeId ~= tonumber(game.PlaceId)
+    intel.gameMismatch = intel.gameId ~= 0 and intel.gameId ~= tonumber(game.GameId)
+
+    intel.remoteIndex = {}
+    intel.remoteList = {}
+    intel.moduleIndex = {}
+    intel.moduleList = {}
+    intel.moduleCategories = {}
+    intel.entityIndex = {}
+    intel.dropSpawnLinks = {}
+    intel.npcDialogueModules = {}
+    intel.remoteGroups = {}
+
+    for _, remote in ipairs(type(decoded.remotes) == "table" and decoded.remotes or {}) do
+        local name = tostring(remote.name or "")
+        if name ~= "" then
+            local record = {
+                Name = name,
+                Class = tostring(remote.class or "Unknown"),
+                Path = tostring(remote.path or ""),
+                LiveConfirmed = false,
+            }
+            table.insert(intel.remoteList, record)
+            local key = string.lower(name)
+            intel.remoteIndex[key] = intel.remoteIndex[key] or {}
+            table.insert(intel.remoteIndex[key], record)
+        end
+    end
+
+    for _, module in ipairs(type(decoded.moduleCatalog) == "table" and decoded.moduleCatalog or {}) do
+        local name = tostring(module.name or "")
+        if name ~= "" then
+            local record = {
+                Name = name,
+                Category = tostring(module.category or "Unknown"),
+                Path = tostring(module.path or ""),
+                Selected = module.selected == true,
+                Reason = tostring(module.reason or ""),
+            }
+            table.insert(intel.moduleList, record)
+            local key = string.lower(name)
+            intel.moduleIndex[key] = intel.moduleIndex[key] or {}
+            table.insert(intel.moduleIndex[key], record)
+        end
+    end
+
+    for _, entity in ipairs(type(decoded.entities) == "table" and decoded.entities or {}) do
+        local name = tostring(entity.name or "")
+        if name ~= "" then
+            local key = string.lower(name)
+            intel.entityIndex[key] = (intel.entityIndex[key] or 0) + 1
+        end
+    end
+
+    local hints = type(decoded.gameDBHints) == "table" and decoded.gameDBHints or {}
+    intel.dropSpawnLinks = type(hints.dropSpawnLinks) == "table" and hints.dropSpawnLinks or {}
+    intel.npcDialogueModules = type(hints.npcDialogueModules) == "table" and hints.npcDialogueModules or {}
+    intel.remoteGroups = type(hints.remoteGroups) == "table" and hints.remoteGroups or {}
+
+    for _, category in ipairs(type(hints.moduleCategories) == "table" and hints.moduleCategories or {}) do
+        intel.moduleCategories[tostring(category.category or "Unknown")] = tonumber(category.count) or 0
+    end
+
+    local deep = type(manifest.deepIntelligence) == "table" and manifest.deepIntelligence or {}
+    intel.coverage = {
+        runtimeEvents = type(decoded.runtimeTimeline) == "table" and #decoded.runtimeTimeline or 0,
+        outgoingRemotes = tonumber(deep.outgoingRemoteCallsCaptured) or 0,
+        actionCorrelations = tonumber(deep.actionCorrelations) or 0,
+        actionSignatures = tonumber(deep.actionSignatures) or 0,
+        functionCatalog = type(decoded.functionCatalog) == "table" and #decoded.functionCatalog or 0,
+        connectionCatalog = type(decoded.connectionCatalog) == "table" and #decoded.connectionCatalog or 0,
+    }
+
+    intel.counts = {
+        remotes = #intel.remoteList,
+        modules = #intel.moduleList,
+        entities = type(decoded.entities) == "table" and #decoded.entities or 0,
+        dropSpawnLinks = #intel.dropSpawnLinks,
+        npcDialogueModules = #intel.npcDialogueModules,
+    }
+
+    intel.loaded = true
+    intel.loading = false
+    intel.lastRefreshAt = os.time()
+    intel.status = (intel.placeMismatch or intel.gameMismatch)
+        and "Loaded with identity mismatch"
+        or "Ready"
+
+    F.buildBundleLiveDiff()
+    F.updateBundleFingerprintBaseline()
+
+    F.recordDiagnosticEvent(
+        "BundleIntel",
+        "Loaded " .. tostring(intel.counts.remotes) .. " remotes, "
+            .. tostring(intel.counts.modules) .. " modules from " .. tostring(intel.sourceFile)
+    )
+
+    if State.gameDB.loaded then
+        F.updateGameDBUI()
+    end
+    if State.updateDiagnostics then
+        State.updateDiagnostics()
+    end
+    if F.updateCompatibilityUI then
+        F.updateCompatibilityUI(true)
+    end
+
+    return true
+end
+
+F.Controllers.BundleIntel = {
+    Load = F.loadBundleIntel,
+    Reload = function(path)
+        return F.loadBundleIntel(true, path)
+    end,
+    LiveDiff = F.buildBundleLiveDiff,
+    Summary = F.getBundleSummary,
+    ModuleHint = F.getBundleModuleHint,
+}
 
 -- =========================================================
 -- v6.2 UNIVERSAL INTERACTION + NPC INTELLIGENCE
@@ -15342,6 +16308,42 @@ function F.buildCompatibilityReport()
         F.getQueueOnTeleport and F.getQueueOnTeleport() and "available" or "queue_on_teleport unavailable"
     )
 
+    local bundle = State.bundleIntel
+    if bundle.loaded then
+        local diff = F.buildBundleLiveDiff()
+        add(
+            (not bundle.placeMismatch and not bundle.gameMismatch) and "OK" or "FAIL",
+            "Bundle identity",
+            tostring(bundle.placeId) .. "/" .. tostring(bundle.gameId)
+                .. " vs " .. tostring(game.PlaceId) .. "/" .. tostring(game.GameId)
+        )
+        add(
+            (diff.bundleMissingLiveCount == 0 and diff.classMismatchCount == 0) and "OK" or "WARN",
+            "Bundle/live Remotes",
+            "snapshot missing live=" .. tostring(diff.bundleMissingLiveCount)
+                .. ", live new=" .. tostring(diff.liveMissingBundleCount)
+                .. ", class mismatch=" .. tostring(diff.classMismatchCount)
+        )
+
+        local coverage = bundle.coverage or {}
+        local hasRuntimeCapture = (coverage.runtimeEvents or 0) > 0
+            or (coverage.outgoingRemotes or 0) > 0
+            or (coverage.actionCorrelations or 0) > 0
+        add(
+            hasRuntimeCapture and "OK" or "WARN",
+            "Bundle runtime depth",
+            hasRuntimeCapture and "runtime evidence present" or "static snapshot only; protocol is not inferred"
+        )
+    else
+        add("WARN", "Bundle Intelligence", tostring(bundle.status))
+    end
+
+    add(
+        State.scheduler.started and "OK" or "WARN",
+        "Managed scheduler",
+        F.getSchedulerSummary()
+    )
+
     State.compatibility.lastRunAt = os.time()
     State.compatibility.ok = counts.OK
     State.compatibility.warnings = counts.WARN
@@ -15414,7 +16416,7 @@ end
 function F.buildDiagnosticsReport()
     local character = F.getPlayerCharacter()
     local root = F.getCharacterRoot()
-    local merchant = F.findMerchant and F.findMerchant() or nil
+    local merchant = F.findMerchant and F.findMerchant(false) or nil
     local owner = F.getMovementOwner() or "NONE"
     local lease = math.max(0, State.movement.leaseUntil - os.clock())
     local activeChannel = tostring(State.movementTelemetry.channel or "None")
@@ -15460,6 +16462,9 @@ function F.buildDiagnosticsReport()
         "Compatibility: OK " .. tostring(State.compatibility.ok)
             .. " | WARN " .. tostring(State.compatibility.warnings)
             .. " | FAIL " .. tostring(State.compatibility.failures),
+        F.getSchedulerSummary(),
+        F.getBundleSummaryLine(),
+        "Services: " .. tostring(#State.serviceOrder) .. " registered",
         "Inventory Preview: Items " .. tostring(State.inventoryPreview.totalItems)
             .. " | Protected " .. tostring(State.inventoryPreview.protectedItems)
             .. " | Candidates " .. tostring(State.inventoryPreview.sellCandidates)
@@ -15469,6 +16474,8 @@ function F.buildDiagnosticsReport()
             .. " | Cached: " .. tostring(F.countTableKeys(State.chestCache))
             .. " | Opened/Failed: " .. tostring(State.chestOpenedCount)
             .. "/" .. tostring(State.chestFailedCount)
+            .. " | Looted/Failed: " .. tostring(State.chestLootedCount)
+            .. "/" .. tostring(State.chestLootFailedCount)
             .. " | Speed: " .. string.format("%.1fx", F.getMovementBaseScale("Chest")),
         "Farm State: " .. tostring(State.farmMachine.state)
             .. " | Busy: " .. tostring(State.farmBusy)
@@ -15645,7 +16652,7 @@ function F.getConfigData()
     local grouped = F.captureProfileSettings()
 
     return {
-        version = 11,
+        version = 12,
         schemaVersion = Config.CONFIG_SCHEMA_VERSION,
         Automation = {farm = grouped.Farm.enabled, sell = State.sellEnabled},
         Farm = grouped.Farm,
@@ -26130,7 +27137,7 @@ function F.isCellRewardChestOpened(chest)
 end
 
 -- =========================================================
--- V6.5.1 GENERAL AUTO CHEST
+-- V6.6.2 GENERAL AUTO CHEST + PERFORMANCE-SAFE LOOT COLLECTION
 --
 -- The exact OpenChest protocol is already used by Cell reward handling.
 -- General discovery is intentionally conservative so an unrelated object with
@@ -26266,7 +27273,38 @@ function F.isAutoChestUsable(chest)
     return F.getDropCFrame(chest) ~= nil
 end
 
-function F.considerAutoChestObject(object)
+function F.isAutoChestFastSignal(object)
+    if typeof(object) ~= "Instance" or not object.Parent then
+        return false
+    end
+
+    if object:IsA("Model") or object:IsA("BasePart") then
+        -- Chest models/parts normally carry the useful name. Do not walk
+        -- ancestors for every streamed mesh/part in Workspace.
+        return F.autoChestTextMatches(object.Name)
+    end
+
+    if object:IsA("ProximityPrompt") then
+        return F.autoChestTextMatches(object.Name)
+            or F.autoChestTextMatches(object.ObjectText)
+            or F.autoChestTextMatches(object.ActionText)
+            or (object.Parent and F.autoChestTextMatches(object.Parent.Name))
+    end
+
+    if object:IsA("ClickDetector") then
+        -- ClickDetectors are uncommon enough that parent evidence is cheap.
+        return F.autoChestTextMatches(object.Name)
+            or (object.Parent and F.autoChestTextMatches(object.Parent.Name))
+    end
+
+    return false
+end
+
+function F.considerAutoChestObject(object, force)
+    if not force and not F.isAutoChestFastSignal(object) then
+        return nil
+    end
+
     local chest = F.getAutoChestRoot(object)
     if chest and F.isAutoChestUsable(chest) then
         State.chestCache[chest] = true
@@ -26276,28 +27314,72 @@ function F.considerAutoChestObject(object)
 end
 
 function F.rebuildAutoChestCache()
+    State.chestScanToken = (State.chestScanToken or 0) + 1
+    local scanToken = State.chestScanToken
+    State.chestScanRunning = true
+    State.chestScanInspected = 0
+
     local fresh = setmetatable({}, {__mode = "k"})
     local previous = State.chestCache
     State.chestCache = fresh
 
-    for _, object in ipairs(workspace:GetDescendants()) do
-        F.considerAutoChestObject(object)
+    -- GetDescendants is used only on explicit/enable scans. Processing is
+    -- chunked and the expensive ancestor resolver runs only for cheap matches.
+    local objects = workspace:GetDescendants()
+    local total = #objects
+
+    for index, object in ipairs(objects) do
+        if not State.loopRunning or State.chestScanToken ~= scanToken then
+            State.chestScanRunning = false
+            return F.countTableKeys(State.chestCache), previous, false
+        end
+
+        if F.isAutoChestFastSignal(object) then
+            F.considerAutoChestObject(object, true)
+        end
+
+        State.chestScanInspected = index
+        if index % Config.AUTO_CHEST_SCAN_BATCH_SIZE == 0 then
+            if State.chestEnabled then
+                State.chestStatus = "Scanning " .. tostring(index) .. "/" .. tostring(total)
+                F.updateChestStatus()
+            end
+            task.wait(Config.AUTO_CHEST_SCAN_YIELD)
+        end
     end
 
+    State.chestScanRunning = false
     State.chestStatus = "Scan complete"
     F.updateChestStatus()
-    return F.countTableKeys(State.chestCache), previous
+    return F.countTableKeys(State.chestCache), previous, true
 end
 
-function F.bindAutoChestCache()
+function F.setAutoChestWatcherEnabled(enabled)
+    enabled = enabled == true
     F.disconnectConnections(State.chestConnections)
+    State.chestWatcherEnabled = enabled
+
+    if not enabled then
+        return false
+    end
 
     State.chestConnections.added = workspace.DescendantAdded:Connect(function(object)
-        if State.loopRunning then
-            F.considerAutoChestObject(object)
+        if State.loopRunning
+            and State.chestWatcherEnabled
+            and F.isAutoChestFastSignal(object)
+        then
+            F.considerAutoChestObject(object, true)
         end
     end)
 
+    return true
+end
+
+function F.bindAutoChestCache(scanNow)
+    F.setAutoChestWatcherEnabled(true)
+    if scanNow == false then
+        return true
+    end
     return F.rebuildAutoChestCache()
 end
 
@@ -26342,9 +27424,12 @@ function F.updateChestStatus()
     State.chestStatusLabel.Text =
         "Chest: " .. (State.chestEnabled and State.chestStatus or "OFF")
         .. " | Detected: " .. tostring(F.countTableKeys(State.chestCache))
+        .. (State.chestScanRunning and (" | Scan: " .. tostring(State.chestScanInspected)) or "")
         .. " | Target: " .. currentName
         .. " | Speed: " .. string.format("%.1fx", F.getMovementBaseScale("Chest"))
         .. " | Opened: " .. tostring(State.chestOpenedCount)
+        .. " | Looted: " .. tostring(State.chestLootedCount)
+        .. " | Loot Fail: " .. tostring(State.chestLootFailedCount)
         .. " | Failed: " .. tostring(State.chestFailedCount)
 end
 
@@ -26359,6 +27444,11 @@ function F.stopAutoChest(reason, preserveEnabled)
 
     if preserveEnabled ~= true then
         State.chestEnabled = false
+        State.chestScanToken = (State.chestScanToken or 0) + 1
+        State.chestScanRunning = false
+        if F.setAutoChestWatcherEnabled then
+            F.setAutoChestWatcherEnabled(false)
+        end
         if State.chestToggle then
             State.chestToggle:SetSilent(false)
         end
@@ -26367,6 +27457,320 @@ function F.stopAutoChest(reason, preserveEnabled)
     F.stopMovementFlight("CHEST")
     F.releaseMovement("CHEST")
     F.updateChestStatus()
+end
+
+-- Capture current world drops before opening a chest so Auto Chest only
+-- collects objects produced after that chest interaction. This deliberately
+-- avoids turning Auto Chest into a second global Auto Farm.
+function F.getAutoChestDropFolders()
+    local result = {}
+    local seen = {}
+
+    local function add(folder)
+        if folder
+            and folder.Parent
+            and not seen[folder]
+            and (folder:IsA("Folder") or folder:IsA("Model"))
+        then
+            seen[folder] = true
+            table.insert(result, folder)
+        end
+    end
+
+    -- Prefer already-bound world caches. Avoid recursive Workspace scans here:
+    -- this function runs repeatedly while waiting for delayed chest drops.
+    add(State.dropCacheBoundFolder)
+    add(State.dropsFolder)
+
+    if #result == 0 and F.findDropsFolder then
+        add(F.findDropsFolder())
+    end
+
+    -- Cheap top-level fallbacks for experiences that use a different common
+    -- loot container name. No GetDescendants() scan is performed.
+    for _, name in ipairs({
+        "Drops",
+        "Drop",
+        "Loot",
+        "LootDrops",
+        "WorldDrops",
+        "WorldLoot",
+    }) do
+        add(workspace:FindFirstChild(name))
+    end
+
+    return result
+end
+
+function F.forEachAutoChestDrop(callback)
+    if type(callback) ~= "function" then
+        return "none"
+    end
+
+    -- Normal path: reuse the event-driven world Drop cache. Even an empty
+    -- bound cache is authoritative and avoids repeated recursive tree walks.
+    if State.dropCacheBoundFolder and State.dropCacheBoundFolder.Parent then
+        for drop in pairs(State.dropCache) do
+            if drop and drop.Parent then
+                callback(drop)
+            end
+        end
+        return "cache"
+    end
+
+    -- Compatibility fallback for maps where the global Drop cache has not
+    -- bound yet. This path is intentionally rare.
+    local seen = setmetatable({}, {__mode = "k"})
+    for _, folder in ipairs(F.getAutoChestDropFolders()) do
+        for _, drop in ipairs(F.collectDropObjects(folder)) do
+            if not seen[drop] then
+                seen[drop] = true
+                callback(drop)
+            end
+        end
+    end
+    return "fallback"
+end
+
+function F.captureAutoChestDropSnapshot()
+    local snapshot = setmetatable({}, {__mode = "k"})
+
+    F.forEachAutoChestDrop(function(drop)
+        snapshot[drop] = true
+    end)
+
+    return snapshot
+end
+
+function F.collectAutoChestLootCandidates(beforeSnapshot, chestPosition, failed)
+    local result = {}
+    local seen = setmetatable({}, {__mode = "k"})
+
+    F.forEachAutoChestDrop(function(drop)
+        if not seen[drop]
+            and not (beforeSnapshot and beforeSnapshot[drop])
+            and not (failed and failed[drop])
+            and F.isDropPresent(drop)
+        then
+            local include = true
+            local dropCFrame = F.getDropCFrame(drop)
+
+            if chestPosition and dropCFrame then
+                include =
+                    (dropCFrame.Position - chestPosition).Magnitude
+                    <= Config.AUTO_CHEST_LOOT_RADIUS
+            end
+
+            if include then
+                seen[drop] = true
+                table.insert(result, drop)
+            end
+        end
+    end)
+
+    local root = F.getCharacterRoot()
+    if root then
+        table.sort(result, function(a, b)
+            local ac = F.getDropCFrame(a)
+            local bc = F.getDropCFrame(b)
+            local ad = ac and (ac.Position - root.Position).Magnitude or math.huge
+            local bd = bc and (bc.Position - root.Position).Magnitude or math.huge
+            return ad < bd
+        end)
+    end
+
+    return result
+end
+
+function F.isAutoChestTokenActive(token)
+    return State.loopRunning
+        and State.chestToken == token
+        and (State.chestEnabled or State.chestManual)
+end
+
+function F.collectAutoChestDropConfirmed(drop, token)
+    if not F.isAutoChestTokenActive(token) then
+        return false, "Cancelled"
+    end
+
+    if not F.isDropPresent(drop) then
+        return true, "Already collected"
+    end
+
+    if State.isSpectating then
+        F.resetCamera()
+    end
+
+    for moveAttempt = 1, Config.AUTO_CHEST_LOOT_MOVE_RETRIES do
+        if not F.isAutoChestTokenActive(token) then
+            return false, "Cancelled"
+        end
+
+        if not F.isDropPresent(drop) then
+            return true, "Confirmed collected"
+        end
+
+        local target = F.getDropStandCFrame(drop)
+        if not target then
+            task.wait(Config.AUTO_CHEST_LOOT_RESCAN_INTERVAL)
+            continue
+        end
+
+        State.chestStatus =
+            "Collecting " .. tostring(drop.Name)
+            .. " " .. tostring(moveAttempt)
+            .. "/" .. tostring(Config.AUTO_CHEST_LOOT_MOVE_RETRIES)
+        State.movementTelemetry.lastAction =
+            "Auto Chest Loot -> " .. tostring(drop.Name)
+        F.updateChestStatus()
+
+        local reached = F.flyToCFrame(
+            target,
+            "CHEST",
+            F.getLootArrivalDistance(drop),
+            Config.AUTO_CHEST_LOOT_MOVE_TIMEOUT,
+            "Chest"
+        )
+
+        if not F.isAutoChestTokenActive(token) then
+            return false, "Cancelled"
+        end
+
+        if not F.isDropPresent(drop) then
+            return true, "Collected while moving"
+        end
+
+        if reached then
+            for pickupAttempt = 1, Config.LOOT_RETRY_COUNT do
+                if not F.isAutoChestTokenActive(token) then
+                    return false, "Cancelled"
+                end
+
+                if not F.isDropPresent(drop) then
+                    return true, "Confirmed collected"
+                end
+
+                task.wait(Config.LOOT_INTERACT_DELAY)
+
+                local requested = F.fireDirectDropPickup(drop)
+                if requested then
+                    local remoteDeadline =
+                        os.clock() + Config.LOOT_REMOTE_CONFIRM_TIMEOUT
+
+                    while F.isAutoChestTokenActive(token)
+                        and os.clock() < remoteDeadline
+                        and F.isDropPresent(drop)
+                    do
+                        task.wait(Config.LOOT_CONFIRM_POLL)
+                    end
+
+                    if not F.isDropPresent(drop) then
+                        return true, "Confirmed direct pickup"
+                    end
+                end
+
+                F.pressLootInteractKey()
+
+                local confirmDeadline =
+                    os.clock() + Config.LOOT_CONFIRM_TIMEOUT
+
+                while F.isAutoChestTokenActive(token)
+                    and os.clock() < confirmDeadline
+                    and F.isDropPresent(drop)
+                do
+                    task.wait(Config.LOOT_CONFIRM_POLL)
+                end
+
+                if not F.isDropPresent(drop) then
+                    return true, "Confirmed interact pickup"
+                end
+            end
+        end
+
+        task.wait(Config.AUTO_CHEST_LOOT_RESCAN_INTERVAL)
+    end
+
+    return not F.isDropPresent(drop), "Pickup could not be confirmed"
+end
+
+function F.collectAutoChestLoot(token, beforeSnapshot, chestPosition)
+    local collected = 0
+    local failedCount = 0
+    local failed = setmetatable({}, {__mode = "k"})
+    local startedAt = os.clock()
+    local notBefore = startedAt + Config.AUTO_CHEST_LOOT_DISCOVERY_SECONDS
+    local emptySince = nil
+
+    State.chestStatus = "Waiting for chest loot"
+    F.updateChestStatus()
+
+    while F.isAutoChestTokenActive(token)
+        and collected < Config.AUTO_CHEST_LOOT_MAX_PER_CHEST
+    do
+        local candidates =
+            F.collectAutoChestLootCandidates(
+                beforeSnapshot,
+                chestPosition,
+                failed
+            )
+
+        local drop = candidates[1]
+        if drop then
+            emptySince = nil
+
+            local success, reason =
+                F.collectAutoChestDropConfirmed(drop, token)
+
+            if not F.isAutoChestTokenActive(token) then
+                return collected, failedCount, false
+            end
+
+            if success then
+                collected = collected + 1
+                State.chestLootedCount = State.chestLootedCount + 1
+                State.sessionStats.lootConfirmed =
+                    State.sessionStats.lootConfirmed + 1
+                F.recordDiagnosticEvent(
+                    "AutoChest",
+                    "Collected chest loot: " .. tostring(drop.Name)
+                )
+            else
+                failed[drop] = true
+                failedCount = failedCount + 1
+                State.chestLootFailedCount =
+                    State.chestLootFailedCount + 1
+                F.recordDiagnosticEvent(
+                    "AutoChest",
+                    "Chest loot failed: " .. tostring(drop.Name)
+                        .. " - " .. tostring(reason)
+                )
+            end
+        else
+            if not emptySince then
+                emptySince = os.clock()
+            end
+
+            if os.clock() >= notBefore
+                and os.clock() - emptySince
+                    >= Config.AUTO_CHEST_LOOT_EMPTY_STABLE
+            then
+                break
+            end
+
+            State.chestStatus =
+                collected > 0
+                and ("Chest loot collected " .. tostring(collected)
+                    .. " | waiting for more")
+                or "Waiting for chest loot"
+            F.updateChestStatus()
+            task.wait(Config.AUTO_CHEST_LOOT_RESCAN_INTERVAL)
+        end
+    end
+
+    F.stopMovementFlight("CHEST")
+    F.releaseMovement("CHEST")
+
+    return collected, failedCount, true
 end
 
 function F.tryOpenAutoChest(chest, token)
@@ -26458,6 +27862,12 @@ function F.runAutoChestStep(manual)
         return false
     end
 
+    if State.chestScanRunning and not manual then
+        State.chestStatus = "Scanning for chests"
+        F.updateChestStatus()
+        return false
+    end
+
     State.chestBusy = true
     State.chestManual = manual
     State.chestToken = State.chestToken + 1
@@ -26480,6 +27890,8 @@ function F.runAutoChestStep(manual)
     F.updateChestStatus()
 
     local chestCFrame = F.getDropCFrame(chest)
+    local chestPosition = chestCFrame and chestCFrame.Position or nil
+    local dropSnapshot = nil
     local reached = chestCFrame and F.flyToCFrame(
         chestCFrame,
         "CHEST",
@@ -26494,6 +27906,9 @@ function F.runAutoChestStep(manual)
         and State.chestToken == token
         and (State.chestEnabled or State.chestManual)
     then
+        -- Snapshot as late as possible so unrelated drops that appeared while
+        -- travelling to the chest are not mistaken for chest rewards.
+        dropSnapshot = F.captureAutoChestDropSnapshot()
         opened, result = F.tryOpenAutoChest(chest, token)
     end
 
@@ -26504,8 +27919,31 @@ function F.runAutoChestStep(manual)
         State.chestOpenedCount = State.chestOpenedCount + 1
         State.chestOpenedCache[chest] = true
         State.chestCache[chest] = nil
-        State.chestStatus = "Opened " .. tostring(chest.Name)
+        State.chestStatus = "Opened " .. tostring(chest.Name) .. " | scanning loot"
         F.recordDiagnosticEvent("AutoChest", State.chestStatus)
+        F.updateChestStatus()
+
+        local lootCollected, lootFailed, lootCompleted =
+            F.collectAutoChestLoot(
+                token,
+                dropSnapshot,
+                chestPosition
+            )
+
+        if State.chestToken == token then
+            if lootCompleted then
+                State.chestStatus =
+                    "Opened " .. tostring(chest.Name)
+                    .. " | Loot " .. tostring(lootCollected)
+                    .. (lootFailed > 0 and (" | Failed " .. tostring(lootFailed)) or "")
+            else
+                State.chestStatus =
+                    "Opened " .. tostring(chest.Name)
+                    .. " | Loot cancelled"
+            end
+
+            F.recordDiagnosticEvent("AutoChest", State.chestStatus)
+        end
     elseif State.chestToken == token then
         State.chestFailedCount = State.chestFailedCount + 1
         State.chestFailedUntil[chest] = os.clock() + Config.AUTO_CHEST_RETRY_COOLDOWN
@@ -26525,8 +27963,11 @@ end
 
 F.Controllers.AutoChest = {
     Scan = F.rebuildAutoChestCache,
+    SetWatcher = F.setAutoChestWatcherEnabled,
     Nearest = F.getNearestAutoChest,
     CollectOne = F.runAutoChestStep,
+    CollectLoot = F.collectAutoChestLoot,
+    CollectDrop = F.collectAutoChestDropConfirmed,
     Stop = F.stopAutoChest,
 }
 
@@ -31160,8 +32601,13 @@ function F.queueDropCacheRebuild()
     if State.dropCacheRebuildQueued then
         return
     end
+
     State.dropCacheRebuildQueued = true
-    task.defer(function()
+    task.delay(Config.DROP_CACHE_REBUILD_DEBOUNCE, function()
+        if not State.loopRunning then
+            State.dropCacheRebuildQueued = false
+            return
+        end
         F.runBoundary("DropCache", F.rebuildDropCache)
     end)
 end
@@ -32083,6 +33529,7 @@ State.chestToggle:OnChanged(function(enabled)
     State.chestStatus = enabled and "Scanning" or "OFF"
 
     if enabled then
+        F.setAutoChestWatcherEnabled(true)
         task.defer(function()
             F.runBoundary("AutoChestScan", F.rebuildAutoChestCache)
         end)
@@ -32121,6 +33568,10 @@ State.chestCollectButton.MouseButton1Click:Connect(function()
     end
 
     task.spawn(function()
+        if F.countTableKeys(State.chestCache) == 0 and not State.chestScanRunning then
+            F.runBoundary("AutoChestManualScan", F.rebuildAutoChestCache)
+        end
+
         local ok = F.runBoundary("AutoChestManual", F.runAutoChestStep, true)
         if not ok then
             State.chestBusy = false
@@ -32255,6 +33706,7 @@ State.lockConnection =
         -- is turned off.
         if F.shouldPauseMonsterLockForFarm()
             or State.sellBusy
+            or State.chestBusy
             or F.isMonsterLockSuspended()
         then
             F.stopMovementFlight("MONSTER_LOCK")
@@ -32339,283 +33791,192 @@ State.lockConnection =
         State.applyMonsterLockPosition()
     end)
 
-task.spawn(function()
-    while State.loopRunning do
-        if State.nightCallEnabled then
-            pcall(
-                F.runAutoNightCallStep
-            )
+F.schedulerRegister("NightCall", Config.NIGHTCALL_LOOP_INTERVAL, function()
+    if State.nightCallEnabled then
+        F.runBoundary("NightCall", F.runAutoNightCallStep)
+    else
+        F.updateNightCallStatus()
+    end
+end)
+
+F.schedulerRegister("StoneAccord", Config.STONE_ACCORD_INTERVAL, function()
+    if State.stoneAccordEnabled then
+        F.runBoundary("StoneAccord", F.fireStoneAccord)
+    end
+end)
+
+F.schedulerRegister("WeaponAutoAttack", Config.WEAPON_ATTACK_INTERVAL, function()
+    if State.weaponAutoAttackEnabled then
+        F.runBoundary("WeaponAutoAttack", F.fireEquippedWeapon)
+    end
+    State.updateCombatStatus()
+end)
+
+F.schedulerRegister("VisualWatchdog", Config.VISUAL_LOOP_INTERVAL, function()
+    if State.noFogEnabled then
+        F.runBoundary("NoFogWatchdog", F.applyNoFog)
+    end
+
+    -- FullBright uses PropertyChanged signals for immediate correction.
+    if State.fullBrightEnabled then
+        F.runBoundary("FullBrightWatchdog", F.applyFullBright)
+    end
+
+    if State.blockInsanityEnabled then
+        F.runBoundary("InsanityRemoteRefresh", F.refreshUpdateInsanityRemote)
+        insanityBlockState.Enabled = true
+    end
+end)
+
+F.schedulerRegister("FinisherWatchdog", Config.FINISHER_SCAN_INTERVAL, function()
+    if not State.finisherEnabled then
+        return
+    end
+
+    if not State.monstersFolder or not State.monstersFolder.Parent then
+        State.monstersFolder = F.findMonstersFolder()
+    end
+
+    if State.monstersFolder then
+        for monster in pairs(State.monsterCache) do
+            if not State.finisherEnabled then
+                break
+            end
+            F.runBoundary("FinisherWatchdog", F.tryFinishMonster, monster)
+        end
+    end
+end)
+
+F.schedulerRegister("DropCacheIntegrity", Config.CACHE_INTEGRITY_INTERVAL, function()
+    local folder = F.findDropsFolder()
+    if folder ~= State.dropCacheBoundFolder then
+        F.runBoundary("DropCacheBind", F.bindDropCache, folder)
+    elseif folder then
+        F.runBoundary("DropCacheIntegrity", F.rebuildDropCache)
+    end
+end)
+
+F.schedulerRegister("AutoFarm", Config.AUTO_FARM_INTERVAL, function()
+    if State.farmEnabled then
+        if State.worldReady then
+            F.runBoundary("AutoFarm", F.runAutoFarmStep)
         else
-            F.updateNightCallStatus()
+            State.farmNoMatchSince = nil
+            F.setFarmState("WORLD_WAIT", State.worldReadyStatus or "Waiting for world")
+            F.updateFarmStatus()
         end
-
-        task.wait(
-            Config.NIGHTCALL_LOOP_INTERVAL
-        )
     end
 end)
 
-task.spawn(function()
-    while State.loopRunning do
-        if State.stoneAccordEnabled then
-            F.fireStoneAccord()
+F.schedulerRegister("AutoChest", Config.AUTO_CHEST_INTERVAL, function()
+    if State.chestEnabled and State.worldReady and not State.chestBusy then
+        local ok = F.runBoundary("AutoChest", F.runAutoChestStep, false)
+        if not ok then
+            State.chestBusy = false
+            State.chestManual = false
+            State.chestCurrent = nil
+            F.stopMovementFlight("CHEST")
+            F.releaseMovement("CHEST")
+            State.chestStatus = "Runtime error; waiting to retry"
+            F.updateChestStatus()
         end
-
-        task.wait(
-            Config.STONE_ACCORD_INTERVAL
-        )
     end
 end)
 
-task.spawn(function()
-    while State.loopRunning do
-        if State.weaponAutoAttackEnabled then
-            F.fireEquippedWeapon()
-        end
+F.schedulerRegister("AutoSellCapacity", Config.AUTO_SELL_CHECK_INTERVAL, function()
+    if State.sellEnabled
+        and State.worldReady
+        and not State.sellBusy
+        and not State.farmBusy
+        and not State.chestBusy
+        and not State.serverHopBusy
+    then
+        local isFull, current, maximum = F.isInventoryFull()
 
-        State.updateCombatStatus()
-
-        task.wait(
-            Config.WEAPON_ATTACK_INTERVAL
-        )
-    end
-end)
-
-task.spawn(function()
-    while State.loopRunning do
-        if State.noFogEnabled then
-            pcall(F.applyNoFog)
-        end
-
-        -- FullBright uses PropertyChanged signals for immediate correction.
-        -- This polling branch is only a lightweight watchdog.
-        if State.fullBrightEnabled then
-            pcall(F.applyFullBright)
-        end
-
-        if State.blockInsanityEnabled then
-            pcall(F.refreshUpdateInsanityRemote)
-            insanityBlockState.Enabled = true
-        end
-
-        task.wait(
-            Config.VISUAL_LOOP_INTERVAL
-        )
-    end
-end)
-
-task.spawn(function()
-    while State.loopRunning do
-        if State.finisherEnabled then
-            if not State.monstersFolder
-                or not State.monstersFolder.Parent then
-
-                State.monstersFolder =
-                    F.findMonstersFolder()
-            end
-
-            if State.monstersFolder then
-                -- HealthChanged connections in Monster Cache are the primary path.
-                -- This low-frequency watchdog covers custom health containers.
-                for monster in pairs(State.monsterCache) do
-                    if not State.finisherEnabled then
-                        break
-                    end
-
-                    F.runBoundary("FinisherWatchdog", F.tryFinishMonster, monster)
-                end
-            end
-        end
-
-        task.wait(
-            Config.FINISHER_SCAN_INTERVAL
-        )
-    end
-end)
-
-task.spawn(function()
-    while State.loopRunning do
-        local folder = F.findDropsFolder()
-        if folder ~= State.dropCacheBoundFolder then
-            F.runBoundary("DropCacheBind", F.bindDropCache, folder)
-        elseif folder then
-            F.runBoundary("DropCacheIntegrity", F.rebuildDropCache)
-        end
-
-        task.wait(Config.CACHE_INTEGRITY_INTERVAL)
-    end
-end)
-
-task.spawn(function()
-    while State.loopRunning do
-        if State.farmEnabled then
-            if State.worldReady then
-                F.runBoundary("AutoFarm", F.runAutoFarmStep)
-            else
-                State.farmNoMatchSince = nil
-                F.setFarmState("WORLD_WAIT", State.worldReadyStatus or "Waiting for world")
-
-                F.updateFarmStatus()
-            end
-        end
-
-        task.wait(
-            Config.AUTO_FARM_INTERVAL
-        )
-    end
-end)
-
-task.spawn(function()
-    while State.loopRunning do
-        if State.chestEnabled
-            and State.worldReady
-            and not State.chestBusy
-        then
-            local ok = F.runBoundary("AutoChest", F.runAutoChestStep, false)
-            if not ok then
-                State.chestBusy = false
-                State.chestManual = false
-                State.chestCurrent = nil
-                F.stopMovementFlight("CHEST")
-                F.releaseMovement("CHEST")
-                State.chestStatus = "Runtime error; waiting to retry"
-                F.updateChestStatus()
-            end
-        end
-
-        task.wait(Config.AUTO_CHEST_INTERVAL)
-    end
-end)
-
-task.spawn(function()
-    while State.loopRunning do
-        if State.sellEnabled
-            and State.worldReady
-            and not State.sellBusy
-            and not State.farmBusy
-            and not State.serverHopBusy
-        then
-            local isFull,
-                current,
-                maximum =
-                    F.isInventoryFull()
-
-            if isFull then
-                State.sellStatus =
-                    "Inventory full "
-                    .. tostring(current)
-                    .. "/"
-                    .. tostring(maximum)
-                    .. " - selling"
-
-                F.updateSellStatus()
-
-                F.runBoundary(
-                    "AutoSellCapacity",
-                    F.runAutoSell,
-                    true
-                )
-            else
-                State.sellStatus =
-                    "Collecting until inventory is full"
-
-                F.updateSellStatus()
-            end
-        end
-
-        task.wait(
-            Config.AUTO_SELL_CHECK_INTERVAL
-        )
-    end
-end)
-
-task.spawn(function()
-    while State.loopRunning do
-        if State.gachaEnabled then
-            F.runBoundary("SilverGacha", F.runAutoSilverGachaStep)
+        if isFull then
+            State.sellStatus =
+                "Inventory full " .. tostring(current) .. "/" .. tostring(maximum) .. " - selling"
+            F.updateSellStatus()
+            F.runBoundary("AutoSellCapacity", F.runAutoSell, true)
         else
-            F.updateGachaStatus()
+            State.sellStatus = "Collecting until inventory is full"
+            F.updateSellStatus()
         end
-
-        task.wait(
-            Config.GACHA_LOOP_INTERVAL
-        )
     end
 end)
 
-task.spawn(function()
-    while State.loopRunning do
-        if State.configDirty then
-            pcall(F.saveFarmConfig, false)
-        end
-
-        task.wait(1.0)
+F.schedulerRegister("SilverGacha", Config.GACHA_LOOP_INTERVAL, function()
+    if State.gachaEnabled then
+        F.runBoundary("SilverGacha", F.runAutoSilverGachaStep)
+    else
+        F.updateGachaStatus()
     end
 end)
 
-task.spawn(function()
-    while State.loopRunning do
-        local folder = F.findMonstersFolder()
-        if folder ~= State.monsterCacheBoundFolder then
-            F.runBoundary("MonsterCacheBind", F.bindMonsterCache, folder)
-        elseif folder then
-            F.runBoundary("MonsterCacheIntegrity", F.rebuildMonsterCache)
-        end
-
-        task.wait(Config.CACHE_INTEGRITY_INTERVAL)
+F.schedulerRegister("ConfigPersistence", 1.0, function()
+    if State.configDirty then
+        F.runBoundary("ConfigPersistence", F.saveFarmConfig, false)
     end
 end)
 
+F.schedulerRegister("MonsterCacheIntegrity", Config.CACHE_INTEGRITY_INTERVAL, function()
+    local folder = F.findMonstersFolder()
+    if folder ~= State.monsterCacheBoundFolder then
+        F.runBoundary("MonsterCacheBind", F.bindMonsterCache, folder)
+    elseif folder then
+        F.runBoundary("MonsterCacheIntegrity", F.rebuildMonsterCache)
+    end
+end)
 
-task.spawn(function()
-    while State.loopRunning do
-        if State.routeRecording then
-            local root = F.getCharacterRoot()
-            if root then
-                local position = root.Position
-                local shouldRecord =
-                    State.routeLastRecordedPosition == nil
-                    or (
-                        position
-                        - State.routeLastRecordedPosition
-                    ).Magnitude >= Config.ROUTE_RECORD_MIN_DISTANCE
+F.schedulerRegister("RouteRecorder", Config.ROUTE_RECORD_INTERVAL, function()
+    if not State.routeRecording then
+        return
+    end
 
-                if shouldRecord
-                    and #State.routePoints < Config.ROUTE_MAX_POINTS
-                then
-                    table.insert(State.routePoints, root.CFrame)
-                    State.routeLastRecordedPosition = position
-                    State.routeStatus =
-                        "Recording " .. tostring(#State.routePoints) .. " points"
-                    F.updateWaypointStatus()
-                elseif #State.routePoints >= Config.ROUTE_MAX_POINTS then
-                    State.routeRecording = false
-                    State.routeStatus = "Recorder stopped at max points"
-                    if State.routeRecordingToggle then
-                        State.routeRecordingToggle:SetSilent(false)
-                    end
-                    F.updateWaypointStatus()
-                    F.markConfigDirty()
-                end
+    local root = F.getCharacterRoot()
+    if root then
+        local position = root.Position
+        local shouldRecord =
+            State.routeLastRecordedPosition == nil
+            or (position - State.routeLastRecordedPosition).Magnitude >= Config.ROUTE_RECORD_MIN_DISTANCE
+
+        if shouldRecord and #State.routePoints < Config.ROUTE_MAX_POINTS then
+            table.insert(State.routePoints, root.CFrame)
+            State.routeLastRecordedPosition = position
+            State.routeStatus = "Recording " .. tostring(#State.routePoints) .. " points"
+            F.updateWaypointStatus()
+        elseif #State.routePoints >= Config.ROUTE_MAX_POINTS then
+            State.routeRecording = false
+            State.routeStatus = "Recorder stopped at max points"
+            if State.routeRecordingToggle then
+                State.routeRecordingToggle:SetSilent(false)
             end
+            F.updateWaypointStatus()
+            F.markConfigDirty()
         end
-
-        task.wait(Config.ROUTE_RECORD_INTERVAL)
     end
 end)
 
-task.spawn(function()
-    while State.loopRunning do
-        F.runBoundary("Diagnostics", F.updateDiagnostics)
-        task.wait(Config.DIAGNOSTICS_INTERVAL)
-    end
+F.schedulerRegister("Diagnostics", Config.DIAGNOSTICS_INTERVAL, function()
+    F.runBoundary("Diagnostics", F.updateDiagnostics)
 end)
+
+F.schedulerRegister("GoalLiveRefresh", Config.GOAL_REFRESH_INTERVAL, function()
+    if State.gameDB.loaded
+        and State.goalFarm.enabled
+        and not State.goalFarm.loading
+    then
+        F.runBoundary("GoalLiveRefresh", F.refreshGoalIntelligence, false, true)
+    end
+end, {RunImmediately = false})
+
+-- Periodic tasks are registered here but started only after initialization.
 
 -- =========================================================
 -- RESPAWN
 -- =========================================================
 
-LocalPlayer.CharacterAdded:Connect(function(character)
+State.characterAddedConnection = LocalPlayer.CharacterAdded:Connect(function(character)
     -- Destroy any flight controller tied to the previous character. Auto Farm
     -- remains enabled and can select/restart a Drop after respawn is ready.
     F.stopLootLock()
@@ -32689,6 +34050,7 @@ function F.shutdown()
     State.shutdownStarted = true
     State.runtime.Active = false
     State.loopRunning = false
+    pcall(F.schedulerStop)
 
     State.monsterLockEnabled = false
     State.monsterLockWaiting = false
@@ -32770,6 +34132,11 @@ function F.shutdown()
         State.gachaNotifyConnection = nil
     end
 
+    if State.characterAddedConnection then
+        pcall(function() State.characterAddedConnection:Disconnect() end)
+        State.characterAddedConnection = nil
+    end
+
     if screenGui and screenGui.Parent then
         screenGui:Destroy()
     end
@@ -32779,27 +34146,6 @@ end
 -- This prevents the shorter early-startup fallback from drifting out of sync.
 State.runtime.Stop = F.shutdown
 closeBtn.MouseButton1Click:Connect(F.shutdown)
-
--- v6.3 lightweight live refresh. Drop tables can change as different monster
--- templates/instances stream into this server. Refresh only while the Goals page
--- is loaded or a goal is active; GameDB module loading is not repeated.
-task.spawn(function()
-    while State.loopRunning do
-        task.wait(Config.GOAL_REFRESH_INTERVAL)
-
-        if State.gameDB.loaded
-            and State.goalFarm.enabled
-            and not State.goalFarm.loading
-        then
-            F.runBoundary(
-                "GoalLiveRefresh",
-                F.refreshGoalIntelligence,
-                false,
-                true
-            )
-        end
-    end
-end)
 
 -- =========================================================
 -- INITIALIZE
@@ -32842,6 +34188,12 @@ F.updateNPCIntelUI()
 F.updateGoalUI()
 F.updateCellFarmUI()
 
+if Config.BUNDLE_AUTO_LOAD then
+    task.defer(function()
+        F.runBoundary("BundleIntel", F.loadBundleIntel, false)
+    end)
+end
+
 if Config.GAME_DB_AUTO_LOAD then
     task.defer(function()
         F.runBoundary("GameDB", F.refreshGameDB, false)
@@ -32862,7 +34214,14 @@ State.serversVisitedCount =
 F.applyFarmConfigToUI()
 F.setAntiAFKEnabled(State.antiAFK.enabled)
 F.bindMovementSafety()
-F.bindAutoChestCache()
+if State.chestEnabled then
+    F.setAutoChestWatcherEnabled(true)
+    task.defer(function()
+        F.runBoundary("AutoChestInitialScan", F.rebuildAutoChestCache)
+    end)
+else
+    F.setAutoChestWatcherEnabled(false)
+end
 
 if State.lowGraphicsEnabled then
     task.spawn(
@@ -32924,6 +34283,8 @@ F.updateGachaStatus()
 F.updateNightCallStatus()
 F.updateAntiAFKStatus()
 F.updateMovementSafetyStatus()
+F.refreshServiceRegistry()
+F.schedulerStart()
 F.updateCompatibilityUI(true)
 F.updateInventoryPreview(true)
 F.updateDiagnostics()
@@ -32969,13 +34330,13 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics (FPS untouched) / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("The Veil Hub v6.5.1: Auto Chest / gradual flight / System Safety / Anti-AFK")
+print("The Veil Hub v6.6.2: performance-safe Auto Chest / cached loot / low-cost diagnostics / throttled scheduler")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
 print("Auto Nightcall Potion: inventory detection / confirmed use / auto weapon restore / one auto-use per server")
-print("Modules: AutoChest / SystemSafety / GameDB / NPC Intelligence / Interactions / GoalFarm / CellFarm / Movement / Planner / Waypoints / Profiles / Diagnostics / Farm / Sell / Combat")
-print("GameDB v6.3: Runtime data + NPC services / interactables / Bestiary + live drop goal intelligence")
+print("Modules: BundleIntel / Scheduler / Services / AutoChest / SystemSafety / GameDB / NPC Intelligence / Interactions / GoalFarm / CellFarm / Movement / Planner / Waypoints / Profiles / Diagnostics / Farm / Sell / Combat")
+print("GameDB v6.6: runtime-first data + Bundle snapshot fallback hints / NPC / Bestiary / live drop intelligence")
 print("World Ready Gate: game load / character / remotes / map settle / Merchant wait")
 print("Server Hop: visited-server filter / saved session / optional queued Raw URL reload")
 print("==========================================")
@@ -32985,7 +34346,7 @@ print("==========================================")
 if type(writefile) == "function" then
     local saved, saveError = pcall(
         writefile,
-        "TheVeilHub_v6_5_1_Runtime.lua",
+        "TheVeilHub_v6_6_2_Runtime.lua",
         runtimeSource
     )
 
@@ -32995,19 +34356,19 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.5.1.")
+    warn("[The Veil Hub] loadstring is required to launch v6.6.2.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.5.1 compile failed:", compileError)
+    warn("[The Veil Hub] v6.6.2 compile failed:", compileError)
     return
 end
 
 local launched, runtimeError = pcall(chunk)
 
 if not launched then
-    warn("[The Veil Hub] v6.5.1 runtime failed:", runtimeError)
+    warn("[The Veil Hub] v6.6.2 runtime failed:", runtimeError)
 end
