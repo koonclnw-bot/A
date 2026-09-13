@@ -1,10 +1,10 @@
--- The Veil Hub v6.6.2 Performance Hotfix loader
+-- The Veil Hub v6.6.3 Cell Reward Attack Stop loader
 -- Keeps a clean local runtime copy for teleport resume, then executes it.
 local runtimeSource = [==============[
 
 -- =========================================================
 -- THE VEIL HUB
--- v6.6.2: performance hotfix for diagnostics, Auto Chest discovery/loot, cache rebuilds, and scheduler cadence.
+-- v6.6.3: stop Cell weapon auto attack + finisher immediately after boss defeat and throughout reward/loot stages.
 -- Cleaned from a corrupted multi-version export.
 -- Sidebar UI + Collapse + ESP
 --
@@ -419,8 +419,8 @@ local Config = {
     CELL_MENU_PROTOCOL_ATTEMPTS = 5,
     CELL_MENU_PROTOCOL_INTERVAL = 1.35,
     CELL_WEAPON_WAIT_TIMEOUT = 12,
-    CELL_RUNTIME_FILE = "TheVeilHub_v6_6_2_Runtime.lua",
-    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_6_2_CellResume.flag",
+    CELL_RUNTIME_FILE = "TheVeilHub_v6_6_3_Runtime.lua",
+    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_6_3_CellResume.flag",
     CELL_DEFAULT_FIGHT_HEIGHT = 20,
     CELL_DEFAULT_TRAVEL_SPEED = 2.0,
 
@@ -443,7 +443,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.6.2 Performance Hotfix",
+    HUB_VERSION = "v6.6.3 Cell Reward Attack Stop",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -25963,6 +25963,51 @@ function F.handleCellBossPlayerAvoidance(
     return true
 end
 
+-- v6.6.3: Cell combat is transactional. Once boss defeat/reward evidence is
+-- accepted, every Hub-owned attack path must stay OFF until a later fight
+-- explicitly re-enables it via prepareCellFight(). The original pre-Cell user
+-- settings are preserved in State.cellFarm.restore and restored when Cell Farm stops.
+function F.stopCellAttacksForRewards(reason)
+    local weaponWasEnabled =
+        State.weaponAutoAttackEnabled == true
+
+    local finisherWasEnabled =
+        State.finisherEnabled == true
+
+    State.weaponAutoAttackEnabled = false
+    State.finisherEnabled = false
+
+    if weaponToggle then
+        weaponToggle:SetSilent(false)
+    end
+
+    if finisherToggle then
+        finisherToggle:SetSilent(false)
+    end
+
+    if weaponWasEnabled or finisherWasEnabled then
+        local detail =
+            "Cell attacks stopped for rewards (weapon + finisher)"
+
+        if reason ~= nil
+            and tostring(reason) ~= ""
+        then
+            detail =
+                detail
+                .. " | "
+                .. tostring(reason)
+        end
+
+        F.recordDiagnosticEvent(
+            "CellFarm",
+            detail
+        )
+    end
+
+    State.updateCombatStatus()
+    return weaponWasEnabled or finisherWasEnabled
+end
+
 function F.prepareCellFight(boss, token)
     if not boss
         or not boss.Parent
@@ -26046,6 +26091,9 @@ function F.fightCellBoss(token, boss)
                 and not F.isMonsterAlive(boss)
             )
         then
+            F.stopCellAttacksForRewards(
+                "Boss instance no longer alive"
+            )
             return true
         end
 
@@ -26139,6 +26187,10 @@ function F.fightCellBoss(token, boss)
             State.cellFarm.lastBossHealth = 0
             State.cellFarm.lastBossHealthPercent = 0
             State.cellFarm.lastBossHealthState = "DEFEATED"
+
+            F.stopCellAttacksForRewards(
+                "Boss HP reached 0"
+            )
 
             if F.updateCellFarmUI then
                 F.updateCellFarmUI()
@@ -29922,6 +29974,13 @@ function F.runCellFarm(token, resumed)
     State.cellFarm.lastBossHealth = 0
     State.cellFarm.lastBossHealthPercent = 0
     State.cellFarm.lastBossHealthState = "DEFEATED"
+
+    -- Final transition guard: reward-chest evidence can confirm a kill even if
+    -- the boss model disappeared before fightCellBoss sampled HP=0.
+    F.stopCellAttacksForRewards(
+        "Boss defeat/reward evidence confirmed"
+    )
+
     F.markConfigDirty()
 
     if F.updateCellFarmUI then
@@ -31556,6 +31615,15 @@ function F.forceCustomHealthDeath(monster, healthInfo)
 end
 
 function F.tryFinishMonster(monster)
+    -- v6.6.3: never execute finisher logic while Cell Farm is outside the
+    -- explicit boss-fight stage. This mirrors the weapon auto-attack gate.
+    if State.cellFarm
+        and State.cellFarm.enabled
+        and tostring(State.cellFarm.stage) ~= "FIGHTING"
+    then
+        return
+    end
+
     if not monster
         or not monster.Parent
         or not monster:IsA("Model") then
@@ -32096,6 +32164,16 @@ end
 function F.fireEquippedWeapon()
     if not State.weaponAutoAttackEnabled
         or State.nightCallBusy
+    then
+        return
+    end
+
+    -- v6.6.3 safety gate. Cell Farm may enable weapon attack for the boss,
+    -- but no attack remote may be sent during reward-chest, loot, bundle, sell,
+    -- hop, recovery, or other non-fight stages.
+    if State.cellFarm
+        and State.cellFarm.enabled
+        and tostring(State.cellFarm.stage) ~= "FIGHTING"
     then
         return
     end
@@ -34330,7 +34408,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics (FPS untouched) / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("The Veil Hub v6.6.2: performance-safe Auto Chest / cached loot / low-cost diagnostics / throttled scheduler")
+print("The Veil Hub v6.6.3: Cell reward attack stop (weapon + finisher) / performance-safe Auto Chest / cached loot / throttled scheduler")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -34346,7 +34424,7 @@ print("==========================================")
 if type(writefile) == "function" then
     local saved, saveError = pcall(
         writefile,
-        "TheVeilHub_v6_6_2_Runtime.lua",
+        "TheVeilHub_v6_6_3_Runtime.lua",
         runtimeSource
     )
 
@@ -34356,19 +34434,19 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.6.2.")
+    warn("[The Veil Hub] loadstring is required to launch v6.6.3.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.6.2 compile failed:", compileError)
+    warn("[The Veil Hub] v6.6.3 compile failed:", compileError)
     return
 end
 
 local launched, runtimeError = pcall(chunk)
 
 if not launched then
-    warn("[The Veil Hub] v6.6.2 runtime failed:", runtimeError)
+    warn("[The Veil Hub] v6.6.3 runtime failed:", runtimeError)
 end
