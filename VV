@@ -1,10 +1,10 @@
--- The Veil Hub v6.4.37 Cradle start fix loader
+-- The Veil Hub v6.5.1 Auto Chest loader
 -- Keeps a clean local runtime copy for teleport resume, then executes it.
 local runtimeSource = [==============[
 
 -- =========================================================
 -- THE VEIL HUB
--- v6.4.37 Cradle start fix: direct start, then bounded dialogue confirmation.
+-- v6.5.1: gradual Auto Chest and zero Hub-owned FPS cap.
 -- Cleaned from a corrupted multi-version export.
 -- Sidebar UI + Collapse + ESP
 --
@@ -27,10 +27,10 @@ local runtimeSource = [==============[
 --   - FullBright LOOP
 --   - Unnamed ESP Loader
 --   - UpdateInsanity FireServer blocker (executor hook, toggle-controlled)
---   - Low Graphics + local 30 FPS power-saving mode
+--   - Low Graphics without changing the executor/game FPS cap
 --
 -- Drops
---   - Nested Browser / Auto Farm / Auto Sell / Server Hop tabs
+--   - Nested Browser / Auto Farm / Auto Chest / Auto Sell / Server Hop tabs
 --   - All Drop Finder + Rarity Groups
 --   - Case-insensitive autocomplete item tags
 --   - v6.3 Bestiary + Goal Farm Intelligence + v6.2 Universal Interaction + v6.1 GameDB Core
@@ -55,6 +55,14 @@ local runtimeSource = [==============[
 --   - Compact command rows with no helper descriptions
 --   - Controls sit directly beside their option labels
 --   - Collapse to mini V button
+--
+-- System Safety
+--   - Passive compatibility self-test (no remote calls)
+--   - CurrentArea / TeleportStrikes movement telemetry
+--   - Optional movement circuit breaker
+--   - Inventory value and Auto Sell preview
+--   - Toggle-controlled Anti-AFK with clean connection lifecycle
+--   - Gradual Auto Chest flight with conservative chest detection
 -- =========================================================
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -112,7 +120,7 @@ local Config = {
     MOVEMENT_LEASE_SECONDS = 0.75,
     RECOVERY_BASE_DELAY = 1,
     RECOVERY_MAX_DELAY = 30,
-    CONFIG_SCHEMA_VERSION = 9,
+    CONFIG_SCHEMA_VERSION = 11,
     AUTO_FARM_INTERVAL = 0.07,
     AUTO_SELL_CHECK_INTERVAL = 1.00,
     INVENTORY_MAX_CAPACITY = 150,
@@ -129,7 +137,13 @@ local Config = {
     TOWN_RESET_COOLDOWN = 45,
     RESPAWN_TIMEOUT = 15,
 
-    LOW_GRAPHICS_FPS_CAP = 30,
+    AUTO_CHEST_INTERVAL = 0.45,
+    AUTO_CHEST_OPEN_DISTANCE = 4.5,
+    AUTO_CHEST_MAX_TRAVEL_TIME = 45,
+    AUTO_CHEST_OPEN_RETRIES = 3,
+    AUTO_CHEST_CONFIRM_TIMEOUT = 3.0,
+    AUTO_CHEST_RETRY_COOLDOWN = 12,
+    AUTO_CHEST_DEFAULT_SPEED = 0.8,
 
     -- Gem Gacha
     GACHA_CYCLE_SECONDS = 20 * 60,
@@ -366,16 +380,16 @@ local Config = {
     CELL_MENU_PROTOCOL_ATTEMPTS = 5,
     CELL_MENU_PROTOCOL_INTERVAL = 1.35,
     CELL_WEAPON_WAIT_TIMEOUT = 12,
-    CELL_RUNTIME_FILE = "TheVeilHub_v6_4_CellRuntime.lua",
-    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_4_CellResume.flag",
+    CELL_RUNTIME_FILE = "TheVeilHub_v6_5_1_Runtime.lua",
+    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_5_1_CellResume.flag",
     CELL_DEFAULT_FIGHT_HEIGHT = 20,
     CELL_DEFAULT_TRAVEL_SPEED = 2.0,
 
     MOVEMENT_PRESETS = {
-        Safe = {Farm = 1.2, Monster = 1.0, Merchant = 1.2, Return = 1.2, Cell = 1.2},
-        Normal = {Farm = 2.0, Monster = 2.0, Merchant = 2.0, Return = 2.0, Cell = 2.0},
-        Fast = {Farm = 2.4, Monster = 2.2, Merchant = 2.3, Return = 2.3, Cell = 2.3},
-        Turbo = {Farm = 3.0, Monster = 2.6, Merchant = 2.8, Return = 2.8, Cell = 2.8},
+        Safe = {Farm = 1.2, Monster = 1.0, Merchant = 1.2, Return = 1.2, Cell = 1.2, Chest = 0.8},
+        Normal = {Farm = 2.0, Monster = 2.0, Merchant = 2.0, Return = 2.0, Cell = 2.0, Chest = 1.0},
+        Fast = {Farm = 2.4, Monster = 2.2, Merchant = 2.3, Return = 2.3, Cell = 2.3, Chest = 1.5},
+        Turbo = {Farm = 3.0, Monster = 2.6, Merchant = 2.8, Return = 2.8, Cell = 2.8, Chest = 2.0},
     },
 
     MONSTER_FLY_ARRIVAL_DISTANCE = 1.5,
@@ -390,7 +404,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.4.37 Cradle Start Fix",
+    HUB_VERSION = "v6.5.1 Auto Chest",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -468,6 +482,7 @@ local Config = {
         MONSTER_LOCK = 10,
         MANUAL = 20,
         FARM = 30,
+        CHEST = 32,
         CELL = 35,
         SELL = 40,
         RECOVERY = 50,
@@ -621,6 +636,7 @@ local State = {
         Merchant = Config.WORLD_FLY_SPEED,
         Return = Config.WORLD_FLY_SPEED,
         Cell = Config.CELL_DEFAULT_TRAVEL_SPEED,
+        Chest = Config.AUTO_CHEST_DEFAULT_SPEED,
     },
     movementSpeedSliders = {},
     movementPresetButton = nil,
@@ -639,6 +655,57 @@ local State = {
         serverCorrections = 0,
         lastCorrection = "Never",
     },
+
+    -- v6.5 passive safety telemetry. TeleportStrikes is treated only as an
+    -- observed player attribute; its server meaning is not assumed.
+    movementSafety = {
+        enabled = true,
+        autoStop = false,
+        baselineStrikes = nil,
+        lastStrikes = nil,
+        currentArea = "Unknown",
+        circuitOpen = false,
+        triggerCount = 0,
+        lastEvent = "Waiting for attributes",
+        connections = {},
+    },
+    movementSafetyToggle = nil,
+    movementSafetyAutoStopToggle = nil,
+    movementSafetyStatusLabel = nil,
+
+    antiAFK = {
+        enabled = false,
+        connection = nil,
+        busy = false,
+        attempts = 0,
+        successes = 0,
+        lastMethod = "None",
+        lastAt = 0,
+        lastError = "None",
+    },
+    antiAFKToggle = nil,
+    antiAFKStatusLabel = nil,
+
+    compatibility = {
+        lastRunAt = 0,
+        ok = 0,
+        warnings = 0,
+        failures = 0,
+        report = "Self-test has not run yet.",
+    },
+    compatibilityStatusLabel = nil,
+
+    inventoryPreview = {
+        lastRunAt = 0,
+        totalItems = 0,
+        protectedItems = 0,
+        sellCandidates = 0,
+        totalKnownValue = 0,
+        candidateKnownValue = 0,
+        unknownValueItems = 0,
+        topItems = {},
+    },
+    inventoryPreviewLabel = nil,
 
     waypoints = {},
     waypointOrder = {},
@@ -977,6 +1044,26 @@ local State = {
     merchantResetCooldownUntil = 0,
     merchantResetInProgress = false,
 
+    -- v6.5.1 Auto Chest. Cache keys are weak so removed streamed chests do not
+    -- remain retained by the Hub.
+    chestEnabled = false,
+    chestBusy = false,
+    chestManual = false,
+    chestToken = 0,
+    chestStatus = "OFF",
+    chestCurrent = nil,
+    chestOpenedCount = 0,
+    chestFailedCount = 0,
+    chestCache = setmetatable({}, {__mode = "k"}),
+    chestOpenedCache = setmetatable({}, {__mode = "k"}),
+    chestFailedUntil = setmetatable({}, {__mode = "k"}),
+    chestConnections = {},
+    chestToggle = nil,
+    chestSpeedSlider = nil,
+    chestStatusLabel = nil,
+    chestRefreshButton = nil,
+    chestCollectButton = nil,
+
     -- Auto Silver Gacha
     gachaEnabled = false,
     gachaStatus = "OFF",
@@ -1103,7 +1190,6 @@ local State = {
     lowGraphicsToggle = nil,
     lowGraphicsOriginals = setmetatable({}, {__mode = "k"}),
     lowGraphicsConnection = nil,
-    lowGraphicsFpsOriginal = nil,
     lowGraphicsQualityOriginal = nil,
 
     reduceMotion = false,
@@ -1124,6 +1210,7 @@ local State = {
     updateDropStatus = nil,
     updateFarmStatus = nil,
     updateSellStatus = nil,
+    updateChestStatus = nil,
     updateServerHopStatus = nil,
     updateGachaStatus = nil,
     updateNightCallStatus = nil,
@@ -1915,6 +2002,8 @@ State.runtime.Stop = function()
     State.loopRunning = false
     State.farmEnabled = false
     State.sellEnabled = false
+    State.chestEnabled = false
+    State.chestToken = State.chestToken + 1
     if State.cellFarm then
         State.cellFarm.enabled = false
         State.cellFarm.running = false
@@ -2694,7 +2783,7 @@ end
 local playerPage, playerBody = F.createPage("Player", "Player", "Position, utility and general actions")
 local combatPage, combatBody = F.createPage("Combat", "Combat", "Targeting, weapon automation and finisher controls")
 local visualsPage, visualsBody = F.createPage("Visuals", "Visuals", "Lighting, ESP and local visual utilities")
-local dropsPage, dropsBody = F.createPage("Drops", "Drops", "Browser, Auto Farm, Auto Sell and Server Hop")
+local dropsPage, dropsBody = F.createPage("Drops", "Drops", "Browser, Auto Farm, Auto Chest, Auto Sell and Server Hop")
 State.pages.Movement, State.movementBody = F.createPage("Movement", "Movement", "Flight speeds, adaptive correction control, waypoints and route recorder")
 State.pages.GameDB, State.gameDBBody = F.createPage("GameDB", "GameDB", "Runtime game intelligence: bestiary, NPCs, status effects, areas, builds and dialogue events")
 State.pages.NPCIntel, State.npcIntelBody = F.createPage("NPCIntel", "NPC & Interact", "NPC services, dialogue actions and universal interactables discovered from live game metadata")
@@ -2702,6 +2791,7 @@ State.pages.Goals, State.goalsBody = F.createPage("Goals", "Bestiary & Goal Farm
 State.pages.CellFarm, State.cellFarmBody = F.createPage("CellFarm", "The Cell Of Life", "Full auto Cradle summon, megaboss combat, loot processing, selling and server-hop resume")
 State.pages.Diagnostics, State.diagnosticsBody = F.createPage("Diagnostics", "Diagnostics", "Live debug telemetry, system validation and session statistics")
 State.pages.Profiles, State.profilesBody = F.createPage("Profiles", "Profiles", "Save and restore portable automation settings")
+State.pages.System, State.systemBody = F.createPage("System", "System Safety", "Compatibility checks, movement telemetry, inventory preview and Anti-AFK")
 local settingsPage, settingsBody = F.createPage("Settings", "Settings", "Interface scale, motion and display preferences")
 
 State.pages.Player = playerPage
@@ -2721,6 +2811,7 @@ F.createSidebarTab("Goals", "Bestiary & Goal Farm", "B")
 F.createSidebarTab("CellFarm", "The Cell Of Life", "L")
 F.createSidebarTab("Diagnostics", "Diagnostics", "X")
 F.createSidebarTab("Profiles", "Profiles", "R")
+F.createSidebarTab("System", "System Safety", "Y")
 local settingsTab = F.createSidebarTab("Settings", "Settings", "S")
 
 navSearch:GetPropertyChangedSignal("Text"):Connect(function()
@@ -4238,7 +4329,7 @@ local fullBrightToggle = F.createToggle(
 State.lowGraphicsToggle = F.createToggle(
     visualsSection,
     "Low Graphics",
-    "Disables heavy local effects and shadows, lowers render quality, and caps FPS to 30 when supported."
+    "Disables heavy local effects and shadows and lowers render quality. FPS is never changed by the Hub."
 )
 
 local insanityBlockToggle = F.createToggle(
@@ -4303,6 +4394,7 @@ dropsPanelHolder.Parent = dropsBody
 local dropsSubNames = {
     "Browser",
     "Auto Farm",
+    "Auto Chest",
     "Auto Sell",
     "Server Hop",
 }
@@ -4311,7 +4403,7 @@ for index, subName in ipairs(dropsSubNames) do
     local button = F.createButton(
         dropsSubNav,
         subName,
-        UDim2.new(0.25, -5, 0, 34),
+        UDim2.new(0.2, -5, 0, 34),
         UDim2.new(0, 0, 0, 0),
         Config.THEME.Card2,
         Config.THEME.SubText,
@@ -4604,6 +4696,46 @@ local _, farmStatusLabel =
 State.farmStatusLabel =
     farmStatusLabel
 
+-- Auto Chest
+do
+    local chestSection =
+        F.createSection(
+            State.dropsSubPages["Auto Chest"]
+        )
+
+    State.chestToggle = F.createToggle(
+        chestSection,
+        "Auto Chest",
+        "Find the nearest conservatively identified chest, then fly to it gradually and open it.",
+        false
+    )
+
+    State.chestSpeedSlider = F.createSlider(
+        chestSection,
+        "Chest Fly Speed (x50 studs/s)",
+        0.5,
+        2.0,
+        State.movementSpeeds.Chest,
+        "x",
+        0.1
+    )
+
+    local _, refreshChestButton, collectChestButton = F.createActionRow(
+        chestSection,
+        "Chest Actions",
+        "SCAN",
+        "COLLECT ONE"
+    )
+    State.chestRefreshButton = refreshChestButton
+    State.chestCollectButton = collectChestButton
+
+    local _, chestStatusLabel = F.createCompactStatusCard(
+        chestSection,
+        "Chest: OFF | Detected: 0 | Opened: 0 | Failed: 0"
+    )
+    State.chestStatusLabel = chestStatusLabel
+end
+
 -- Auto Sell
 local sellSection =
     F.createSection(
@@ -4786,6 +4918,110 @@ local _, resetUiBtn = F.createSingleButtonRow(
     "Resets scale, motion and dim preferences",
     "RESET"
 )
+
+-- =========================================================
+-- BUILD V6.5 SYSTEM SAFETY PAGE
+-- =========================================================
+
+do
+State.systemSection = F.createSection(State.systemBody)
+
+local compatibilityCard = F.createCard(State.systemSection, 154)
+State.compatibilityStatusLabel = F.createTextLabel(
+    compatibilityCard,
+    "Compatibility self-test has not run yet.",
+    UDim2.new(1, -28, 1, -20),
+    UDim2.new(0, 14, 0, 10),
+    Enum.Font.Code,
+    11,
+    Config.THEME.SubText,
+    Enum.TextXAlignment.Left
+)
+State.compatibilityStatusLabel.TextWrapped = true
+State.compatibilityStatusLabel.TextYAlignment = Enum.TextYAlignment.Top
+
+local _, compatibilityRunButton, compatibilityCopyButton = F.createActionRow(
+    State.systemSection,
+    "Compatibility",
+    "SELF TEST",
+    "COPY"
+)
+State.compatibilityRunButton = compatibilityRunButton
+State.compatibilityCopyButton = compatibilityCopyButton
+
+State.movementSafetyToggle = F.createToggle(
+    State.systemSection,
+    "Movement Safety Monitor",
+    "Observe CurrentArea and TeleportStrikes attributes without sending any remote.",
+    true
+)
+
+State.movementSafetyAutoStopToggle = F.createToggle(
+    State.systemSection,
+    "Circuit Breaker",
+    "When enabled, stop active movement automation if TeleportStrikes increases after the baseline.",
+    false
+)
+
+local _, movementSafetyStatusLabel = F.createCompactStatusCard(
+    State.systemSection,
+    "Safety: monitoring | Area: Unknown | TeleportStrikes: unavailable"
+)
+State.movementSafetyStatusLabel = movementSafetyStatusLabel
+
+local _, movementSafePresetButton, movementSafetyResetButton = F.createActionRow(
+    State.systemSection,
+    "Movement Recovery",
+    "SAFE PRESET",
+    "RESET"
+)
+State.movementSafePresetButton = movementSafePresetButton
+State.movementSafetyResetButton = movementSafetyResetButton
+
+State.antiAFKToggle = F.createToggle(
+    State.systemSection,
+    "Anti-AFK",
+    "On Roblox idle, send one bounded local input action. No connection disabling or event hooks.",
+    false
+)
+
+local _, antiAFKStatusLabel = F.createCompactStatusCard(
+    State.systemSection,
+    "Anti-AFK: OFF | Attempts: 0 | Success: 0 | Method: None"
+)
+State.antiAFKStatusLabel = antiAFKStatusLabel
+
+local _, antiAFKTestButton = F.createSingleButtonRow(
+    State.systemSection,
+    "Anti-AFK Test",
+    "Runs the same bounded local input action once without waiting for Roblox Idled.",
+    "TEST NOW"
+)
+State.antiAFKTestButton = antiAFKTestButton
+
+local inventoryPreviewCard = F.createCard(State.systemSection, 132)
+State.inventoryPreviewLabel = F.createTextLabel(
+    inventoryPreviewCard,
+    "Inventory preview has not run yet.",
+    UDim2.new(1, -28, 1, -20),
+    UDim2.new(0, 14, 0, 10),
+    Enum.Font.Code,
+    11,
+    Config.THEME.SubText,
+    Enum.TextXAlignment.Left
+)
+State.inventoryPreviewLabel.TextWrapped = true
+State.inventoryPreviewLabel.TextYAlignment = Enum.TextYAlignment.Top
+
+local _, inventoryRefreshButton, inventoryCopyButton = F.createActionRow(
+    State.systemSection,
+    "Inventory / Sell Preview",
+    "REFRESH",
+    "COPY"
+)
+State.inventoryRefreshButton = inventoryRefreshButton
+State.inventoryCopyButton = inventoryCopyButton
+end
 
 -- =========================================================
 -- BUILD GAMEDB INTELLIGENCE PAGE
@@ -5669,6 +5905,23 @@ function F.selectPage(name)
     local oldPage = State.pages[State.currentPageName]
     State.currentPageName = name
     statusText.Text = name .. " | Ready"
+
+    if name == "System" then
+        task.defer(function()
+            if F.updateCompatibilityUI then
+                F.updateCompatibilityUI(false)
+            end
+            if F.updateInventoryPreview then
+                F.updateInventoryPreview(false)
+            end
+            if F.updateMovementSafetyStatus then
+                F.updateMovementSafetyStatus()
+            end
+            if F.updateAntiAFKStatus then
+                F.updateAntiAFKStatus()
+            end
+        end)
+    end
 
     if oldPage and oldPage ~= newPage then
         if State.reduceMotion then
@@ -7394,6 +7647,10 @@ function F.setMovementSpeed(channel, value, markDirty)
         slider:SetSilent(value)
     end
 
+    if channel == "Chest" and State.chestSpeedSlider then
+        State.chestSpeedSlider:SetSilent(value)
+    end
+
     F.resetAdaptiveMovement(channel)
 
     if markDirty ~= false then
@@ -7421,7 +7678,7 @@ function F.refreshMovementControlUI()
         )
     end
 
-    for _, channel in ipairs({"Farm", "Monster", "Merchant", "Return", "Cell"}) do
+    for _, channel in ipairs({"Farm", "Monster", "Merchant", "Return", "Cell", "Chest"}) do
         local slider = State.movementSpeedSliders[channel]
         if slider then
             slider:SetSilent(
@@ -7433,6 +7690,13 @@ function F.refreshMovementControlUI()
     if State.farmFlightSpeedSlider then
         State.farmFlightSpeedSlider:SetSilent(
             State.farmFlightSpeed
+        )
+    end
+
+
+    if State.chestSpeedSlider then
+        State.chestSpeedSlider:SetSilent(
+            F.getMovementBaseScale("Chest")
         )
     end
 
@@ -7454,6 +7718,7 @@ function F.applyMovementPreset(name)
     F.setMovementSpeed("Merchant", preset.Merchant, false)
     F.setMovementSpeed("Return", preset.Return, false)
     F.setMovementSpeed("Cell", preset.Cell or preset.Return, false)
+    F.setMovementSpeed("Chest", preset.Chest or preset.Farm, false)
     State.cellFarm.travelSpeed = State.movementSpeeds.Cell
     if State.cellTravelSpeedSlider then
         State.cellTravelSpeedSlider:SetSilent(State.cellFarm.travelSpeed)
@@ -7502,6 +7767,7 @@ function F.updateMovementStatus()
         .. " | Merchant " .. string.format("%.1fx", F.getMovementBaseScale("Merchant"))
         .. " | Return " .. string.format("%.1fx", F.getMovementBaseScale("Return"))
         .. " | Cell " .. string.format("%.1fx", F.getMovementBaseScale("Cell"))
+        .. " | Chest " .. string.format("%.1fx", F.getMovementBaseScale("Chest"))
         .. "\nActive: " .. channel
         .. " | Base/Effective: " .. string.format("%.1f/%.1fx", base, effective)
         .. " | Distance: " .. string.format("%.1f", tonumber(State.movementTelemetry.distance) or 0)
@@ -8220,6 +8486,7 @@ function F.flyToCFrame(targetCFrame, owner, arrivalDistance, maxTravelTime, spee
 
     local manualToken = nil
     local cellToken = nil
+    local chestToken = nil
 
     if owner == "MANUAL" then
         State.manualMovementToken =
@@ -8229,6 +8496,8 @@ function F.flyToCFrame(targetCFrame, owner, arrivalDistance, maxTravelTime, spee
             State.manualMovementToken
     elseif owner == "CELL" and State.cellFarm then
         cellToken = State.cellFarm.token
+    elseif owner == "CHEST" then
+        chestToken = State.chestToken
     end
 
     local root =
@@ -8282,6 +8551,17 @@ function F.flyToCFrame(targetCFrame, owner, arrivalDistance, maxTravelTime, spee
             and (
                 not State.cellFarm.enabled
                 or State.cellFarm.token ~= cellToken
+            )
+        then
+            break
+        end
+
+
+        if chestToken
+            and (
+                not State.chestEnabled
+                    and not State.chestManual
+                or State.chestToken ~= chestToken
             )
         then
             break
@@ -10072,6 +10352,200 @@ function F.collectSellCandidates()
     return result
 end
 
+function F.readInventoryNumber(item, fieldNames)
+    if not item or type(fieldNames) ~= "table" then
+        return nil
+    end
+
+    for _, fieldName in ipairs(fieldNames) do
+        local attributeValue = item:GetAttribute(fieldName)
+        local numericAttribute = tonumber(attributeValue)
+        if numericAttribute then
+            return numericAttribute, "attribute:" .. fieldName
+        end
+
+        local valueObject = item:FindFirstChild(fieldName, true)
+        if valueObject then
+            local ok, value = pcall(function()
+                return valueObject.Value
+            end)
+            local numericValue = ok and tonumber(value) or nil
+            if numericValue then
+                return numericValue, valueObject:GetFullName()
+            end
+        end
+    end
+
+    return nil
+end
+
+function F.formatCompactNumber(value)
+    value = tonumber(value) or 0
+    if math.abs(value) >= 1000000 then
+        return string.format("%.2fm", value / 1000000)
+    end
+    if math.abs(value) >= 1000 then
+        return string.format("%.1fk", value / 1000)
+    end
+    if value == math.floor(value) then
+        return tostring(math.floor(value))
+    end
+    return string.format("%.2f", value)
+end
+
+function F.buildInventoryPreview()
+    local items = F.collectInventoryItems()
+    local candidates = F.collectSellCandidates()
+    local candidateSet = {}
+    local rarityCounts = {}
+    local ranked = {}
+    local protectedCount = 0
+    local totalKnownValue = 0
+    local candidateKnownValue = 0
+    local unknownValueItems = 0
+
+    for _, item in ipairs(candidates) do
+        candidateSet[item] = true
+    end
+
+    for _, item in ipairs(items) do
+        local rarityInfo = F.getInventoryItemRarity(item)
+        local rarityName = tostring(rarityInfo.Name or "Unknown")
+        rarityCounts[rarityName] = (rarityCounts[rarityName] or 0) + 1
+
+        local sellPrice = F.readInventoryNumber(
+            item,
+            {"SellPrice", "SellValue"}
+        )
+
+        if sellPrice then
+            totalKnownValue = totalKnownValue + sellPrice
+            if candidateSet[item] then
+                candidateKnownValue = candidateKnownValue + sellPrice
+            end
+        else
+            unknownValueItems = unknownValueItems + 1
+        end
+
+        if F.isNeverSellItem(item) then
+            protectedCount = protectedCount + 1
+        end
+
+        local baseDamage = F.readInventoryNumber(
+            item,
+            {"BaseDamage", "Damage"}
+        )
+        local cooldown = F.readInventoryNumber(
+            item,
+            {"AttackCooldown", "AttackDelay", "Cooldown"}
+        )
+        local rawScore = nil
+        if baseDamage and cooldown and cooldown > 0 then
+            rawScore = baseDamage / cooldown
+        end
+
+        table.insert(ranked, {
+            name = tostring(item.Name),
+            sellPrice = sellPrice,
+            rawScore = rawScore,
+            candidate = candidateSet[item] == true,
+        })
+    end
+
+    table.sort(ranked, function(a, b)
+        local aScore = tonumber(a.rawScore) or -1
+        local bScore = tonumber(b.rawScore) or -1
+        if aScore ~= bScore then
+            return aScore > bScore
+        end
+        local aPrice = tonumber(a.sellPrice) or -1
+        local bPrice = tonumber(b.sellPrice) or -1
+        if aPrice ~= bPrice then
+            return aPrice > bPrice
+        end
+        return string.lower(a.name) < string.lower(b.name)
+    end)
+
+    local topItems = {}
+    for index = 1, math.min(3, #ranked) do
+        local entry = ranked[index]
+        local detail = entry.rawScore
+            and ("raw " .. F.formatCompactNumber(entry.rawScore))
+            or (
+                entry.sellPrice
+                and ("value " .. F.formatCompactNumber(entry.sellPrice))
+                or "value unknown"
+            )
+        table.insert(topItems, entry.name .. " (" .. detail .. ")")
+    end
+
+    local rarityParts = {}
+    for _, rarityInfo in ipairs(Config.DROP_RARITIES) do
+        local count = rarityCounts[rarityInfo.Name]
+        if count and count > 0 then
+            table.insert(rarityParts, rarityInfo.Name .. " " .. tostring(count))
+        end
+    end
+    State.inventoryPreview.lastRunAt = os.clock()
+    State.inventoryPreview.totalItems = #items
+    State.inventoryPreview.protectedItems = protectedCount
+    State.inventoryPreview.sellCandidates = #candidates
+    State.inventoryPreview.totalKnownValue = totalKnownValue
+    State.inventoryPreview.candidateKnownValue = candidateKnownValue
+    State.inventoryPreview.unknownValueItems = unknownValueItems
+    State.inventoryPreview.topItems = topItems
+
+    return table.concat({
+        "Items " .. tostring(#items)
+            .. " | Protected " .. tostring(protectedCount)
+            .. " | Sell candidates " .. tostring(#candidates),
+        "Known value " .. F.formatCompactNumber(totalKnownValue)
+            .. " | Candidate value " .. F.formatCompactNumber(candidateKnownValue)
+            .. " | Unknown " .. tostring(unknownValueItems),
+        "Rarity: " .. (#rarityParts > 0 and table.concat(rarityParts, " | ") or "No recognized items"),
+        "Top raw stats: " .. (#topItems > 0 and table.concat(topItems, ", ") or "None"),
+        "Preview only: no SellItemsEvent was sent.",
+    }, "\n")
+end
+
+function F.updateInventoryPreview(force)
+    if not force
+        and (os.clock() - (State.inventoryPreview.lastRunAt or 0)) < 1
+    then
+        return State.inventoryPreview.report
+    end
+
+    local ok, report = F.runBoundary(
+        "InventoryPreview",
+        F.buildInventoryPreview
+    )
+
+    if not ok then
+        report = "Inventory preview failed: " .. tostring(report)
+    end
+
+    State.inventoryPreview.report = tostring(report)
+    if State.inventoryPreviewLabel and State.inventoryPreviewLabel.Parent then
+        State.inventoryPreviewLabel.Text = State.inventoryPreview.report
+    end
+    return State.inventoryPreview.report
+end
+
+function F.copyInventoryPreview()
+    local report = F.updateInventoryPreview(true)
+    local clipboard = type(setclipboard) == "function" and setclipboard
+        or (type(toclipboard) == "function" and toclipboard or nil)
+
+    if clipboard and pcall(clipboard, report) then
+        F.notify("Inventory Preview", "Preview copied.", "success", 2.0)
+        return true
+    end
+
+    print(report)
+    F.notify("Inventory Preview", "Clipboard unavailable; preview printed.", "info", 2.5)
+    return false
+end
+
 function F.updateSellStatus()
     local label =
         State.sellStatusLabel
@@ -10105,6 +10579,10 @@ function F.updateSellStatus()
         .. " | Mode: FULL/BLOCKED ONLY"
         .. " | Sold confirmed: "
         .. tostring(State.soldCount)
+
+    if State.currentPageName == "System" and F.updateInventoryPreview then
+        F.updateInventoryPreview(false)
+    end
 end
 
 State.updateSellStatus =
@@ -14194,6 +14672,10 @@ function F.captureProfileSettings()
             neverSell = F.deepCopySerializable(State.neverSellOrder),
             beforeHop = State.sellBeforeHop,
         },
+        Chest = {
+            enabled = State.chestEnabled,
+            speed = F.getMovementBaseScale("Chest"),
+        },
         Combat = {
             monsterLock = profileMonsterLockEnabled,
             height = monsterLockHeight,
@@ -14226,6 +14708,11 @@ function F.captureProfileSettings()
             waypoints = F.exportWaypoints(),
             route = F.exportRoute(),
         },
+        System = {
+            antiAFK = State.antiAFK.enabled,
+            movementSafety = State.movementSafety.enabled,
+            movementAutoStop = State.movementSafety.autoStop,
+        },
         Goal = {
             kind = State.goalFarm.selectedKind,
             name = State.goalFarm.selectedName,
@@ -14246,6 +14733,7 @@ function F.applyProfileSettings(profile)
 
     local farm = type(profile.Farm) == "table" and profile.Farm or {}
     local sell = type(profile.Sell) == "table" and profile.Sell or {}
+    local chest = type(profile.Chest) == "table" and profile.Chest or {}
     local combat = type(profile.Combat) == "table" and profile.Combat or {}
     local gacha = type(profile.Gacha) == "table" and profile.Gacha or {}
     local nightcall = type(profile.Nightcall) == "table" and profile.Nightcall or {}
@@ -14253,6 +14741,7 @@ function F.applyProfileSettings(profile)
     local ui = type(profile.UI) == "table" and profile.UI or {}
     local movement = type(profile.Movement) == "table" and profile.Movement or {}
     local navigation = type(profile.Navigation) == "table" and profile.Navigation or {}
+    local system = type(profile.System) == "table" and profile.System or {}
     local goal = type(profile.Goal) == "table" and profile.Goal or {}
     local cell = type(profile.Cell) == "table" and profile.Cell or {}
 
@@ -14338,6 +14827,13 @@ function F.applyProfileSettings(profile)
         State.neverSellNames[string.lower(tostring(name))] = true
     end
     State.sellBeforeHop = sell.beforeHop ~= false
+    State.chestEnabled = chest.enabled == true
+    State.chestStatus = State.chestEnabled and "Ready" or "OFF"
+    State.movementSpeeds.Chest = math.clamp(
+        tonumber(chest.speed) or Config.AUTO_CHEST_DEFAULT_SPEED,
+        0.5,
+        2.0
+    )
 
     State.monsterLockEnabled = combat.monsterLock == true
     monsterLockHeight = math.clamp(tonumber(combat.height) or monsterLockHeight, Config.MIN_MONSTER_HEIGHT, Config.MAX_MONSTER_HEIGHT)
@@ -14352,6 +14848,9 @@ function F.applyProfileSettings(profile)
     State.userUiScale = math.clamp(tonumber(ui.scale) or 1, 0.75, 1.25)
     State.reduceMotion = ui.reduceMotion == true
     State.backgroundDimEnabled = ui.backgroundDim == true
+    State.antiAFK.enabled = system.antiAFK == true
+    State.movementSafety.enabled = system.movementSafety ~= false
+    State.movementSafety.autoStop = system.movementAutoStop == true
 
     if next(movement) ~= nil then
         State.movementPreset = tostring(movement.preset or "Custom")
@@ -14371,6 +14870,9 @@ function F.applyProfileSettings(profile)
     end
 
     F.applyFarmConfigToUI()
+    F.setAntiAFKEnabled(State.antiAFK.enabled)
+    F.bindMovementSafety()
+    F.updateChestStatus()
     F.refreshMovementControlUI()
     F.updateWaypointStatus()
     if F.refreshGoalIntelligence and State.gameDB.loaded then
@@ -14491,6 +14993,417 @@ F.Controllers.Planner = {
     ScoreDrop = F.getSmartFarmScore,
 }
 
+-- =========================================================
+-- V6.5 SYSTEM SAFETY
+-- =========================================================
+
+function F.updateAntiAFKStatus()
+    local anti = State.antiAFK
+    local lastText = anti.lastAt > 0
+        and os.date("!%H:%M:%S", anti.lastAt)
+        or "Never"
+
+    if State.antiAFKStatusLabel and State.antiAFKStatusLabel.Parent then
+        State.antiAFKStatusLabel.Text =
+            "Anti-AFK: " .. (anti.enabled and "ON" or "OFF")
+            .. " | Attempts: " .. tostring(anti.attempts)
+            .. " | Success: " .. tostring(anti.successes)
+            .. " | Method: " .. tostring(anti.lastMethod)
+            .. " | Last: " .. lastText
+    end
+end
+
+function F.performAntiAFKAction(source)
+    local anti = State.antiAFK
+    if anti.busy or not State.loopRunning then
+        return false, "busy or stopped"
+    end
+
+    anti.busy = true
+    anti.attempts = anti.attempts + 1
+    anti.lastAt = os.time()
+    anti.lastError = "None"
+    source = tostring(source or "Manual")
+
+    local succeeded = false
+    local method = "None"
+    local errors = {}
+    local currentCamera = F.getCurrentCamera()
+
+    local virtualUserOk, virtualUserError = pcall(function()
+        local virtualUser = game:GetService("VirtualUser")
+        virtualUser:CaptureController()
+        virtualUser:Button2Down(
+            Vector2.new(0, 0),
+            currentCamera and currentCamera.CFrame or CFrame.new()
+        )
+        task.wait(0.08)
+        virtualUser:Button2Up(
+            Vector2.new(0, 0),
+            currentCamera and currentCamera.CFrame or CFrame.new()
+        )
+    end)
+
+    if virtualUserOk then
+        succeeded = true
+        method = "VirtualUser"
+    else
+        table.insert(errors, "VirtualUser: " .. tostring(virtualUserError))
+    end
+
+    if not succeeded then
+        local inputOk, inputError = pcall(function()
+            local virtualInput = game:GetService("VirtualInputManager")
+            virtualInput:SendKeyEvent(true, Enum.KeyCode.LeftShift, false, game)
+            task.wait(0.05)
+            virtualInput:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
+        end)
+
+        if inputOk then
+            succeeded = true
+            method = "VirtualInputManager"
+        else
+            table.insert(errors, "VirtualInputManager: " .. tostring(inputError))
+        end
+    end
+
+    anti.busy = false
+    anti.lastMethod = method
+
+    if succeeded then
+        anti.successes = anti.successes + 1
+        F.recordDiagnosticEvent("AntiAFK", source .. " action via " .. method)
+    else
+        anti.lastError = table.concat(errors, " | ")
+        F.recordError("AntiAFK", anti.lastError)
+    end
+
+    F.updateAntiAFKStatus()
+    return succeeded, anti.lastError
+end
+
+function F.stopAntiAFK(preserveEnabled)
+    local anti = State.antiAFK
+    if preserveEnabled ~= true then
+        anti.enabled = false
+    end
+    anti.busy = false
+
+    if anti.connection then
+        pcall(function()
+            anti.connection:Disconnect()
+        end)
+        anti.connection = nil
+    end
+
+    F.updateAntiAFKStatus()
+end
+
+function F.setAntiAFKEnabled(enabled)
+    enabled = enabled == true
+
+    if State.antiAFK.connection then
+        pcall(function()
+            State.antiAFK.connection:Disconnect()
+        end)
+        State.antiAFK.connection = nil
+    end
+
+    State.antiAFK.enabled = enabled
+
+    if enabled then
+        State.antiAFK.connection = LocalPlayer.Idled:Connect(function()
+            if State.antiAFK.enabled and State.loopRunning then
+                task.spawn(function()
+                    F.performAntiAFKAction("Roblox Idled")
+                end)
+            end
+        end)
+        F.recordDiagnosticEvent("AntiAFK", "Enabled; waiting for LocalPlayer.Idled")
+    else
+        F.recordDiagnosticEvent("AntiAFK", "Disabled")
+    end
+
+    F.updateAntiAFKStatus()
+    return true
+end
+
+function F.updateMovementSafetyStatus()
+    local safety = State.movementSafety
+    local strikes = safety.lastStrikes
+    local baseline = safety.baselineStrikes
+    local delta = strikes and baseline and (strikes - baseline) or nil
+
+    if State.movementSafetyStatusLabel and State.movementSafetyStatusLabel.Parent then
+        State.movementSafetyStatusLabel.Text =
+            "Safety: " .. (safety.enabled and "monitoring" or "OFF")
+            .. " | Circuit: " .. (safety.circuitOpen and "OPEN" or "ready")
+            .. " | Area: " .. tostring(safety.currentArea)
+            .. " | TeleportStrikes: " .. (strikes ~= nil and tostring(strikes) or "unavailable")
+            .. (delta ~= nil and (" (delta " .. tostring(delta) .. ")") or "")
+            .. " | Last: " .. tostring(safety.lastEvent)
+    end
+end
+
+function F.triggerMovementCircuitBreaker(reason)
+    local safety = State.movementSafety
+    if safety.circuitOpen then
+        return false
+    end
+
+    safety.circuitOpen = true
+    safety.triggerCount = safety.triggerCount + 1
+    safety.lastEvent = tostring(reason or "Observed strike increase")
+
+    if F.stopCellFarm and State.cellFarm.enabled then
+        F.stopCellFarm(false, "Movement safety circuit breaker")
+    end
+    if F.stopGoalFarm and State.goalFarm.enabled then
+        F.stopGoalFarm(false)
+    end
+    if F.stopAutoFarm then
+        F.stopAutoFarm("Movement safety circuit breaker")
+    end
+    if F.stopAutoChest then
+        F.stopAutoChest("Movement safety circuit breaker")
+    end
+
+    State.sellEnabled = false
+    State.sellBusy = false
+    State.chestEnabled = false
+    State.chestBusy = false
+    State.chestToken = State.chestToken + 1
+    State.sellStatus = "Movement safety circuit breaker"
+    if State.sellToggle then
+        State.sellToggle:SetSilent(false)
+    end
+
+    if F.setMonsterLock then
+        F.setMonsterLock(false)
+    end
+    if F.stopRecordedRoute then
+        F.stopRecordedRoute("Movement safety circuit breaker")
+    end
+    pcall(F.stopLootLock)
+    pcall(F.stopMovementFlight)
+    pcall(F.releaseMovement, State.movement.owner)
+
+    if F.applyMovementPreset then
+        F.applyMovementPreset("Safe")
+    end
+
+    F.markConfigDirty()
+    F.updateSellStatus()
+    F.updateMovementSafetyStatus()
+    F.recordDiagnosticEvent("MovementSafety", "Circuit opened: " .. safety.lastEvent)
+    F.notify(
+        "Movement Safety",
+        "Automation stopped after TeleportStrikes increased. Review Diagnostics before resetting.",
+        "warning",
+        4.0
+    )
+    return true
+end
+
+function F.refreshMovementSafetyAttributes(resetBaseline)
+    local safety = State.movementSafety
+    local area = LocalPlayer:GetAttribute("CurrentArea")
+    local strikes = tonumber(LocalPlayer:GetAttribute("TeleportStrikes"))
+
+    safety.currentArea = area ~= nil and tostring(area) or "Unknown"
+    if resetBaseline or safety.baselineStrikes == nil then
+        safety.baselineStrikes = strikes
+        safety.circuitOpen = false
+        safety.lastEvent = strikes ~= nil and "Baseline captured" or "TeleportStrikes unavailable"
+    end
+    safety.lastStrikes = strikes
+    F.updateMovementSafetyStatus()
+end
+
+function F.resetMovementSafety()
+    F.refreshMovementSafetyAttributes(true)
+    F.resetAdaptiveMovement()
+    State.movementSafety.lastEvent = "Baseline and adaptive telemetry reset"
+    F.updateMovementSafetyStatus()
+    F.recordDiagnosticEvent("MovementSafety", "Baseline reset by user")
+end
+
+function F.bindMovementSafety()
+    F.disconnectConnections(State.movementSafety.connections)
+
+    if not State.movementSafety.enabled then
+        State.movementSafety.lastEvent = "Monitor disabled"
+        F.updateMovementSafetyStatus()
+        return true
+    end
+
+    F.refreshMovementSafetyAttributes(true)
+
+    State.movementSafety.connections.area =
+        LocalPlayer:GetAttributeChangedSignal("CurrentArea"):Connect(function()
+            local area = LocalPlayer:GetAttribute("CurrentArea")
+            State.movementSafety.currentArea = area ~= nil and tostring(area) or "Unknown"
+            State.movementSafety.lastEvent = "CurrentArea changed"
+            F.updateMovementSafetyStatus()
+        end)
+
+    State.movementSafety.connections.strikes =
+        LocalPlayer:GetAttributeChangedSignal("TeleportStrikes"):Connect(function()
+            local safety = State.movementSafety
+            local previous = safety.lastStrikes
+            local current = tonumber(LocalPlayer:GetAttribute("TeleportStrikes"))
+
+            if current ~= nil and previous ~= nil and current > previous then
+                safety.lastEvent = "TeleportStrikes increased "
+                    .. tostring(previous) .. " -> " .. tostring(current)
+                safety.lastStrikes = current
+                F.recordDiagnosticEvent("MovementSafety", safety.lastEvent)
+
+                if safety.autoStop then
+                    F.triggerMovementCircuitBreaker(safety.lastEvent)
+                end
+            else
+                if current ~= nil and previous ~= nil and current < previous then
+                    safety.baselineStrikes = current
+                    safety.lastEvent = "TeleportStrikes counter decreased; baseline refreshed"
+                else
+                    safety.lastEvent = "TeleportStrikes changed"
+                end
+                safety.lastStrikes = current
+            end
+
+            F.updateMovementSafetyStatus()
+        end)
+
+    return true
+end
+
+function F.buildCompatibilityReport()
+    local results = {}
+    local counts = {OK = 0, WARN = 0, FAIL = 0}
+
+    local function add(level, name, detail)
+        level = counts[level] and level or "WARN"
+        counts[level] = counts[level] + 1
+        table.insert(results, "[" .. level .. "] " .. name .. " - " .. tostring(detail))
+    end
+
+    add(game:IsLoaded() and "OK" or "WARN", "Game load", game:IsLoaded() and "loaded" or "still loading")
+    add(F.getCharacterRoot() and "OK" or "FAIL", "Character root", F.getCharacterRoot() and "available" or "missing")
+
+    F.refreshCoreRemotes()
+    add(Remotes and "OK" or "FAIL", "ReplicatedStorage.Remotes", Remotes and "available" or "missing")
+
+    for _, remoteName in ipairs({
+        "DialogEvent",
+        "InteractPromptEvent",
+        "ConsumableEvent",
+        "GemGachaEvent",
+        "SellItemsEvent",
+    }) do
+        local found = Remotes and Remotes:FindFirstChild(remoteName) or nil
+        add(found and "OK" or "WARN", remoteName, found and found.ClassName or "not found")
+    end
+
+    local dropsFolder = F.findDropsFolder and F.findDropsFolder() or nil
+    local monstersFolder = F.findMonstersFolder and F.findMonstersFolder() or nil
+    local npcsFolder = workspace:FindFirstChild("NPCs")
+    local cradle = npcsFolder and npcsFolder:FindFirstChild("The Cradle") or nil
+    add(dropsFolder and "OK" or "WARN", "Drops folder", dropsFolder and dropsFolder:GetFullName() or "not streamed")
+    add(monstersFolder and "OK" or "WARN", "Monsters folder", monstersFolder and monstersFolder:GetFullName() or "not streamed")
+    add(npcsFolder and "OK" or "WARN", "NPCs folder", npcsFolder and npcsFolder:GetFullName() or "not streamed")
+    add(cradle and "OK" or "WARN", "The Cradle", cradle and cradle:GetFullName() or "not streamed")
+
+    local virtualUserOk = pcall(function()
+        return game:GetService("VirtualUser")
+    end)
+    local virtualInputOk = pcall(function()
+        return game:GetService("VirtualInputManager")
+    end)
+    add(
+        (virtualUserOk or virtualInputOk) and "OK" or "WARN",
+        "Anti-AFK input",
+        virtualUserOk and "VirtualUser" or (virtualInputOk and "VirtualInputManager" or "unsupported")
+    )
+
+    add(
+        type(readfile) == "function" and type(writefile) == "function" and "OK" or "WARN",
+        "Config persistence",
+        type(readfile) == "function" and type(writefile) == "function" and "available" or "executor file APIs unavailable"
+    )
+    add(
+        "OK",
+        "FPS policy",
+        "unmanaged by Hub; executor/game setting is preserved"
+    )
+    add(
+        F.getQueueOnTeleport and F.getQueueOnTeleport() and "OK" or "WARN",
+        "Teleport persistence",
+        F.getQueueOnTeleport and F.getQueueOnTeleport() and "available" or "queue_on_teleport unavailable"
+    )
+
+    State.compatibility.lastRunAt = os.time()
+    State.compatibility.ok = counts.OK
+    State.compatibility.warnings = counts.WARN
+    State.compatibility.failures = counts.FAIL
+    State.compatibility.report = table.concat({
+        "The Veil Hub " .. Config.HUB_VERSION .. " Compatibility Self-Test",
+        "UTC " .. os.date("!%Y-%m-%d %H:%M:%S"),
+        "Result: OK " .. tostring(counts.OK)
+            .. " | WARN " .. tostring(counts.WARN)
+            .. " | FAIL " .. tostring(counts.FAIL),
+        table.concat(results, "\n"),
+        "Note: passive inspection only; no RemoteEvent was fired.",
+    }, "\n")
+
+    return State.compatibility.report
+end
+
+function F.updateCompatibilityUI(force)
+    if force or State.compatibility.lastRunAt == 0 then
+        F.buildCompatibilityReport()
+    end
+
+    if State.compatibilityStatusLabel and State.compatibilityStatusLabel.Parent then
+        local lines = {}
+        local count = 0
+        for line in string.gmatch(State.compatibility.report, "[^\n]+") do
+            count = count + 1
+            if count <= 7 then
+                table.insert(lines, line)
+            end
+        end
+        State.compatibilityStatusLabel.Text = table.concat(lines, "\n")
+    end
+    return State.compatibility.report
+end
+
+function F.copyCompatibilityReport()
+    local report = F.updateCompatibilityUI(true)
+    local clipboard = type(setclipboard) == "function" and setclipboard
+        or (type(toclipboard) == "function" and toclipboard or nil)
+
+    if clipboard and pcall(clipboard, report) then
+        F.notify("Compatibility", "Self-test report copied.", "success", 2.0)
+        return true
+    end
+
+    print(report)
+    F.notify("Compatibility", "Clipboard unavailable; report printed.", "info", 2.5)
+    return false
+end
+
+F.Controllers.SystemSafety = {
+    RunCompatibilityTest = F.buildCompatibilityReport,
+    RefreshCompatibilityUI = F.updateCompatibilityUI,
+    SetAntiAFK = F.setAntiAFKEnabled,
+    TestAntiAFK = F.performAntiAFKAction,
+    BindMovementSafety = F.bindMovementSafety,
+    ResetMovementSafety = F.resetMovementSafety,
+    OpenMovementCircuit = F.triggerMovementCircuitBreaker,
+    InventoryPreview = F.buildInventoryPreview,
+}
+
 function F.getPassiveRemoteStatus(name)
     if not Remotes or not Remotes.Parent then
         return "WAITING"
@@ -14536,6 +15449,27 @@ function F.buildDiagnosticsReport()
         "Adaptive: " .. (State.adaptiveMovementEnabled and "ON" or "OFF")
             .. " | Server Corrections: " .. tostring(State.movementTelemetry.serverCorrections)
             .. " | Last: " .. tostring(State.movementTelemetry.lastCorrection),
+        "Movement Safety: " .. (State.movementSafety.enabled and "ON" or "OFF")
+            .. " | Circuit: " .. (State.movementSafety.circuitOpen and "OPEN" or "ready")
+            .. " | Area: " .. tostring(State.movementSafety.currentArea)
+            .. " | TeleportStrikes: " .. tostring(State.movementSafety.lastStrikes or "unavailable"),
+        "Anti-AFK: " .. (State.antiAFK.enabled and "ON" or "OFF")
+            .. " | Attempts/Success: " .. tostring(State.antiAFK.attempts)
+            .. "/" .. tostring(State.antiAFK.successes)
+            .. " | Method: " .. tostring(State.antiAFK.lastMethod),
+        "Compatibility: OK " .. tostring(State.compatibility.ok)
+            .. " | WARN " .. tostring(State.compatibility.warnings)
+            .. " | FAIL " .. tostring(State.compatibility.failures),
+        "Inventory Preview: Items " .. tostring(State.inventoryPreview.totalItems)
+            .. " | Protected " .. tostring(State.inventoryPreview.protectedItems)
+            .. " | Candidates " .. tostring(State.inventoryPreview.sellCandidates)
+            .. " | Known Candidate Value " .. F.formatCompactNumber(State.inventoryPreview.candidateKnownValue),
+        "Auto Chest: " .. (State.chestEnabled and "ON" or "OFF")
+            .. " | Status: " .. tostring(State.chestStatus)
+            .. " | Cached: " .. tostring(F.countTableKeys(State.chestCache))
+            .. " | Opened/Failed: " .. tostring(State.chestOpenedCount)
+            .. "/" .. tostring(State.chestFailedCount)
+            .. " | Speed: " .. string.format("%.1fx", F.getMovementBaseScale("Chest")),
         "Farm State: " .. tostring(State.farmMachine.state)
             .. " | Busy: " .. tostring(State.farmBusy)
             .. " | Strategy: " .. tostring(State.farmStrategy),
@@ -14711,11 +15645,12 @@ function F.getConfigData()
     local grouped = F.captureProfileSettings()
 
     return {
-        version = 9,
+        version = 11,
         schemaVersion = Config.CONFIG_SCHEMA_VERSION,
         Automation = {farm = grouped.Farm.enabled, sell = State.sellEnabled},
         Farm = grouped.Farm,
         Sell = grouped.Sell,
+        Chest = grouped.Chest,
         Combat = grouped.Combat,
         Gacha = grouped.Gacha,
         Nightcall = grouped.Nightcall,
@@ -14723,6 +15658,7 @@ function F.getConfigData()
         UI = grouped.UI,
         Movement = grouped.Movement,
         Navigation = grouped.Navigation,
+        System = grouped.System,
         Goal = grouped.Goal,
         Cell = grouped.Cell,
         CellSession = {
@@ -14872,6 +15808,7 @@ function F.loadFarmConfig()
     if tonumber(decoded.schemaVersion) and tonumber(decoded.schemaVersion) >= 4 then
         local farm = type(decoded.Farm) == "table" and decoded.Farm or {}
         local sell = type(decoded.Sell) == "table" and decoded.Sell or {}
+        local chest = type(decoded.Chest) == "table" and decoded.Chest or {}
         local combat = type(decoded.Combat) == "table" and decoded.Combat or {}
         local gacha = type(decoded.Gacha) == "table" and decoded.Gacha or {}
         local nightcall = type(decoded.Nightcall) == "table" and decoded.Nightcall or {}
@@ -14879,6 +15816,7 @@ function F.loadFarmConfig()
         local ui = type(decoded.UI) == "table" and decoded.UI or {}
         local movement = type(decoded.Movement) == "table" and decoded.Movement or {}
         local navigation = type(decoded.Navigation) == "table" and decoded.Navigation or {}
+        local system = type(decoded.System) == "table" and decoded.System or {}
         local goal = type(decoded.Goal) == "table" and decoded.Goal or {}
         local cell = type(decoded.Cell) == "table" and decoded.Cell or {}
         local cellSession = type(decoded.CellSession) == "table" and decoded.CellSession or {}
@@ -14902,6 +15840,8 @@ function F.loadFarmConfig()
         decoded.sellRarities = sell.rarities
         decoded.neverSell = sell.neverSell
         decoded.sellBeforeHop = sell.beforeHop
+        decoded.chestEnabled = chest.enabled
+        decoded.chestSpeed = chest.speed
         decoded.monsterLockEnabled = combat.monsterLock
         decoded.monsterLockHeight = combat.height
         decoded.gachaEnabled = gacha.enabled
@@ -14917,6 +15857,9 @@ function F.loadFarmConfig()
         decoded.cellMovementSpeed = movement.cellSpeed
         decoded.waypoints = navigation.waypoints
         decoded.route = navigation.route
+        decoded.antiAFKEnabled = system.antiAFK
+        decoded.movementSafetyEnabled = system.movementSafety
+        decoded.movementSafetyAutoStop = system.movementAutoStop
         State.itemPriority = type(farm.itemPriority) == "table" and farm.itemPriority or {}
         State.monsterWhitelist = type(combat.whitelist) == "table" and combat.whitelist or {}
         State.monsterBlacklist = type(combat.blacklist) == "table" and combat.blacklist or {}
@@ -15184,6 +16127,22 @@ function F.loadFarmConfig()
     State.sellBeforeHop =
         decoded.sellBeforeHop ~= false
 
+    State.chestEnabled =
+        decoded.chestEnabled == true
+
+    State.chestStatus =
+        State.chestEnabled
+        and "Ready"
+        or "OFF"
+
+    State.movementSpeeds.Chest =
+        math.clamp(
+            tonumber(decoded.chestSpeed)
+                or Config.AUTO_CHEST_DEFAULT_SPEED,
+            0.5,
+            2.0
+        )
+
     State.persistentHopEnabled =
         decoded.persistentHopEnabled ~= false
 
@@ -15194,6 +16153,15 @@ function F.loadFarmConfig()
 
     State.lowGraphicsEnabled =
         decoded.lowGraphicsEnabled == true
+
+    State.antiAFK.enabled =
+        decoded.antiAFKEnabled == true
+
+    State.movementSafety.enabled =
+        decoded.movementSafetyEnabled ~= false
+
+    State.movementSafety.autoStop =
+        decoded.movementSafetyAutoStop == true
 
     State.gachaEnabled =
         decoded.gachaEnabled == true
@@ -15383,6 +16351,18 @@ function F.applyFarmConfigToUI()
         )
     end
 
+    if State.chestToggle then
+        State.chestToggle:SetSilent(
+            State.chestEnabled
+        )
+    end
+
+    if State.chestSpeedSlider then
+        State.chestSpeedSlider:SetSilent(
+            F.getMovementBaseScale("Chest")
+        )
+    end
+
     if State.neverSellInput then
         State.neverSellInput:SetTags(
             State.neverSellOrder,
@@ -15461,6 +16441,24 @@ function F.applyFarmConfigToUI()
     if State.nightCallToggle then
         State.nightCallToggle:SetSilent(
             State.nightCallEnabled
+        )
+    end
+
+    if State.antiAFKToggle then
+        State.antiAFKToggle:SetSilent(
+            State.antiAFK.enabled
+        )
+    end
+
+    if State.movementSafetyToggle then
+        State.movementSafetyToggle:SetSilent(
+            State.movementSafety.enabled
+        )
+    end
+
+    if State.movementSafetyAutoStopToggle then
+        State.movementSafetyAutoStopToggle:SetSilent(
+            State.movementSafety.autoStop
         )
     end
 
@@ -25131,6 +26129,407 @@ function F.isCellRewardChestOpened(chest)
     return false
 end
 
+-- =========================================================
+-- V6.5.1 GENERAL AUTO CHEST
+--
+-- The exact OpenChest protocol is already used by Cell reward handling.
+-- General discovery is intentionally conservative so an unrelated object with
+-- a ClickDetector or an "Open" prompt is not treated as a chest.
+-- =========================================================
+
+function F.autoChestTextMatches(value)
+    local lowered = string.lower(F.trimText(value))
+    if lowered == "" then
+        return false
+    end
+
+    for _, token in ipairs({
+        "chest",
+        "treasure",
+        "crate",
+        "loot box",
+        "reward box",
+        "reward crate",
+        "loot crate",
+    }) do
+        if string.find(lowered, token, 1, true) then
+            return true
+        end
+    end
+
+    return false
+end
+
+function F.findNamedAutoChestAncestor(object)
+    local current = object
+
+    for _ = 1, 7 do
+        if not current or current == workspace then
+            break
+        end
+
+        if (
+            current:IsA("Model")
+            or current:IsA("BasePart")
+        )
+            and F.autoChestTextMatches(current.Name)
+        then
+            if current:IsA("BasePart")
+                and current.Parent
+                and current.Parent:IsA("Model")
+                and F.autoChestTextMatches(current.Parent.Name)
+            then
+                return current.Parent
+            end
+
+            return current
+        end
+
+        current = current.Parent
+    end
+
+    return nil
+end
+
+function F.getAutoChestPromptContainer(prompt)
+    local current = prompt and prompt.Parent or nil
+    local firstPart = nil
+
+    for _ = 1, 7 do
+        if not current or current == workspace then
+            break
+        end
+
+        if current:IsA("Model") then
+            return current
+        end
+
+        if not firstPart and current:IsA("BasePart") then
+            firstPart = current
+        end
+
+        current = current.Parent
+    end
+
+    return firstPart
+end
+
+function F.getAutoChestRoot(object)
+    if typeof(object) ~= "Instance"
+        or not object.Parent
+        or not object:IsDescendantOf(workspace)
+    then
+        return nil
+    end
+
+    local namedAncestor = F.findNamedAutoChestAncestor(object)
+
+    if object:IsA("Model") or object:IsA("BasePart") then
+        return namedAncestor
+    end
+
+    if object:IsA("ProximityPrompt") then
+        local promptEvidence =
+            F.autoChestTextMatches(object.ObjectText)
+            or F.autoChestTextMatches(object.ActionText)
+            or namedAncestor ~= nil
+
+        if promptEvidence then
+            return namedAncestor or F.getAutoChestPromptContainer(object)
+        end
+    elseif object:IsA("ClickDetector") and namedAncestor then
+        return namedAncestor
+    end
+
+    return nil
+end
+
+function F.isAutoChestUsable(chest)
+    if typeof(chest) ~= "Instance"
+        or not chest.Parent
+        or not chest:IsDescendantOf(workspace)
+        or State.chestOpenedCache[chest]
+    then
+        return false
+    end
+
+    local character = F.getPlayerCharacter()
+    if character and chest:IsDescendantOf(character) then
+        return false
+    end
+
+    if F.isCellRewardChestOpened(chest) then
+        State.chestOpenedCache[chest] = true
+        return false
+    end
+
+    return F.getDropCFrame(chest) ~= nil
+end
+
+function F.considerAutoChestObject(object)
+    local chest = F.getAutoChestRoot(object)
+    if chest and F.isAutoChestUsable(chest) then
+        State.chestCache[chest] = true
+        return chest
+    end
+    return nil
+end
+
+function F.rebuildAutoChestCache()
+    local fresh = setmetatable({}, {__mode = "k"})
+    local previous = State.chestCache
+    State.chestCache = fresh
+
+    for _, object in ipairs(workspace:GetDescendants()) do
+        F.considerAutoChestObject(object)
+    end
+
+    State.chestStatus = "Scan complete"
+    F.updateChestStatus()
+    return F.countTableKeys(State.chestCache), previous
+end
+
+function F.bindAutoChestCache()
+    F.disconnectConnections(State.chestConnections)
+
+    State.chestConnections.added = workspace.DescendantAdded:Connect(function(object)
+        if State.loopRunning then
+            F.considerAutoChestObject(object)
+        end
+    end)
+
+    return F.rebuildAutoChestCache()
+end
+
+function F.getNearestAutoChest()
+    local root = F.getCharacterRoot()
+    if not root then
+        return nil, math.huge
+    end
+
+    local now = os.clock()
+    local nearest = nil
+    local nearestDistance = math.huge
+
+    for chest in pairs(State.chestCache) do
+        if not F.isAutoChestUsable(chest) then
+            State.chestCache[chest] = nil
+        elseif now >= (State.chestFailedUntil[chest] or 0) then
+            local chestCFrame = F.getDropCFrame(chest)
+            if chestCFrame then
+                local distance = (chestCFrame.Position - root.Position).Magnitude
+                if distance < nearestDistance then
+                    nearest = chest
+                    nearestDistance = distance
+                end
+            end
+        end
+    end
+
+    return nearest, nearestDistance
+end
+
+function F.updateChestStatus()
+    if not State.chestStatusLabel or not State.chestStatusLabel.Parent then
+        return
+    end
+
+    local currentName = State.chestCurrent
+        and State.chestCurrent.Parent
+        and tostring(State.chestCurrent.Name)
+        or "None"
+
+    State.chestStatusLabel.Text =
+        "Chest: " .. (State.chestEnabled and State.chestStatus or "OFF")
+        .. " | Detected: " .. tostring(F.countTableKeys(State.chestCache))
+        .. " | Target: " .. currentName
+        .. " | Speed: " .. string.format("%.1fx", F.getMovementBaseScale("Chest"))
+        .. " | Opened: " .. tostring(State.chestOpenedCount)
+        .. " | Failed: " .. tostring(State.chestFailedCount)
+end
+
+State.updateChestStatus = F.updateChestStatus
+
+function F.stopAutoChest(reason, preserveEnabled)
+    State.chestToken = State.chestToken + 1
+    State.chestBusy = false
+    State.chestManual = false
+    State.chestCurrent = nil
+    State.chestStatus = tostring(reason or "Stopped")
+
+    if preserveEnabled ~= true then
+        State.chestEnabled = false
+        if State.chestToggle then
+            State.chestToggle:SetSilent(false)
+        end
+    end
+
+    F.stopMovementFlight("CHEST")
+    F.releaseMovement("CHEST")
+    F.updateChestStatus()
+end
+
+function F.tryOpenAutoChest(chest, token)
+    if not F.isAutoChestUsable(chest) then
+        return false, "Chest unavailable"
+    end
+
+    local initialParent = chest.Parent
+    local prompt = chest:FindFirstChildWhichIsA("ProximityPrompt", true)
+    local clickDetector = chest:FindFirstChildWhichIsA("ClickDetector", true)
+    local interactPromptEvent = F.getInteractPromptEvent()
+
+    for attempt = 1, Config.AUTO_CHEST_OPEN_RETRIES do
+        if State.chestToken ~= token
+            or (not State.chestEnabled and not State.chestManual)
+        then
+            return false, "Cancelled"
+        end
+
+        State.chestStatus = "Opening " .. tostring(chest.Name)
+            .. " " .. tostring(attempt) .. "/" .. tostring(Config.AUTO_CHEST_OPEN_RETRIES)
+        F.updateChestStatus()
+
+        local actionSent = false
+
+        if interactPromptEvent and interactPromptEvent:IsA("RemoteEvent") then
+            actionSent = pcall(function()
+                interactPromptEvent:FireServer("OpenChest", chest)
+            end)
+            if actionSent then
+                State.movementTelemetry.lastRemote =
+                    'InteractPromptEvent:FireServer("OpenChest", Chest)'
+            end
+        end
+
+        if prompt and prompt.Parent and prompt.Enabled then
+            if type(fireproximityprompt) == "function" then
+                local promptOk = pcall(fireproximityprompt, prompt)
+                actionSent = promptOk or actionSent
+            else
+                actionSent = F.pressLootInteractKey() or actionSent
+            end
+        elseif clickDetector and clickDetector.Parent
+            and type(fireclickdetector) == "function"
+        then
+            local clickOk = pcall(fireclickdetector, clickDetector)
+            actionSent = clickOk or actionSent
+        end
+
+        if not actionSent then
+            return false, "No supported chest interaction path"
+        end
+
+        local deadline = os.clock() + Config.AUTO_CHEST_CONFIRM_TIMEOUT
+        while State.loopRunning
+            and State.chestToken == token
+            and os.clock() < deadline
+        do
+            if not chest.Parent
+                or (initialParent and chest.Parent ~= initialParent)
+                or F.isCellRewardChestOpened(chest)
+            then
+                return true, "Confirmed opened"
+            end
+            task.wait(0.10)
+        end
+
+        task.wait(0.20)
+    end
+
+    return false, "Open was not confirmed"
+end
+
+function F.runAutoChestStep(manual)
+    manual = manual == true
+    if State.chestBusy
+        or (not manual and not State.chestEnabled)
+    then
+        return false
+    end
+
+    if State.serverHopBusy
+        or State.sellBusy
+        or State.farmBusy
+        or (State.cellFarm and State.cellFarm.enabled)
+    then
+        State.chestStatus = "Waiting for active automation"
+        F.updateChestStatus()
+        return false
+    end
+
+    State.chestBusy = true
+    State.chestManual = manual
+    State.chestToken = State.chestToken + 1
+    local token = State.chestToken
+    local chest, distance = F.getNearestAutoChest()
+
+    if not chest then
+        State.chestBusy = false
+        State.chestManual = false
+        State.chestCurrent = nil
+        State.chestStatus = "No unopened chest found"
+        F.updateChestStatus()
+        return false
+    end
+
+    State.chestCurrent = chest
+    State.chestStatus = "Flying to " .. tostring(chest.Name)
+        .. " (" .. string.format("%.0f", distance) .. " studs)"
+    State.movementTelemetry.lastAction = "Auto Chest -> " .. tostring(chest.Name)
+    F.updateChestStatus()
+
+    local chestCFrame = F.getDropCFrame(chest)
+    local reached = chestCFrame and F.flyToCFrame(
+        chestCFrame,
+        "CHEST",
+        Config.AUTO_CHEST_OPEN_DISTANCE,
+        Config.AUTO_CHEST_MAX_TRAVEL_TIME,
+        "Chest"
+    ) or false
+
+    local opened = false
+    local result = reached and "Reached" or "Could not reach chest"
+    if reached
+        and State.chestToken == token
+        and (State.chestEnabled or State.chestManual)
+    then
+        opened, result = F.tryOpenAutoChest(chest, token)
+    end
+
+    F.stopMovementFlight("CHEST")
+    F.releaseMovement("CHEST")
+
+    if opened then
+        State.chestOpenedCount = State.chestOpenedCount + 1
+        State.chestOpenedCache[chest] = true
+        State.chestCache[chest] = nil
+        State.chestStatus = "Opened " .. tostring(chest.Name)
+        F.recordDiagnosticEvent("AutoChest", State.chestStatus)
+    elseif State.chestToken == token then
+        State.chestFailedCount = State.chestFailedCount + 1
+        State.chestFailedUntil[chest] = os.clock() + Config.AUTO_CHEST_RETRY_COOLDOWN
+        State.chestStatus = tostring(result)
+        F.recordDiagnosticEvent(
+            "AutoChest",
+            "Failed " .. tostring(chest.Name) .. ": " .. tostring(result)
+        )
+    end
+
+    State.chestBusy = false
+    State.chestManual = false
+    State.chestCurrent = nil
+    F.updateChestStatus()
+    return opened
+end
+
+F.Controllers.AutoChest = {
+    Scan = F.rebuildAutoChestCache,
+    Nearest = F.getNearestAutoChest,
+    CollectOne = F.runAutoChestStep,
+    Stop = F.stopAutoChest,
+}
+
 function F.stopCellRewardMovement()
     F.stopLootLock(
         "CELL"
@@ -28031,23 +29430,6 @@ function F.applyLowGraphics()
     end
 
     pcall(function()
-        if type(getfpscap) == "function"
-            and State.lowGraphicsFpsOriginal == nil
-        then
-            State.lowGraphicsFpsOriginal =
-                getfpscap()
-        end
-    end)
-
-    pcall(function()
-        if type(setfpscap) == "function" then
-            setfpscap(
-                Config.LOW_GRAPHICS_FPS_CAP
-            )
-        end
-    end)
-
-    pcall(function()
         local userGameSettings =
             UserSettings():GetService(
                 "UserGameSettings"
@@ -28147,16 +29529,6 @@ function F.restoreLowGraphics()
         )
 
     pcall(function()
-        if type(setfpscap) == "function" then
-            setfpscap(
-                tonumber(
-                    State.lowGraphicsFpsOriginal
-                ) or 60
-            )
-        end
-    end)
-
-    pcall(function()
         local userGameSettings =
             UserSettings():GetService(
                 "UserGameSettings"
@@ -28170,7 +29542,6 @@ function F.restoreLowGraphics()
         end
     end)
 
-    State.lowGraphicsFpsOriginal = nil
     State.lowGraphicsQualityOriginal = nil
 
     if State.fullBrightEnabled then
@@ -30006,12 +31377,21 @@ function F.waitForWorldReady()
                 State.worldReadyStatus
         end
 
+        if State.chestEnabled then
+            State.chestStatus =
+                State.worldReadyStatus
+        end
+
         if State.updateFarmStatus then
             State.updateFarmStatus()
         end
 
         if State.updateSellStatus then
             State.updateSellStatus()
+        end
+
+        if State.updateChestStatus then
+            State.updateChestStatus()
         end
 
         task.delay(1, function()
@@ -30100,6 +31480,10 @@ function F.waitForWorldReady()
         State.sellStatus = "Monitoring"
     end
 
+    if State.chestEnabled then
+        State.chestStatus = "Scanning"
+    end
+
     if State.updateDropStatus then
         State.updateDropStatus()
     end
@@ -30112,9 +31496,13 @@ function F.waitForWorldReady()
         State.updateSellStatus()
     end
 
+    if State.updateChestStatus then
+        State.updateChestStatus()
+    end
+
     F.notify(
         "World ready",
-        "Initial game/map load finished. Auto Farm and Auto Sell may start.",
+        "Initial game/map load finished. Farm, Chest and Sell automation may start.",
         "success",
         2.5
     )
@@ -30686,6 +32074,139 @@ resetUiBtn.MouseButton1Click:Connect(function()
 end)
 
 -- =========================================================
+-- V6.5 SYSTEM SAFETY CONTROLS
+-- =========================================================
+
+State.chestToggle:OnChanged(function(enabled)
+    State.chestEnabled = enabled
+    State.chestToken = State.chestToken + 1
+    State.chestStatus = enabled and "Scanning" or "OFF"
+
+    if enabled then
+        task.defer(function()
+            F.runBoundary("AutoChestScan", F.rebuildAutoChestCache)
+        end)
+    else
+        F.stopAutoChest("OFF")
+    end
+
+    F.markConfigDirty()
+    F.updateChestStatus()
+end)
+
+State.chestSpeedSlider:OnChanged(function(value)
+    F.setMovementSpeed("Chest", value, true)
+    F.updateChestStatus()
+end)
+
+State.chestRefreshButton.MouseButton1Click:Connect(function()
+    State.chestRefreshButton.Text = "SCANNING"
+    task.spawn(function()
+        local ok = F.runBoundary("AutoChestScan", F.rebuildAutoChestCache)
+        if State.chestRefreshButton and State.chestRefreshButton.Parent then
+            State.chestRefreshButton.Text = ok and "DONE" or "FAILED"
+            State.chestRefreshButton.TextColor3 = ok and Config.THEME.Green or Config.THEME.Red
+            task.wait(0.8)
+            if State.chestRefreshButton and State.chestRefreshButton.Parent then
+                State.chestRefreshButton.Text = "SCAN"
+                State.chestRefreshButton.TextColor3 = Config.THEME.Text
+            end
+        end
+    end)
+end)
+
+State.chestCollectButton.MouseButton1Click:Connect(function()
+    if State.chestBusy then
+        return
+    end
+
+    task.spawn(function()
+        local ok = F.runBoundary("AutoChestManual", F.runAutoChestStep, true)
+        if not ok then
+            State.chestBusy = false
+            State.chestManual = false
+            State.chestCurrent = nil
+            F.stopMovementFlight("CHEST")
+            F.releaseMovement("CHEST")
+            F.updateChestStatus()
+        end
+    end)
+end)
+
+State.antiAFKToggle:OnChanged(function(enabled)
+    F.setAntiAFKEnabled(enabled)
+    F.markConfigDirty()
+    F.notify(
+        "Anti-AFK",
+        enabled and "Enabled; waiting for Roblox Idled." or "Disabled and connection removed.",
+        enabled and "success" or "info",
+        2.4
+    )
+end)
+
+State.antiAFKTestButton.MouseButton1Click:Connect(function()
+    if State.antiAFK.busy then
+        return
+    end
+
+    State.antiAFKTestButton.Text = "TESTING"
+    task.spawn(function()
+        local ok = F.performAntiAFKAction("Manual test")
+        if State.antiAFKTestButton and State.antiAFKTestButton.Parent then
+            State.antiAFKTestButton.Text = ok and "SUCCESS" or "FAILED"
+            State.antiAFKTestButton.TextColor3 = ok and Config.THEME.Green or Config.THEME.Red
+            task.wait(0.8)
+            if State.antiAFKTestButton and State.antiAFKTestButton.Parent then
+                State.antiAFKTestButton.Text = "TEST NOW"
+                State.antiAFKTestButton.TextColor3 = Config.THEME.Text
+            end
+        end
+    end)
+end)
+
+State.movementSafetyToggle:OnChanged(function(enabled)
+    State.movementSafety.enabled = enabled
+    F.bindMovementSafety()
+    F.markConfigDirty()
+end)
+
+State.movementSafetyAutoStopToggle:OnChanged(function(enabled)
+    State.movementSafety.autoStop = enabled
+    State.movementSafety.lastEvent = enabled
+        and "Circuit breaker armed"
+        or "Circuit breaker disarmed"
+    F.updateMovementSafetyStatus()
+    F.markConfigDirty()
+end)
+
+State.movementSafePresetButton.MouseButton1Click:Connect(function()
+    F.applyMovementPreset("Safe")
+    State.movementSafety.lastEvent = "Safe movement preset applied"
+    F.updateMovementSafetyStatus()
+end)
+
+State.movementSafetyResetButton.MouseButton1Click:Connect(function()
+    F.resetMovementSafety()
+end)
+
+State.compatibilityRunButton.MouseButton1Click:Connect(function()
+    F.updateCompatibilityUI(true)
+    F.notify("Compatibility", "Passive self-test completed.", "success", 2.0)
+end)
+
+State.compatibilityCopyButton.MouseButton1Click:Connect(function()
+    F.copyCompatibilityReport()
+end)
+
+State.inventoryRefreshButton.MouseButton1Click:Connect(function()
+    F.updateInventoryPreview(true)
+end)
+
+State.inventoryCopyButton.MouseButton1Click:Connect(function()
+    F.copyInventoryPreview()
+end)
+
+-- =========================================================
 -- LOOPS
 -- =========================================================
 
@@ -30946,6 +32467,28 @@ end)
 
 task.spawn(function()
     while State.loopRunning do
+        if State.chestEnabled
+            and State.worldReady
+            and not State.chestBusy
+        then
+            local ok = F.runBoundary("AutoChest", F.runAutoChestStep, false)
+            if not ok then
+                State.chestBusy = false
+                State.chestManual = false
+                State.chestCurrent = nil
+                F.stopMovementFlight("CHEST")
+                F.releaseMovement("CHEST")
+                State.chestStatus = "Runtime error; waiting to retry"
+                F.updateChestStatus()
+            end
+        end
+
+        task.wait(Config.AUTO_CHEST_INTERVAL)
+    end
+end)
+
+task.spawn(function()
+    while State.loopRunning do
         if State.sellEnabled
             and State.worldReady
             and not State.sellBusy
@@ -31183,6 +32726,10 @@ function F.shutdown()
     pcall(F.stopLootLock)
     pcall(F.stopMovementFlight)
     pcall(F.releaseMovement, State.movement.owner)
+    pcall(F.stopAntiAFK, true)
+    pcall(F.stopAutoChest, "Hub shutdown")
+    pcall(F.disconnectConnections, State.movementSafety.connections)
+    pcall(F.disconnectConnections, State.chestConnections)
     pcall(F.disconnectConnections, State.dropCacheConnections)
     pcall(F.disconnectConnections, State.monsterCacheConnections)
 
@@ -31267,6 +32814,10 @@ fullBrightToggle:SetSilent(false)
 State.lowGraphicsToggle:SetSilent(false)
 State.gachaToggle:SetSilent(false)
 State.nightCallToggle:SetSilent(false)
+State.chestToggle:SetSilent(false)
+State.antiAFKToggle:SetSilent(false)
+State.movementSafetyToggle:SetSilent(true)
+State.movementSafetyAutoStopToggle:SetSilent(false)
 insanityBlockToggle:SetSilent(false)
 reduceMotionToggle:SetSilent(false)
 dimToggle:SetSilent(false)
@@ -31309,6 +32860,9 @@ State.serversVisitedCount =
     )
 
 F.applyFarmConfigToUI()
+F.setAntiAFKEnabled(State.antiAFK.enabled)
+F.bindMovementSafety()
+F.bindAutoChestCache()
 
 if State.lowGraphicsEnabled then
     task.spawn(
@@ -31324,6 +32878,10 @@ end
 if State.sellEnabled then
     State.sellStatus =
         "Waiting for game/map"
+end
+
+if State.chestEnabled then
+    State.chestStatus = "Waiting for game/map"
 end
 
 if State.gachaEnabled then
@@ -31360,9 +32918,14 @@ F.refreshDropRarityHeaders()
 F.updateDropStatus()
 F.updateFarmStatus()
 F.updateSellStatus()
+F.updateChestStatus()
 F.updateServerHopStatus()
 F.updateGachaStatus()
 F.updateNightCallStatus()
+F.updateAntiAFKStatus()
+F.updateMovementSafetyStatus()
+F.updateCompatibilityUI(true)
+F.updateInventoryPreview(true)
 F.updateDiagnostics()
 
 F.selectDropsSubPage(
@@ -31404,14 +32967,14 @@ print("Cell Farm v6.4.8: hop resume waits for menu boot before Endure/Slot 1/Cur
 print("Goal Farm: Bestiary targets / live monster drop intelligence / coordinated combat + loot")
 print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
-print("No Fog / FullBright / Low Graphics 30 FPS / ESP / Insanity Block")
+print("No Fog / FullBright / Low Graphics (FPS untouched) / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("Drops v6.4.37: Smart Planner / Goal Farm / Full Auto Cell / Adaptive Speed / Auto Sell / Server Hop")
+print("The Veil Hub v6.5.1: Auto Chest / gradual flight / System Safety / Anti-AFK")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
 print("Auto Nightcall Potion: inventory detection / confirmed use / auto weapon restore / one auto-use per server")
-print("Modules: GameDB / NPC Intelligence / Interactions / GoalFarm / CellFarm / Movement / Planner / Waypoints / Profiles / Diagnostics / Farm / Sell / Combat")
+print("Modules: AutoChest / SystemSafety / GameDB / NPC Intelligence / Interactions / GoalFarm / CellFarm / Movement / Planner / Waypoints / Profiles / Diagnostics / Farm / Sell / Combat")
 print("GameDB v6.3: Runtime data + NPC services / interactables / Bestiary + live drop goal intelligence")
 print("World Ready Gate: game load / character / remotes / map settle / Merchant wait")
 print("Server Hop: visited-server filter / saved session / optional queued Raw URL reload")
@@ -31422,7 +32985,7 @@ print("==========================================")
 if type(writefile) == "function" then
     local saved, saveError = pcall(
         writefile,
-        "TheVeilHub_v6_4_CellRuntime.lua",
+        "TheVeilHub_v6_5_1_Runtime.lua",
         runtimeSource
     )
 
@@ -31432,19 +32995,19 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.4.37.")
+    warn("[The Veil Hub] loadstring is required to launch v6.5.1.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.4.37 compile failed:", compileError)
+    warn("[The Veil Hub] v6.5.1 compile failed:", compileError)
     return
 end
 
 local launched, runtimeError = pcall(chunk)
 
 if not launched then
-    warn("[The Veil Hub] v6.4.37 runtime failed:", runtimeError)
+    warn("[The Veil Hub] v6.5.1 runtime failed:", runtimeError)
 end
