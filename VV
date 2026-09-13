@@ -1,10 +1,10 @@
--- The Veil Hub v6.6.3 Cell Reward Attack Stop loader
+-- The Veil Hub v6.6.4 Cell Nearby Legendary+Mythic Loot loader
 -- Keeps a clean local runtime copy for teleport resume, then executes it.
 local runtimeSource = [==============[
 
 -- =========================================================
 -- THE VEIL HUB
--- v6.6.3: stop Cell weapon auto attack + finisher immediately after boss defeat and throughout reward/loot stages.
+-- v6.6.4: Cell reward loot is fixed-anchor nearby only (40 studs) and collects Legendary/Mythic only; reward attack stop remains enforced.
 -- Cleaned from a corrupted multi-version export.
 -- Sidebar UI + Collapse + ESP
 --
@@ -335,7 +335,14 @@ local Config = {
     CELL_REWARD_DROP_NOTICE = 30.0,
 
     CELL_DROP_DISCOVERY_SECONDS = 5.0,
+    -- Broad radius used only to observe the Cell reward sequence. Actual pickup
+    -- is deliberately much tighter so the character never chains across the map.
     CELL_DROP_RADIUS = 260,
+    CELL_REWARD_LOOT_NEARBY_RADIUS = 40,
+    CELL_REWARD_LOOT_RARITIES = {
+        legendary = true,
+        mythic = true,
+    },
     CELL_MAX_LOOT_PER_RUN = 90,
     CELL_LOOT_MOVE_RETRIES = 3,
     CELL_LOOT_DIRECT_MOVE_TIMEOUT = 45,
@@ -419,8 +426,8 @@ local Config = {
     CELL_MENU_PROTOCOL_ATTEMPTS = 5,
     CELL_MENU_PROTOCOL_INTERVAL = 1.35,
     CELL_WEAPON_WAIT_TIMEOUT = 12,
-    CELL_RUNTIME_FILE = "TheVeilHub_v6_6_3_Runtime.lua",
-    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_6_3_CellResume.flag",
+    CELL_RUNTIME_FILE = "TheVeilHub_v6_6_4_Runtime.lua",
+    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_6_4_CellResume.flag",
     CELL_DEFAULT_FIGHT_HEIGHT = 20,
     CELL_DEFAULT_TRAVEL_SPEED = 2.0,
 
@@ -443,7 +450,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.6.3 Cell Reward Attack Stop",
+    HUB_VERSION = "v6.6.4 Cell Nearby Legendary+Mythic Loot",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -989,6 +996,9 @@ local State = {
         rewardLastChestDebugId = "None",
         rewardDropWaves = 0,
         rewardDropCount = 0,
+        rewardLootAnchorPosition = nil,
+        rewardLootRadius = Config.CELL_REWARD_LOOT_NEARBY_RADIUS,
+        rewardLootEligible = 0,
         lootMoveTarget = "None",
         lootMoveDistance = -1,
         lootMoveAttempts = 0,
@@ -25103,15 +25113,6 @@ function F.getCellDropFolders()
     local result = {}
     local seen = {}
 
-    local wantedNames = {
-        drops = true,
-        drop = true,
-        loot = true,
-        lootdrops = true,
-        worlddrops = true,
-        worldloot = true,
-    }
-
     local function add(object)
         if not object
             or not object.Parent
@@ -25128,99 +25129,150 @@ function F.getCellDropFolders()
         end
 
         seen[object] = true
-
-        table.insert(
-            result,
-            object
-        )
+        table.insert(result, object)
     end
 
+    -- Performance-safe: prefer the already-bound event-driven Drop folder.
+    -- Do not scan Workspace:GetDescendants() on every Cell reward poll.
+    add(State.dropCacheBoundFolder)
     add(State.dropsFolder)
     add(workspace:FindFirstChild("Drops"))
     add(workspace:FindFirstChild("Drop"))
-
-    for _, object in ipairs(
-        workspace:GetDescendants()
-    ) do
-        if object:IsA("Folder")
-            or object:IsA("Model")
-        then
-            local key =
-                string.lower(
-                    tostring(
-                        object.Name
-                        or ""
-                    )
-                ):gsub(
-                    "%s+",
-                    ""
-                )
-
-            if wantedNames[key] then
-                add(object)
-            end
-        end
-    end
+    add(workspace:FindFirstChild("Loot"))
+    add(workspace:FindFirstChild("LootDrops"))
+    add(workspace:FindFirstChild("WorldDrops"))
+    add(workspace:FindFirstChild("WorldLoot"))
 
     return result
 end
 
-function F.collectCellLootCandidates(beforeSnapshot)
-    local result = {}
-    local seen = {}
+function F.forEachCellDrop(callback)
+    if type(callback) ~= "function" then
+        return "none"
+    end
 
-    for _, folder in ipairs(
-        F.getCellDropFolders()
-    ) do
-        for _, drop in ipairs(
-            F.collectDropObjects(folder)
-        ) do
-            if not seen[drop]
-                and not (
-                    beforeSnapshot
-                    and beforeSnapshot[drop]
-                )
+    -- Normal path: reuse the event-driven cache maintained for Auto Farm/UI.
+    if State.dropCacheBoundFolder
+        and State.dropCacheBoundFolder.Parent
+    then
+        for drop in pairs(State.dropCache) do
+            if drop
+                and drop.Parent
                 and F.isDropPresent(drop)
             then
-                local include = true
+                callback(drop)
+            end
+        end
 
-                local dropCFrame =
-                    F.getDropCFrame(drop)
+        return "cache"
+    end
 
-                if State.cellFarm.lastBossPosition
-                    and dropCFrame
-                then
-                    include =
-                        (
-                            dropCFrame.Position
-                            - State.cellFarm.lastBossPosition
-                        ).Magnitude
-                        <= Config.CELL_DROP_RADIUS
-                end
+    -- Compatibility fallback. This is intentionally limited to known Drop
+    -- containers; it never performs a global Workspace descendant scan.
+    local seen = setmetatable({}, {__mode = "k"})
 
-                if include then
-                    seen[drop] = true
-                    table.insert(result, drop)
-                end
+    for _, folder in ipairs(F.getCellDropFolders()) do
+        for _, drop in ipairs(F.collectDropObjects(folder)) do
+            if not seen[drop] then
+                seen[drop] = true
+                callback(drop)
             end
         end
     end
+
+    return "fallback"
+end
+
+-- Optional collection filters are deliberately separate from reward-wave
+-- detection. Calls without anchor/radius/rarity arguments still observe every
+-- post-snapshot reward drop, which keeps chest-open confirmation reliable.
+function F.collectCellLootCandidates(
+    beforeSnapshot,
+    anchorPosition,
+    nearbyRadius,
+    allowedRarities
+)
+    local result = {}
+    local seen = setmetatable({}, {__mode = "k"})
+    local radius = tonumber(nearbyRadius)
+
+    F.forEachCellDrop(function(drop)
+        if seen[drop]
+            or (
+                beforeSnapshot
+                and beforeSnapshot[drop]
+            )
+            or not F.isDropPresent(drop)
+        then
+            return
+        end
+
+        local include = true
+        local dropCFrame = F.getDropCFrame(drop)
+
+        -- Broad Cell reward-area guard retained for all callers.
+        if State.cellFarm.lastBossPosition
+            and dropCFrame
+        then
+            include =
+                (
+                    dropCFrame.Position
+                    - State.cellFarm.lastBossPosition
+                ).Magnitude
+                <= Config.CELL_DROP_RADIUS
+        end
+
+        -- Strict fixed-anchor pickup radius. If position cannot be resolved,
+        -- do not chase the object; this is safer than flying to an unknown root.
+        if include
+            and anchorPosition
+            and radius
+            and radius > 0
+        then
+            if not dropCFrame then
+                include = false
+            else
+                include =
+                    (
+                        dropCFrame.Position
+                        - anchorPosition
+                    ).Magnitude
+                    <= radius
+            end
+        end
+
+        -- Actual Cell pickup allowlist. Reward-wave counting passes nil here,
+        -- so lower rarities still participate in spawn-stability detection but
+        -- are intentionally never added to the pickup queue.
+        if include
+            and type(allowedRarities) == "table"
+        then
+            local rarityInfo = F.getDropRarity(drop)
+            local rarityKey =
+                rarityInfo
+                and rarityInfo.Key
+                or "unknown"
+
+            include =
+                allowedRarities[rarityKey]
+                == true
+        end
+
+        if include then
+            seen[drop] = true
+            table.insert(result, drop)
+        end
+    end)
 
     return result
 end
 
 function F.captureCellDropSnapshot()
-    local snapshot = {}
+    local snapshot = setmetatable({}, {__mode = "k"})
 
-    for _, folder in ipairs(
-        F.getCellDropFolders()
-    ) do
-        for _, drop in ipairs(
-            F.collectDropObjects(folder)
-        ) do
-            snapshot[drop] = true
-        end
-    end
+    F.forEachCellDrop(function(drop)
+        snapshot[drop] = true
+    end)
 
     return snapshot
 end
@@ -25963,7 +26015,7 @@ function F.handleCellBossPlayerAvoidance(
     return true
 end
 
--- v6.6.3: Cell combat is transactional. Once boss defeat/reward evidence is
+-- v6.6.4: Cell combat is transactional. Once boss defeat/reward evidence is
 -- accepted, every Hub-owned attack path must stay OFF until a later fight
 -- explicitly re-enables it via prepareCellFight(). The original pre-Cell user
 -- settings are preserved in State.cellFarm.restore and restored when Cell Farm stops.
@@ -28689,16 +28741,40 @@ function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapsho
 end
 
 function F.collectCellBossLoot(token, beforeSnapshot)
-    F.setCellFarmStage(
-        "LOOT RESCAN",
-        "Finding every post-chest drop before Bundle/Sell"
-    )
-
     F.stopMovementFlight("MONSTER_LOCK")
     F.releaseMovement("MONSTER_LOCK")
     F.stopLootLock("CELL")
 
     task.wait(0.25)
+
+    local anchorRoot = F.getCharacterRoot()
+    local lootAnchorPosition =
+        anchorRoot
+        and anchorRoot.Position
+        or nil
+
+    State.cellFarm.rewardLootAnchorPosition =
+        lootAnchorPosition
+
+    State.cellFarm.rewardLootRadius =
+        Config.CELL_REWARD_LOOT_NEARBY_RADIUS
+
+    State.cellFarm.rewardLootEligible = 0
+    if not lootAnchorPosition then
+        F.setCellFarmStage(
+            "LOOT HOLD",
+            "Cannot establish nearby-loot anchor - movement blocked"
+        )
+
+        return 0, false
+    end
+
+    F.setCellFarmStage(
+        "LOOT FILTER",
+        "Legendary/Mythic only | fixed "
+            .. tostring(Config.CELL_REWARD_LOOT_NEARBY_RADIUS)
+            .. " stud radius"
+    )
 
     local collected = 0
     local quietSince = nil
@@ -28707,8 +28783,14 @@ function F.collectCellBossLoot(token, beforeSnapshot)
     while F.isCellFarmActive(token) do
         local candidates =
             F.collectCellLootCandidates(
-                beforeSnapshot
+                beforeSnapshot,
+                lootAnchorPosition,
+                Config.CELL_REWARD_LOOT_NEARBY_RADIUS,
+                Config.CELL_REWARD_LOOT_RARITIES
             )
+
+        State.cellFarm.rewardLootEligible =
+            #candidates
 
         table.sort(
             candidates,
@@ -28763,7 +28845,7 @@ function F.collectCellBossLoot(token, beforeSnapshot)
 
             F.setCellFarmStage(
                 "LOOT RESCAN",
-                "No remaining drops | quiet "
+                "No nearby Legendary/Mythic remaining | quiet "
                     .. string.format(
                         "%.1f",
                         quietFor
@@ -30043,16 +30125,18 @@ function F.runCellFarm(token, resumed)
     if not lootComplete then
         F.setCellFarmStage(
             "LOOT INCOMPLETE",
-            "Known post-chest drops remain - Bundle/Sell/Hop blocked"
+            "Nearby Legendary/Mythic pickup queue incomplete - Bundle/Sell/Hop blocked"
         )
 
         return false
     end
 
     State.cellFarm.status =
-        "All post-chest loot collected: "
+        "Nearby Legendary/Mythic collected: "
         .. tostring(collectedLoot)
-        .. " item(s)"
+        .. " item(s) | radius "
+        .. tostring(Config.CELL_REWARD_LOOT_NEARBY_RADIUS)
+        .. " studs"
 
     F.setCellFarmStage(
         "LOOT SETTLE",
@@ -31615,7 +31699,7 @@ function F.forceCustomHealthDeath(monster, healthInfo)
 end
 
 function F.tryFinishMonster(monster)
-    -- v6.6.3: never execute finisher logic while Cell Farm is outside the
+    -- v6.6.4: never execute finisher logic while Cell Farm is outside the
     -- explicit boss-fight stage. This mirrors the weapon auto-attack gate.
     if State.cellFarm
         and State.cellFarm.enabled
@@ -32168,7 +32252,7 @@ function F.fireEquippedWeapon()
         return
     end
 
-    -- v6.6.3 safety gate. Cell Farm may enable weapon attack for the boss,
+    -- v6.6.4 safety gate. Cell Farm may enable weapon attack for the boss,
     -- but no attack remote may be sent during reward-chest, loot, bundle, sell,
     -- hop, recovery, or other non-fight stages.
     if State.cellFarm
@@ -34408,7 +34492,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics (FPS untouched) / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("The Veil Hub v6.6.3: Cell reward attack stop (weapon + finisher) / performance-safe Auto Chest / cached loot / throttled scheduler")
+print("The Veil Hub v6.6.4: Cell nearby Legendary/Mythic reward loot / reward attack stop / performance-safe Auto Chest / throttled scheduler")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -34424,7 +34508,7 @@ print("==========================================")
 if type(writefile) == "function" then
     local saved, saveError = pcall(
         writefile,
-        "TheVeilHub_v6_6_3_Runtime.lua",
+        "TheVeilHub_v6_6_4_Runtime.lua",
         runtimeSource
     )
 
@@ -34434,19 +34518,19 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.6.3.")
+    warn("[The Veil Hub] loadstring is required to launch v6.6.4.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.6.3 compile failed:", compileError)
+    warn("[The Veil Hub] v6.6.4 compile failed:", compileError)
     return
 end
 
 local launched, runtimeError = pcall(chunk)
 
 if not launched then
-    warn("[The Veil Hub] v6.6.3 runtime failed:", runtimeError)
+    warn("[The Veil Hub] v6.6.4 runtime failed:", runtimeError)
 end
