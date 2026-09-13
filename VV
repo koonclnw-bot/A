@@ -1,10 +1,10 @@
--- The Veil Hub v6.6.4 Cell Nearby Legendary+Mythic Loot loader
+-- The Veil Hub v6.6.5 Cell Reward Multi-Anchor Loot Guard loader
 -- Keeps a clean local runtime copy for teleport resume, then executes it.
 local runtimeSource = [==============[
 
 -- =========================================================
 -- THE VEIL HUB
--- v6.6.4: Cell reward loot is fixed-anchor nearby only (40 studs) and collects Legendary/Mythic only; reward attack stop remains enforced.
+-- v6.6.5: Cell reward loot uses every opened reward chest as a fixed nearby anchor, collects Legendary/Mythic only, and blocks hop while eligible chest loot remains.
 -- Cleaned from a corrupted multi-version export.
 -- Sidebar UI + Collapse + ESP
 --
@@ -426,8 +426,8 @@ local Config = {
     CELL_MENU_PROTOCOL_ATTEMPTS = 5,
     CELL_MENU_PROTOCOL_INTERVAL = 1.35,
     CELL_WEAPON_WAIT_TIMEOUT = 12,
-    CELL_RUNTIME_FILE = "TheVeilHub_v6_6_4_Runtime.lua",
-    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_6_4_CellResume.flag",
+    CELL_RUNTIME_FILE = "TheVeilHub_v6_6_5_Runtime.lua",
+    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_6_5_CellResume.flag",
     CELL_DEFAULT_FIGHT_HEIGHT = 20,
     CELL_DEFAULT_TRAVEL_SPEED = 2.0,
 
@@ -450,7 +450,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.6.4 Cell Nearby Legendary+Mythic Loot",
+    HUB_VERSION = "v6.6.5 Cell Reward Multi-Anchor Loot Guard",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -997,6 +997,8 @@ local State = {
         rewardDropWaves = 0,
         rewardDropCount = 0,
         rewardLootAnchorPosition = nil,
+        rewardLootAnchors = {},
+        rewardLootAnchorCount = 0,
         rewardLootRadius = Config.CELL_REWARD_LOOT_NEARBY_RADIUS,
         rewardLootEligible = 0,
         lootMoveTarget = "None",
@@ -25183,6 +25185,104 @@ function F.forEachCellDrop(callback)
     return "fallback"
 end
 
+-- v6.6.5 reward-loot anchor registry. Each successfully opened Cell reward
+-- chest contributes one fixed world-space anchor. This prevents the pickup
+-- route from chaining away from the reward area while still covering loot from
+-- earlier chests after the character has moved to later chests.
+function F.addCellRewardLootAnchor(position)
+    if typeof(position) ~= "Vector3" then
+        return false
+    end
+
+    local anchors =
+        State.cellFarm.rewardLootAnchors
+
+    if type(anchors) ~= "table" then
+        anchors = {}
+        State.cellFarm.rewardLootAnchors =
+            anchors
+    end
+
+    for _, existing in ipairs(anchors) do
+        if typeof(existing) == "Vector3"
+            and (
+                existing
+                - position
+            ).Magnitude <= 1.5
+        then
+            return false
+        end
+    end
+
+    table.insert(
+        anchors,
+        position
+    )
+
+    State.cellFarm.rewardLootAnchorCount =
+        #anchors
+
+    if not State.cellFarm.rewardLootAnchorPosition then
+        State.cellFarm.rewardLootAnchorPosition =
+            position
+    end
+
+    return true
+end
+
+function F.isCellDropWithinLootAnchors(
+    dropPosition,
+    anchorSource,
+    radius
+)
+    if typeof(dropPosition) ~= "Vector3" then
+        return false
+    end
+
+    radius =
+        tonumber(radius)
+        or Config.CELL_REWARD_LOOT_NEARBY_RADIUS
+
+    if radius <= 0 then
+        return false
+    end
+
+    if typeof(anchorSource) == "Vector3" then
+        return (
+            dropPosition
+            - anchorSource
+        ).Magnitude <= radius
+    end
+
+    if type(anchorSource) == "table" then
+        for _, anchor in ipairs(anchorSource) do
+            local anchorPosition =
+                nil
+
+            if typeof(anchor) == "Vector3" then
+                anchorPosition =
+                    anchor
+            elseif type(anchor) == "table"
+                and typeof(anchor.Position) == "Vector3"
+            then
+                anchorPosition =
+                    anchor.Position
+            end
+
+            if anchorPosition
+                and (
+                    dropPosition
+                    - anchorPosition
+                ).Magnitude <= radius
+            then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
 -- Optional collection filters are deliberately separate from reward-wave
 -- detection. Calls without anchor/radius/rarity arguments still observe every
 -- post-snapshot reward drop, which keeps chest-open confirmation reliable.
@@ -25222,8 +25322,9 @@ function F.collectCellLootCandidates(
                 <= Config.CELL_DROP_RADIUS
         end
 
-        -- Strict fixed-anchor pickup radius. If position cannot be resolved,
-        -- do not chase the object; this is safer than flying to an unknown root.
+        -- Strict reward-anchor pickup radius. anchorPosition may be one Vector3
+        -- for compatibility or a table containing every successfully opened
+        -- reward-chest position. Unknown positions are never chased.
         if include
             and anchorPosition
             and radius
@@ -25233,11 +25334,11 @@ function F.collectCellLootCandidates(
                 include = false
             else
                 include =
-                    (
-                        dropCFrame.Position
-                        - anchorPosition
-                    ).Magnitude
-                    <= radius
+                    F.isCellDropWithinLootAnchors(
+                        dropCFrame.Position,
+                        anchorPosition,
+                        radius
+                    )
             end
         end
 
@@ -26015,7 +26116,7 @@ function F.handleCellBossPlayerAvoidance(
     return true
 end
 
--- v6.6.4: Cell combat is transactional. Once boss defeat/reward evidence is
+-- v6.6.5: Cell combat is transactional. Once boss defeat/reward evidence is
 -- accepted, every Hub-owned attack path must stay OFF until a later fight
 -- explicitly re-enables it via prepareCellFight(). The original pre-Cell user
 -- settings are preserved in State.cellFarm.restore and restored when Cell Farm stops.
@@ -28447,6 +28548,9 @@ function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapsho
     State.lockedMonster = nil
     State.cellFarm.rewardChestsFound = 0
     State.cellFarm.rewardChestsOpened = 0
+    State.cellFarm.rewardLootAnchors = {}
+    State.cellFarm.rewardLootAnchorCount = 0
+    State.cellFarm.rewardLootAnchorPosition = nil
 
     F.setCellFarmStage(
         "WAITING REWARD CHESTS",
@@ -28628,6 +28732,11 @@ function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapsho
 
         if chest then
             if not opened[chest] then
+                local chestAnchorCFrame =
+                    F.getDropCFrame(
+                        chest
+                    )
+
                 local success =
                     F.openCellRewardChest(
                         chest,
@@ -28637,6 +28746,12 @@ function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapsho
 
                 if success then
                     opened[chest] = true
+
+                    if chestAnchorCFrame then
+                        F.addCellRewardLootAnchor(
+                            chestAnchorCFrame.Position
+                        )
+                    end
 
                     State.cellFarm.rewardChestsOpened =
                         State.cellFarm.rewardChestsOpened
@@ -28747,23 +28862,40 @@ function F.collectCellBossLoot(token, beforeSnapshot)
 
     task.wait(0.25)
 
-    local anchorRoot = F.getCharacterRoot()
-    local lootAnchorPosition =
-        anchorRoot
-        and anchorRoot.Position
-        or nil
+    local lootAnchors =
+        State.cellFarm.rewardLootAnchors
 
-    State.cellFarm.rewardLootAnchorPosition =
-        lootAnchorPosition
+    if type(lootAnchors) ~= "table" then
+        lootAnchors = {}
+        State.cellFarm.rewardLootAnchors =
+            lootAnchors
+    end
+
+    -- Compatibility fallback only. Normal v6.6.5 flow records one anchor for
+    -- every successfully opened reward chest before it disappears.
+    if #lootAnchors == 0 then
+        local anchorRoot =
+            F.getCharacterRoot()
+
+        if anchorRoot then
+            F.addCellRewardLootAnchor(
+                anchorRoot.Position
+            )
+
+            lootAnchors =
+                State.cellFarm.rewardLootAnchors
+        end
+    end
 
     State.cellFarm.rewardLootRadius =
         Config.CELL_REWARD_LOOT_NEARBY_RADIUS
 
     State.cellFarm.rewardLootEligible = 0
-    if not lootAnchorPosition then
+
+    if #lootAnchors == 0 then
         F.setCellFarmStage(
             "LOOT HOLD",
-            "Cannot establish nearby-loot anchor - movement blocked"
+            "No reward-chest loot anchors available - hop blocked"
         )
 
         return 0, false
@@ -28771,9 +28903,11 @@ function F.collectCellBossLoot(token, beforeSnapshot)
 
     F.setCellFarmStage(
         "LOOT FILTER",
-        "Legendary/Mythic only | fixed "
+        "Legendary/Mythic only | "
+            .. tostring(#lootAnchors)
+            .. " chest anchor(s) x "
             .. tostring(Config.CELL_REWARD_LOOT_NEARBY_RADIUS)
-            .. " stud radius"
+            .. " studs"
     )
 
     local collected = 0
@@ -28784,7 +28918,7 @@ function F.collectCellBossLoot(token, beforeSnapshot)
         local candidates =
             F.collectCellLootCandidates(
                 beforeSnapshot,
-                lootAnchorPosition,
+                lootAnchors,
                 Config.CELL_REWARD_LOOT_NEARBY_RADIUS,
                 Config.CELL_REWARD_LOOT_RARITIES
             )
@@ -28845,7 +28979,7 @@ function F.collectCellBossLoot(token, beforeSnapshot)
 
             F.setCellFarmStage(
                 "LOOT RESCAN",
-                "No nearby Legendary/Mythic remaining | quiet "
+                "No Legendary/Mythic near opened reward chests | quiet "
                     .. string.format(
                         "%.1f",
                         quietFor
@@ -30231,9 +30365,71 @@ function F.runCellFarm(token, resumed)
         return false
     end
 
+    -- v6.6.5 final anti-premature-hop guard. Rarity metadata or a delayed
+    -- reward layer can become visible after the first loot pass without
+    -- changing inventory state. Re-check every opened-chest anchor immediately
+    -- before allowing the server transition.
+    local finalEligible =
+        F.collectCellLootCandidates(
+            dropSnapshot,
+            State.cellFarm.rewardLootAnchors,
+            Config.CELL_REWARD_LOOT_NEARBY_RADIUS,
+            Config.CELL_REWARD_LOOT_RARITIES
+        )
+
+    if #finalEligible > 0 then
+        F.setCellFarmStage(
+            "LOOT FINAL GUARD",
+            tostring(#finalEligible)
+                .. " nearby Legendary/Mythic item(s) still present - returning to pickup"
+        )
+
+        local extraCollected,
+            extraComplete =
+                F.collectCellBossLoot(
+                    token,
+                    dropSnapshot
+                )
+
+        collectedLoot =
+            collectedLoot
+            + (tonumber(extraCollected) or 0)
+
+        if not F.isCellFarmActive(token) then
+            return false
+        end
+
+        if not extraComplete then
+            F.setCellFarmStage(
+                "LOOT FINAL GUARD",
+                "Eligible reward loot remains unresolved - hop blocked"
+            )
+
+            return false
+        end
+
+        finalEligible =
+            F.collectCellLootCandidates(
+                dropSnapshot,
+                State.cellFarm.rewardLootAnchors,
+                Config.CELL_REWARD_LOOT_NEARBY_RADIUS,
+                Config.CELL_REWARD_LOOT_RARITIES
+            )
+
+        if #finalEligible > 0 then
+            F.setCellFarmStage(
+                "LOOT FINAL GUARD",
+                tostring(#finalEligible)
+                    .. " eligible reward item(s) still present - hop blocked"
+            )
+
+            return false
+        end
+    end
+
     F.setCellFarmStage(
         "READY TO HOP",
-        "Loot, bundles, filtering and selling complete"
+        "Legendary/Mythic reward loot cleared near all opened chests; Bundle/Sell complete"
     )
 
     if not F.cellFarmWait(
@@ -30328,6 +30524,9 @@ function F.startCellFarm(resumed)
         State.cellFarm.rewardChestsFound = 0
         State.cellFarm.rewardChestsOpened = 0
         State.cellFarm.rewardChestRemoteCalls = 0
+        State.cellFarm.rewardLootAnchors = {}
+        State.cellFarm.rewardLootAnchorCount = 0
+        State.cellFarm.rewardLootAnchorPosition = nil
         State.cellFarm.rewardLastChestDebugId = "None"
         State.cellFarm.rewardDropWaves = 0
         State.cellFarm.rewardDropCount = 0
@@ -31699,7 +31898,7 @@ function F.forceCustomHealthDeath(monster, healthInfo)
 end
 
 function F.tryFinishMonster(monster)
-    -- v6.6.4: never execute finisher logic while Cell Farm is outside the
+    -- v6.6.5: never execute finisher logic while Cell Farm is outside the
     -- explicit boss-fight stage. This mirrors the weapon auto-attack gate.
     if State.cellFarm
         and State.cellFarm.enabled
@@ -32252,7 +32451,7 @@ function F.fireEquippedWeapon()
         return
     end
 
-    -- v6.6.4 safety gate. Cell Farm may enable weapon attack for the boss,
+    -- v6.6.5 safety gate. Cell Farm may enable weapon attack for the boss,
     -- but no attack remote may be sent during reward-chest, loot, bundle, sell,
     -- hop, recovery, or other non-fight stages.
     if State.cellFarm
@@ -34492,7 +34691,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics (FPS untouched) / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("The Veil Hub v6.6.4: Cell nearby Legendary/Mythic reward loot / reward attack stop / performance-safe Auto Chest / throttled scheduler")
+print("The Veil Hub v6.6.5: Cell multi-anchor Legendary/Mythic reward loot / pre-hop loot guard / reward attack stop / performance-safe Auto Chest")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -34508,7 +34707,7 @@ print("==========================================")
 if type(writefile) == "function" then
     local saved, saveError = pcall(
         writefile,
-        "TheVeilHub_v6_6_4_Runtime.lua",
+        "TheVeilHub_v6_6_5_Runtime.lua",
         runtimeSource
     )
 
@@ -34518,19 +34717,19 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.6.4.")
+    warn("[The Veil Hub] loadstring is required to launch v6.6.5.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.6.4 compile failed:", compileError)
+    warn("[The Veil Hub] v6.6.5 compile failed:", compileError)
     return
 end
 
 local launched, runtimeError = pcall(chunk)
 
 if not launched then
-    warn("[The Veil Hub] v6.6.4 runtime failed:", runtimeError)
+    warn("[The Veil Hub] v6.6.5 runtime failed:", runtimeError)
 end
