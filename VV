@@ -1,10 +1,10 @@
--- The Veil Hub v6.6.17 Cell Boss Monster Lock Stability loader
+-- The Veil Hub v6.6.18 Pale Chest ESP + Pale-Only Auto Chest loader
 -- Keeps a clean local runtime copy for teleport resume, then executes it.
 local runtimeSource = [==============[
 
 -- =========================================================
 -- THE VEIL HUB
--- v6.6.17: Cell boss stability release. The Cell Of Life is permanently excluded from Universal Finisher; Cell combat uses Weapon Auto Attack only. Monster Lock keeps the live Cell target through transient health/filter glitches, raw-model reacquisition bypasses generic monster filters, and boss death requires server defeat evidence or a short stable confirmation instead of one HP=0 sample. Preserves target-loot, pre/post-sell guards, fail-safe lifecycle cleanup, fast boss engage, selectable Same Server / Server Hop, DIRECT custom-IY bridge, nil-parent reward-chest support, and performance-safe reward discovery.
+-- v6.6.18: Pale chest release. General Auto Chest is hard-filtered to chest candidates spatially inside workspace.Map.Maze["PALE AREAS"], rejects Chestplate false positives, and validates LocalPlayer.CurrentArea contains "Pale" again before OpenChest. Adds lightweight Highlight/Billboard Pale Chest ESP using the same eligibility filter. Preserves v6.6.17 Cell boss Monster Lock stability, permanent NO-FINISHER policy for The Cell Of Life, target-loot pre/post-sell guards, fail-safe lifecycle cleanup, selectable Same Server / Server Hop, and DIRECT custom-IY bridge.
 -- Cleaned from a corrupted multi-version export.
 -- Sidebar UI + Collapse + ESP
 --
@@ -151,6 +151,13 @@ local Config = {
     AUTO_CHEST_CONFIRM_TIMEOUT = 3.0,
     AUTO_CHEST_RETRY_COOLDOWN = 12,
     AUTO_CHEST_DEFAULT_SPEED = 0.8,
+    -- v6.6.18: General Auto Chest is intentionally Pale-only. Candidate
+    -- positions are checked against streamed geometry under Map.Maze["PALE AREAS"],
+    -- then CurrentArea is confirmed again after arrival before OpenChest.
+    AUTO_CHEST_PALE_REGION_MARGIN = 12,
+    AUTO_CHEST_PALE_REGION_REFRESH = 8.0,
+    AUTO_CHEST_PALE_AREA_CONFIRM_TIMEOUT = 1.50,
+    AUTO_CHEST_ESP_REFRESH_INTERVAL = 1.00,
     -- Discovery is chunked and expensive ancestor checks are performed only
     -- for objects with cheap chest evidence. The watcher exists only while
     -- Auto Chest is enabled.
@@ -449,8 +456,8 @@ local Config = {
     CELL_MENU_PROTOCOL_ATTEMPTS = 5,
     CELL_MENU_PROTOCOL_INTERVAL = 1.35,
     CELL_WEAPON_WAIT_TIMEOUT = 12,
-    CELL_RUNTIME_FILE = "TheVeilHub_v6_6_17_Runtime.lua",
-    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_6_17_CellResume.flag",
+    CELL_RUNTIME_FILE = "TheVeilHub_v6_6_18_Runtime.lua",
+    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_6_18_CellResume.flag",
     CELL_DEFAULT_FIGHT_HEIGHT = 20,
     CELL_DEFAULT_TRAVEL_SPEED = 2.0,
 
@@ -473,7 +480,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.6.17 Cell Boss Monster Lock Stability",
+    HUB_VERSION = "v6.6.18 Pale Chest ESP + Pale-Only Auto Chest",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -1213,6 +1220,15 @@ local State = {
     chestFailedUntil = setmetatable({}, {__mode = "k"}),
     chestConnections = {},
     chestWatcherEnabled = false,
+    chestESPEnabled = false,
+    chestESPObjects = setmetatable({}, {__mode = "k"}),
+    chestESPFolder = nil,
+    chestESPToggle = nil,
+    chestPaleRegions = {},
+    chestPaleRegionPartCount = 0,
+    chestPaleRegionBuiltAt = 0,
+    chestPaleRegionSource = "Not scanned",
+    chestLastArea = "Unknown",
     chestScanRunning = false,
     chestScanToken = 0,
     chestScanInspected = 0,
@@ -5125,8 +5141,15 @@ do
     State.chestToggle = F.createToggle(
         chestSection,
         "Auto Chest",
-        "Find the nearest chest, open it, then collect newly spawned loot around that chest before continuing.",
+        "Pale-only: find the nearest eligible chest inside The Pale, open it, then collect newly spawned loot around that chest. Chestplate is explicitly excluded.",
         false
+    )
+
+    State.chestESPToggle = F.createToggle(
+        chestSection,
+        "The Pale Chest ESP",
+        "Highlights only unopened chest candidates that pass the same Pale-only Auto Chest filter. Chestplate is excluded.",
+        State.chestESPEnabled
     )
 
     State.chestSpeedSlider = F.createSlider(
@@ -16399,6 +16422,8 @@ function F.captureProfileSettings()
         },
         Chest = {
             enabled = State.chestEnabled,
+            esp = State.chestESPEnabled == true,
+            paleOnly = true,
             speed = F.getMovementBaseScale("Chest"),
         },
         Combat = {
@@ -16581,6 +16606,7 @@ function F.applyProfileSettings(profile)
     end
     State.sellBeforeHop = sell.beforeHop ~= false
     State.chestEnabled = chest.enabled == true
+    State.chestESPEnabled = chest.esp == true
     State.chestStatus = State.chestEnabled and "Ready" or "OFF"
     State.movementSpeeds.Chest = math.clamp(
         tonumber(chest.speed) or Config.AUTO_CHEST_DEFAULT_SPEED,
@@ -16625,6 +16651,22 @@ function F.applyProfileSettings(profile)
     F.applyFarmConfigToUI()
     F.setAntiAFKEnabled(State.antiAFK.enabled)
     F.bindMovementSafety()
+
+    if F.syncAutoChestWatcher then
+        F.syncAutoChestWatcher()
+    end
+
+    if State.chestEnabled or State.chestESPEnabled then
+        task.defer(function()
+            F.runBoundary(
+                "ProfilePaleChestRefresh",
+                F.rebuildAutoChestCache
+            )
+        end)
+    elseif F.clearPaleChestESP then
+        F.clearPaleChestESP()
+    end
+
     F.updateChestStatus()
     F.refreshMovementControlUI()
     F.updateWaypointStatus()
@@ -17643,6 +17685,7 @@ function F.loadFarmConfig()
         decoded.neverSell = sell.neverSell
         decoded.sellBeforeHop = sell.beforeHop
         decoded.chestEnabled = chest.enabled
+        decoded.chestESPEnabled = chest.esp
         decoded.chestSpeed = chest.speed
         decoded.monsterLockEnabled = combat.monsterLock
         decoded.monsterLockHeight = combat.height
@@ -17960,6 +18003,9 @@ function F.loadFarmConfig()
     State.chestEnabled =
         decoded.chestEnabled == true
 
+    State.chestESPEnabled =
+        decoded.chestESPEnabled == true
+
     State.chestStatus =
         State.chestEnabled
         and "Ready"
@@ -18184,6 +18230,12 @@ function F.applyFarmConfigToUI()
     if State.chestToggle then
         State.chestToggle:SetSilent(
             State.chestEnabled
+        )
+    end
+
+    if State.chestESPToggle then
+        State.chestESPToggle:SetSilent(
+            State.chestESPEnabled
         )
     end
 
@@ -29249,9 +29301,439 @@ end
 -- a ClickDetector or an "Open" prompt is not treated as a chest.
 -- =========================================================
 
+function F.normalizeAutoChestAreaName(value)
+    return string.lower(
+        F.trimText(value)
+    ):gsub("[%s_%-]+", " ")
+end
+
+function F.isPaleAreaName(value)
+    local normalized =
+        F.normalizeAutoChestAreaName(value)
+
+    if normalized == "" then
+        return false
+    end
+
+    return normalized == "pale"
+        or normalized == "the pale"
+        or normalized == "pale beyond"
+        or normalized == "the pale beyond"
+        or string.find(normalized, "pale", 1, true) ~= nil
+end
+
+function F.getCurrentAreaName()
+    local currentArea = nil
+    pcall(function()
+        currentArea = LocalPlayer:GetAttribute("CurrentArea")
+    end)
+
+    local textValue =
+        currentArea ~= nil
+        and tostring(currentArea)
+        or "Unknown"
+
+    State.chestLastArea = textValue
+    return textValue
+end
+
+function F.isCurrentAreaPale()
+    local area = F.getCurrentAreaName()
+    return F.isPaleAreaName(area), area
+end
+
+function F.getPaleAreaRoot()
+    local map = workspace:FindFirstChild("Map")
+    local maze = map and map:FindFirstChild("Maze")
+    return maze and maze:FindFirstChild("PALE AREAS") or nil
+end
+
+function F.rebuildPaleChestRegions(force)
+    local now = os.clock()
+
+    if force ~= true
+        and #State.chestPaleRegions > 0
+        and now - (State.chestPaleRegionBuiltAt or 0)
+            < Config.AUTO_CHEST_PALE_REGION_REFRESH
+    then
+        return true
+    end
+
+    local paleRoot = F.getPaleAreaRoot()
+    State.chestPaleRegions = {}
+    State.chestPaleRegionPartCount = 0
+    State.chestPaleRegionBuiltAt = now
+
+    if not paleRoot or not paleRoot.Parent then
+        State.chestPaleRegionSource = 'Map.Maze["PALE AREAS"] unavailable'
+        return false
+    end
+
+    local regions = {}
+    local partCount = 0
+
+    local function buildRegion(container, label)
+        local minX = math.huge
+        local minZ = math.huge
+        local maxX = -math.huge
+        local maxZ = -math.huge
+        local count = 0
+
+        local function includePart(part)
+            if not part or not part:IsA("BasePart") then
+                return
+            end
+
+            local xHalf, _, zHalf = F.getPartWorldHalfExtents(part)
+            minX = math.min(minX, part.Position.X - xHalf)
+            maxX = math.max(maxX, part.Position.X + xHalf)
+            minZ = math.min(minZ, part.Position.Z - zHalf)
+            maxZ = math.max(maxZ, part.Position.Z + zHalf)
+            count = count + 1
+        end
+
+        if container:IsA("BasePart") then
+            includePart(container)
+        end
+
+        for _, object in ipairs(container:GetDescendants()) do
+            if object:IsA("BasePart") then
+                includePart(object)
+            end
+        end
+
+        if count <= 0 then
+            return
+        end
+
+        partCount = partCount + count
+        table.insert(regions, {
+            minX = minX,
+            maxX = maxX,
+            minZ = minZ,
+            maxZ = maxZ,
+            name = tostring(label or container.Name),
+        })
+    end
+
+    for _, child in ipairs(paleRoot:GetChildren()) do
+        buildRegion(child, child.Name)
+    end
+
+    if #regions == 0 then
+        buildRegion(paleRoot, paleRoot.Name)
+    end
+
+    State.chestPaleRegions = regions
+    State.chestPaleRegionPartCount = partCount
+    State.chestPaleRegionSource =
+        #regions > 0
+        and (tostring(#regions) .. " streamed Pale region(s)")
+        or "Pale geometry has no streamed BaseParts"
+
+    return #regions > 0
+end
+
+function F.isPositionInPaleChestRegion(position)
+    if typeof(position) ~= "Vector3" then
+        return false
+    end
+
+    F.rebuildPaleChestRegions(false)
+
+    local margin = math.max(
+        0,
+        tonumber(Config.AUTO_CHEST_PALE_REGION_MARGIN) or 0
+    )
+
+    for _, region in ipairs(State.chestPaleRegions) do
+        if position.X >= region.minX - margin
+            and position.X <= region.maxX + margin
+            and position.Z >= region.minZ - margin
+            and position.Z <= region.maxZ + margin
+        then
+            return true, region.name
+        end
+    end
+
+    return false
+end
+
+function F.isChestplateLikeInstance(object)
+    local current = object
+
+    for _ = 1, 7 do
+        if typeof(current) ~= "Instance" or current == workspace then
+            break
+        end
+
+        local lowered = string.lower(tostring(current.Name or ""))
+        if string.find(lowered, "chestplate", 1, true)
+            or string.find(lowered, "chest plate", 1, true)
+        then
+            return true
+        end
+
+        current = current.Parent
+    end
+
+    return false
+end
+
+function F.isPaleAutoChest(chest)
+    if typeof(chest) ~= "Instance"
+        or not chest.Parent
+        or not chest:IsDescendantOf(workspace)
+        or F.isChestplateLikeInstance(chest)
+    then
+        return false
+    end
+
+    local chestCFrame = F.getDropCFrame(chest)
+    if not chestCFrame then
+        return false
+    end
+
+    local inside = F.isPositionInPaleChestRegion(chestCFrame.Position)
+    return inside == true
+end
+
+function F.getPaleChestESPPart(chest)
+    if typeof(chest) ~= "Instance" or not chest.Parent then
+        return nil
+    end
+
+    if chest:IsA("BasePart") then
+        return chest
+    end
+
+    if chest:IsA("Model") and chest.PrimaryPart then
+        return chest.PrimaryPart
+    end
+
+    return chest:FindFirstChildWhichIsA("BasePart", true)
+end
+
+function F.removePaleChestESP(chest)
+    local record = State.chestESPObjects[chest]
+    if not record then
+        return false
+    end
+
+    State.chestESPObjects[chest] = nil
+
+    if record.connection then
+        pcall(function()
+            record.connection:Disconnect()
+        end)
+    end
+
+    if record.highlight then
+        pcall(function()
+            record.highlight:Destroy()
+        end)
+    end
+
+    if record.billboard then
+        pcall(function()
+            record.billboard:Destroy()
+        end)
+    end
+
+    return true
+end
+
+function F.clearPaleChestESP()
+    local targets = {}
+    for chest in pairs(State.chestESPObjects) do
+        table.insert(targets, chest)
+    end
+
+    for _, chest in ipairs(targets) do
+        F.removePaleChestESP(chest)
+    end
+
+    if State.chestESPFolder then
+        pcall(function()
+            State.chestESPFolder:Destroy()
+        end)
+        State.chestESPFolder = nil
+    end
+
+    return true
+end
+
+function F.ensurePaleChestESPFolder()
+    local folder = State.chestESPFolder
+    if folder and folder.Parent then
+        return folder
+    end
+
+    folder = Instance.new("Folder")
+    folder.Name = "__TheVeil_PaleChestESP"
+
+    local parentOk = pcall(function()
+        folder.Parent = CoreGui
+    end)
+
+    if not parentOk then
+        pcall(function()
+            folder.Parent = LocalPlayer:WaitForChild("PlayerGui", 2)
+        end)
+    end
+
+    State.chestESPFolder = folder
+    return folder
+end
+
+function F.ensurePaleChestESP(chest)
+    if not State.chestESPEnabled or not F.isAutoChestUsable(chest) then
+        F.removePaleChestESP(chest)
+        return false
+    end
+
+    local current = State.chestESPObjects[chest]
+    if current and current.highlight and current.highlight.Parent then
+        return true
+    end
+
+    F.removePaleChestESP(chest)
+
+    local part = F.getPaleChestESPPart(chest)
+    if not part then
+        return false
+    end
+
+    local folder = F.ensurePaleChestESPFolder()
+    if not folder or not folder.Parent then
+        return false
+    end
+
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "PaleChestHighlight"
+    highlight.Adornee = chest:IsA("Model") and chest or part
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.FillTransparency = 0.82
+    highlight.OutlineTransparency = 0
+    highlight.FillColor = Color3.fromRGB(170, 215, 255)
+    highlight.OutlineColor = Color3.fromRGB(235, 248, 255)
+    highlight.Parent = folder
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "PaleChestBillboard"
+    billboard.Adornee = part
+    billboard.AlwaysOnTop = true
+    billboard.LightInfluence = 0
+    billboard.MaxDistance = 2500
+    billboard.Size = UDim2.fromOffset(190, 36)
+    billboard.StudsOffsetWorldSpace = Vector3.new(0, 3.25, 0)
+    billboard.Parent = folder
+
+    local label = Instance.new("TextLabel")
+    label.BackgroundTransparency = 1
+    label.Size = UDim2.fromScale(1, 1)
+    label.Font = Enum.Font.Code
+    label.TextSize = 14
+    label.TextStrokeTransparency = 0.25
+    label.TextColor3 = Color3.fromRGB(235, 248, 255)
+    label.Text = "THE PALE CHEST"
+    label.Parent = billboard
+
+    local record = {
+        highlight = highlight,
+        billboard = billboard,
+        connection = nil,
+    }
+
+    record.connection = chest.AncestryChanged:Connect(function()
+        if not chest.Parent or not chest:IsDescendantOf(workspace) then
+            F.removePaleChestESP(chest)
+        end
+    end)
+
+    State.chestESPObjects[chest] = record
+    return true
+end
+
+function F.refreshPaleChestESP()
+    if not State.chestESPEnabled then
+        return F.clearPaleChestESP()
+    end
+
+    local stale = {}
+    for chest in pairs(State.chestESPObjects) do
+        if not F.isAutoChestUsable(chest) then
+            table.insert(stale, chest)
+        end
+    end
+
+    for _, chest in ipairs(stale) do
+        F.removePaleChestESP(chest)
+    end
+
+    for chest in pairs(State.chestCache) do
+        if F.isAutoChestUsable(chest) then
+            F.ensurePaleChestESP(chest)
+        end
+    end
+
+    return true
+end
+
+function F.syncAutoChestWatcher()
+    return F.setAutoChestWatcherEnabled(
+        State.chestEnabled or State.chestESPEnabled
+    )
+end
+
+function F.setPaleChestESPEnabled(enabled)
+    State.chestESPEnabled = enabled == true
+
+    if State.chestESPEnabled then
+        F.syncAutoChestWatcher()
+        task.defer(function()
+            F.runBoundary("PaleChestESPScan", F.rebuildAutoChestCache)
+        end)
+    else
+        F.clearPaleChestESP()
+        F.syncAutoChestWatcher()
+    end
+
+    F.markConfigDirty()
+    F.updateChestStatus()
+    return true
+end
+
+function F.waitForPaleAreaAtChest(token)
+    local deadline = os.clock() + math.max(
+        0.2,
+        tonumber(Config.AUTO_CHEST_PALE_AREA_CONFIRM_TIMEOUT) or 1.5
+    )
+    local lastArea = "Unknown"
+
+    while F.isAutoChestTokenActive(token) and os.clock() < deadline do
+        local inPale, area = F.isCurrentAreaPale()
+        lastArea = tostring(area or lastArea)
+        if inPale then
+            return true, lastArea
+        end
+        task.wait(0.10)
+    end
+
+    return false, lastArea
+end
+
 function F.autoChestTextMatches(value)
     local lowered = string.lower(F.trimText(value))
     if lowered == "" then
+        return false
+    end
+
+    -- v6.6.18: Chestplate was a real false positive because the previous
+    -- detector used a raw substring match for "chest".
+    if string.find(lowered, "chestplate", 1, true)
+        or string.find(lowered, "chest plate", 1, true)
+    then
         return false
     end
 
@@ -29330,6 +29812,7 @@ function F.getAutoChestRoot(object)
     if typeof(object) ~= "Instance"
         or not object.Parent
         or not object:IsDescendantOf(workspace)
+        or F.isChestplateLikeInstance(object)
     then
         return nil
     end
@@ -29370,6 +29853,12 @@ function F.isAutoChestUsable(chest)
         return false
     end
 
+    if F.isChestplateLikeInstance(chest)
+        or not F.isPaleAutoChest(chest)
+    then
+        return false
+    end
+
     if F.isCellRewardChestOpened(chest) then
         State.chestOpenedCache[chest] = true
         return false
@@ -29379,7 +29868,10 @@ function F.isAutoChestUsable(chest)
 end
 
 function F.isAutoChestFastSignal(object)
-    if typeof(object) ~= "Instance" or not object.Parent then
+    if typeof(object) ~= "Instance"
+        or not object.Parent
+        or F.isChestplateLikeInstance(object)
+    then
         return false
     end
 
@@ -29413,12 +29905,19 @@ function F.considerAutoChestObject(object, force)
     local chest = F.getAutoChestRoot(object)
     if chest and F.isAutoChestUsable(chest) then
         State.chestCache[chest] = true
+
+        if State.chestESPEnabled then
+            F.ensurePaleChestESP(chest)
+        end
+
         return chest
     end
     return nil
 end
 
 function F.rebuildAutoChestCache()
+    F.rebuildPaleChestRegions(true)
+
     State.chestScanToken = (State.chestScanToken or 0) + 1
     local scanToken = State.chestScanToken
     State.chestScanRunning = true
@@ -29454,7 +29953,12 @@ function F.rebuildAutoChestCache()
     end
 
     State.chestScanRunning = false
-    State.chestStatus = "Scan complete"
+    State.chestStatus = "Pale scan complete"
+
+    if State.chestESPEnabled then
+        F.refreshPaleChestESP()
+    end
+
     F.updateChestStatus()
     return F.countTableKeys(State.chestCache), previous, true
 end
@@ -29501,6 +30005,7 @@ function F.getNearestAutoChest()
     for chest in pairs(State.chestCache) do
         if not F.isAutoChestUsable(chest) then
             State.chestCache[chest] = nil
+            F.removePaleChestESP(chest)
         elseif now >= (State.chestFailedUntil[chest] or 0) then
             local chestCFrame = F.getDropCFrame(chest)
             if chestCFrame then
@@ -29531,6 +30036,11 @@ function F.updateChestStatus()
         .. " | Detected: " .. tostring(F.countTableKeys(State.chestCache))
         .. (State.chestScanRunning and (" | Scan: " .. tostring(State.chestScanInspected)) or "")
         .. " | Target: " .. currentName
+        .. " | Pale-only"
+        .. " | Area: " .. tostring(F.getCurrentAreaName())
+        .. " | Regions: " .. tostring(#State.chestPaleRegions)
+        .. "/" .. tostring(State.chestPaleRegionPartCount)
+        .. " | ESP: " .. (State.chestESPEnabled and "ON" or "OFF")
         .. " | Speed: " .. string.format("%.1fx", F.getMovementBaseScale("Chest"))
         .. " | Opened: " .. tostring(State.chestOpenedCount)
         .. " | Looted: " .. tostring(State.chestLootedCount)
@@ -29551,8 +30061,10 @@ function F.stopAutoChest(reason, preserveEnabled)
         State.chestEnabled = false
         State.chestScanToken = (State.chestScanToken or 0) + 1
         State.chestScanRunning = false
-        if F.setAutoChestWatcherEnabled then
-            F.setAutoChestWatcherEnabled(false)
+        if F.syncAutoChestWatcher then
+            F.syncAutoChestWatcher()
+        elseif F.setAutoChestWatcherEnabled then
+            F.setAutoChestWatcherEnabled(State.chestESPEnabled)
         end
         if State.chestToggle then
             State.chestToggle:SetSilent(false)
@@ -29880,7 +30392,22 @@ end
 
 function F.tryOpenAutoChest(chest, token)
     if not F.isAutoChestUsable(chest) then
-        return false, "Chest unavailable"
+        return false, "Chest unavailable / outside The Pale"
+    end
+
+    local paleConfirmed, currentArea =
+        F.waitForPaleAreaAtChest(token)
+
+    if not paleConfirmed then
+        return false,
+            "CurrentArea=" .. tostring(currentArea)
+            .. " (not The Pale) - OpenChest blocked"
+    end
+
+    -- Revalidate after movement/area confirmation so a stale cache entry cannot
+    -- bypass the Pale-only policy.
+    if not F.isAutoChestUsable(chest) then
+        return false, "Chest failed Pale revalidation"
     end
 
     local initialParent = chest.Parent
@@ -29957,6 +30484,17 @@ function F.runAutoChestStep(manual)
         return false
     end
 
+    local inPale, currentArea =
+        F.isCurrentAreaPale()
+
+    if not inPale then
+        State.chestStatus =
+            "Waiting for The Pale | CurrentArea="
+            .. tostring(currentArea)
+        F.updateChestStatus()
+        return false
+    end
+
     if State.serverHopBusy
         or State.sellBusy
         or State.farmBusy
@@ -30024,6 +30562,7 @@ function F.runAutoChestStep(manual)
         State.chestOpenedCount = State.chestOpenedCount + 1
         State.chestOpenedCache[chest] = true
         State.chestCache[chest] = nil
+        F.removePaleChestESP(chest)
         State.chestStatus = "Opened " .. tostring(chest.Name) .. " | scanning loot"
         F.recordDiagnosticEvent("AutoChest", State.chestStatus)
         F.updateChestStatus()
@@ -30073,6 +30612,8 @@ F.Controllers.AutoChest = {
     CollectOne = F.runAutoChestStep,
     CollectLoot = F.collectAutoChestLoot,
     CollectDrop = F.collectAutoChestDropConfirmed,
+    RefreshESP = F.refreshPaleChestESP,
+    SetESP = F.setPaleChestESPEnabled,
     Stop = F.stopAutoChest,
 }
 
@@ -36538,7 +37079,7 @@ State.chestToggle:OnChanged(function(enabled)
     State.chestStatus = enabled and "Scanning" or "OFF"
 
     if enabled then
-        F.setAutoChestWatcherEnabled(true)
+        F.syncAutoChestWatcher()
         task.defer(function()
             F.runBoundary("AutoChestScan", F.rebuildAutoChestCache)
         end)
@@ -36548,6 +37089,10 @@ State.chestToggle:OnChanged(function(enabled)
 
     F.markConfigDirty()
     F.updateChestStatus()
+end)
+
+State.chestESPToggle:OnChanged(function(enabled)
+    F.setPaleChestESPEnabled(enabled)
 end)
 
 State.chestSpeedSlider:OnChanged(function(value)
@@ -36937,6 +37482,12 @@ F.schedulerRegister("AutoChest", Config.AUTO_CHEST_INTERVAL, function()
     end
 end)
 
+F.schedulerRegister("PaleChestESP", Config.AUTO_CHEST_ESP_REFRESH_INTERVAL, function()
+    if State.chestESPEnabled then
+        F.runBoundary("PaleChestESP", F.refreshPaleChestESP)
+    end
+end)
+
 F.schedulerRegister("AutoSellCapacity", Config.AUTO_SELL_CHECK_INTERVAL, function()
     if State.sellEnabled
         and State.worldReady
@@ -37159,6 +37710,7 @@ function F.shutdown()
     pcall(F.releaseMovement, State.movement.owner)
     pcall(F.stopAntiAFK, true)
     pcall(F.stopAutoChest, "Hub shutdown")
+    pcall(F.clearPaleChestESP)
     pcall(F.disconnectConnections, State.movementSafety.connections)
     pcall(F.disconnectConnections, State.chestConnections)
     pcall(F.disconnectConnections, State.dropCacheConnections)
@@ -37283,8 +37835,8 @@ State.serversVisitedCount =
 F.applyFarmConfigToUI()
 F.setAntiAFKEnabled(State.antiAFK.enabled)
 F.bindMovementSafety()
-if State.chestEnabled then
-    F.setAutoChestWatcherEnabled(true)
+if State.chestEnabled or State.chestESPEnabled then
+    F.syncAutoChestWatcher()
     task.defer(function()
         F.runBoundary("AutoChestInitialScan", F.rebuildAutoChestCache)
     end)
@@ -37399,7 +37951,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics (FPS untouched) / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("The Veil Hub v6.6.17: Cell Monster Lock stability / NO FINISHER on The Cell Of Life / confirmed boss death / exact-name Cell Loot targets / PRE-SELL + POST-SELL guards / selectable SAME-SERVER or SERVER-HOP / DIRECT custom-IY bridge")
+print("The Veil Hub v6.6.18: PALE-ONLY Auto Chest / Pale Chest ESP / Chestplate excluded / Cell Monster Lock stability / NO FINISHER on The Cell Of Life / target-loot guards / selectable SAME-SERVER or SERVER-HOP / DIRECT custom-IY bridge")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -37415,7 +37967,7 @@ print("==========================================")
 if type(writefile) == "function" then
     local saved, saveError = pcall(
         writefile,
-        "TheVeilHub_v6_6_17_Runtime.lua",
+        "TheVeilHub_v6_6_18_Runtime.lua",
         runtimeSource
     )
 
@@ -37425,19 +37977,19 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.6.17.")
+    warn("[The Veil Hub] loadstring is required to launch v6.6.18.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.6.17 compile failed:", compileError)
+    warn("[The Veil Hub] v6.6.18 compile failed:", compileError)
     return
 end
 
 local launched, runtimeError = pcall(chunk)
 
 if not launched then
-    warn("[The Veil Hub] v6.6.17 runtime failed:", runtimeError)
+    warn("[The Veil Hub] v6.6.18 runtime failed:", runtimeError)
 end
