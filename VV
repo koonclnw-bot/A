@@ -1,10 +1,10 @@
--- The Veil Hub v6.6.13 Cell Fast Boss Engage loader
+-- The Veil Hub v6.6.16 Target Loot + Pre-Sell Guard loader
 -- Keeps a clean local runtime copy for teleport resume, then executes it.
 local runtimeSource = [==============[
 
 -- =========================================================
 -- THE VEIL HUB
--- v6.6.13: Keeps selectable Same Server / Server Hop mode and the DIRECT custom-IY bridge, while adding immediate pre-fight Cell boss approach as soon as the boss model appears. Movement starts before HP/alive confirmation; attacks remain gated until the boss is alive and the weapon is equipped.
+-- v6.6.16: Release-audited Cell flow plus exact-name Cell Loot Targets. Target names are collected in addition to Legendary/Mythic, automatically protected from Cell selling, and guarded before Sell and again before Server Hop / next round. Keeps fail-safe lifecycle cleanup, exclusive combat quarantine, fast event-driven boss approach, selectable Same Server / Server Hop, DIRECT custom-IY bridge, nil-parent reward-chest support, and performance-safe reward discovery.
 -- Cleaned from a corrupted multi-version export.
 -- Sidebar UI + Collapse + ESP
 --
@@ -124,7 +124,7 @@ local Config = {
     MOVEMENT_LEASE_SECONDS = 0.75,
     RECOVERY_BASE_DELAY = 1,
     RECOVERY_MAX_DELAY = 30,
-    CONFIG_SCHEMA_VERSION = 13,
+    CONFIG_SCHEMA_VERSION = 14,
     AUTO_FARM_INTERVAL = 0.07,
     AUTO_SELL_CHECK_INTERVAL = 1.00,
     INVENTORY_MAX_CAPACITY = 150,
@@ -391,7 +391,7 @@ local Config = {
     CELL_DIALOG_CHECKPOINT_ONLY = false,
     CELL_DIALOG_CHECKPOINT_HEARTBEAT = 2.0,
 
-    -- v6.6.13: DIRECT bridge to the user's already-running CUSTOM Infinite Yield.
+    -- v6.6.16: DIRECT bridge to the user's already-running CUSTOM Infinite Yield.
     -- Preferred contract:
     --   getgenv().TheVeilIYBridge = {
     --       StartE = function() ... end,
@@ -422,7 +422,7 @@ local Config = {
     CELL_CRADLE_OPTION_RETRIES = 2,
     CELL_CRADLE_BOSS_MODEL_WAIT = 30.0,
     CELL_CRADLE_BOSS_ALIVE_WAIT = 10.0,
-    -- v6.6.13: move toward the Cell immediately when its model appears instead
+    -- v6.6.16: move toward the Cell immediately when its model appears instead
     -- of standing at The Cradle for the alive/HP confirmation window.
     CELL_BOSS_APPROACH_POLL = 0.03,
     CELL_BOSS_APPROACH_ARRIVAL_DISTANCE = 1.25,
@@ -444,8 +444,8 @@ local Config = {
     CELL_MENU_PROTOCOL_ATTEMPTS = 5,
     CELL_MENU_PROTOCOL_INTERVAL = 1.35,
     CELL_WEAPON_WAIT_TIMEOUT = 12,
-    CELL_RUNTIME_FILE = "TheVeilHub_v6_6_13_Runtime.lua",
-    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_6_13_CellResume.flag",
+    CELL_RUNTIME_FILE = "TheVeilHub_v6_6_16_Runtime.lua",
+    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_6_16_CellResume.flag",
     CELL_DEFAULT_FIGHT_HEIGHT = 20,
     CELL_DEFAULT_TRAVEL_SPEED = 2.0,
 
@@ -468,7 +468,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.6.13 Cell Fast Boss Engage",
+    HUB_VERSION = "v6.6.16 Target Loot Pre-Sell Guard",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -947,6 +947,8 @@ local State = {
         restore = nil,
         keepOrder = {"Shadowbeam Staff"},
         keepNames = {["shadowbeam staff"] = true},
+        lootNameOrder = {},
+        lootNames = {},
         selectedWeaponName = "",
         weaponStatus = "AUTO / not selected",
         menuPhase = "Unknown",
@@ -999,6 +1001,8 @@ local State = {
         cradleAutoKeyVirtualKey = nil,
         cradleAutoKeyCode = nil,
         cradleAutoKeyStopRequested = false,
+        cradleAutoKeyStopPending = false,
+        cradleAutoKeyStopAttempts = 0,
         cradleAutoKeyLastStopReason = "None",
         cradleAutoKeyLastAt = 0,
         cradleIYLoaded = false,
@@ -1021,15 +1025,21 @@ local State = {
         bossApproachActive = false,
         bossApproachToken = 0,
         bossApproachStatus = "Idle",
+        activeDialogObserver = nil,
+        activeBossWatcher = nil,
+        activeRewardObserver = nil,
+        activeRewardChestConnection = nil,
         fightHeight = Config.CELL_DEFAULT_FIGHT_HEIGHT,
         travelSpeed = Config.CELL_DEFAULT_TRAVEL_SPEED,
         serverHopEnabled = Config.CELL_SERVER_HOP_DEFAULT,
+        cellTeleportBootstrapQueuedJobId = "",
         runs = 0,
         kills = 0,
         lootCollected = 0,
         rewardChestsFound = 0,
         rewardChestsOpened = 0,
         rewardChestRemoteCalls = 0,
+        rewardChestItemNotifyEvidence = 0,
         rewardLastChestDebugId = "None",
         rewardDropWaves = 0,
         rewardDropCount = 0,
@@ -2382,6 +2392,22 @@ end
 
 State.runtime.ScreenGui = screenGui
 State.runtime.Stop = function()
+    -- Runtime replacement must tear down Cell-owned observers/tasks and make a
+    -- best-effort DIRECT-IY Stop() before the old runtime becomes inactive.
+    if F.cleanupCellTransientRuntime then
+        local ok, cleaned =
+            pcall(
+                F.cleanupCellTransientRuntime,
+                "Runtime replacement"
+            )
+
+        if not ok or cleaned == false then
+            warn(
+                "[The Veil Hub][CellFarm] Runtime replacement could not confirm DIRECT-IY Stop()."
+            )
+        end
+    end
+
     State.runtime.Active = false
     State.loopRunning = false
     State.farmEnabled = false
@@ -5742,14 +5768,14 @@ State.cellFarmSection = F.createSection(State.cellFarmBody)
 State.cellServerHopToggle = F.createToggle(
     State.cellFarmSection,
     "Cell Server Hop",
-    "OFF = keep farming in the current server. ON = after reward/loot/bundle/sell guards, hop to a new server and resume Cell Farm automatically. The selected policy also applies to world-readiness timeout and nearby-player avoidance.",
+    "OFF = keep farming in the current server. ON = after reward/loot/bundle/sell guards, hop to a new server and resume Cell Farm. IMPORTANT: Direct IY must auto-load/register its bridge again after teleport for Cradle automation to continue. The selected policy also applies to world-readiness timeout and nearby-player avoidance.",
     State.cellFarm.serverHopEnabled
 )
 
 State.cellFarmToggle = F.createToggle(
     State.cellFarmSection,
     "Full Auto The Cell Of Life",
-    "Physical sequence: reach The Cradle -> spam E until exact dialog is confirmed -> spam 1 until The Cell Of Life is observed/alive -> continue fight/reward flow.",
+    "Direct-IY sequence: reach The Cradle -> StartE() until the exact dialog is confirmed -> Stop() -> Start1() until The Cell Of Life appears -> Stop() -> immediate boss approach -> fight/reward flow.",
     false
 )
 
@@ -5773,6 +5799,51 @@ State.cellKeepInput = F.createAutocompleteTags(
             if cleaned ~= "" then
                 State.cellFarm.keepNames[string.lower(cleaned)] = true
             end
+        end
+
+        F.markConfigDirty()
+        if F.updateCellFarmUI then
+            F.updateCellFarmUI()
+        end
+    end
+)
+
+State.cellLootInput = F.createAutocompleteTags(
+    State.cellFarmSection,
+    "Cell Loot Names",
+    "Exact reward-drop names to collect in addition to Legendary/Mythic. Matching is case-insensitive. These named targets are also protected from Cell selling automatically.",
+    "Philosopher's Stone / item name / ...",
+    function(query)
+        if F.findItemSuggestion then
+            return F.findItemSuggestion(query)
+        end
+        return nil
+    end,
+    function(tags)
+        State.cellFarm.lootNameOrder = {}
+        State.cellFarm.lootNames = {}
+
+        for _, itemName in ipairs(
+            type(tags) == "table" and tags or {}
+        ) do
+            local cleaned = F.trimText(itemName)
+            if cleaned ~= "" then
+                local key = string.lower(cleaned)
+                if not State.cellFarm.lootNames[key] then
+                    State.cellFarm.lootNames[key] = true
+                    table.insert(
+                        State.cellFarm.lootNameOrder,
+                        cleaned
+                    )
+                end
+            end
+        end
+
+        if State.cellLootInput then
+            State.cellLootInput:SetTags(
+                State.cellFarm.lootNameOrder,
+                true
+            )
         end
 
         F.markConfigDirty()
@@ -5866,7 +5937,7 @@ State.cellHopButton,
 State.cellStopButton = F.createActionRow(
     State.cellFarmSection,
     "Cell Farm Control",
-    State.cellFarm.serverHopEnabled and "HOP NOW" or "SAME SERVER",
+    State.cellFarm.serverHopEnabled and "HOP AFTER RUN" or "SAME SERVER",
     "STOP NOW"
 )
 
@@ -5888,10 +5959,22 @@ State.cellServerHopToggle:OnChanged(function(state)
     State.cellFarm.serverHopEnabled = state == true
     F.markConfigDirty()
 
+    if state ~= true
+        and State.serverHopBusy
+        and F.notify
+    then
+        F.notify(
+            "Cell Farm",
+            "A teleport request is already in flight and cannot be cancelled. Same Server mode will take effect if that attempt fails or on the next Cell run.",
+            "warning",
+            5
+        )
+    end
+
     if State.cellHopButton then
         State.cellHopButton.Text =
             State.cellFarm.serverHopEnabled
-            and "HOP NOW"
+            and "HOP AFTER RUN"
             or "SAME SERVER"
     end
 
@@ -5990,7 +6073,7 @@ State.cellHopButton.MouseButton1Click:Connect(function()
     if not State.cellFarm.serverHopEnabled then
         F.notify(
             "Cell Farm",
-            "Same Server mode is active. Turn Cell Server Hop ON if you want to change servers.",
+            "Same Server mode is active. Turn Cell Server Hop ON to hop at the next safe Cell transition.",
             "info",
             3
         )
@@ -6000,21 +6083,27 @@ State.cellHopButton.MouseButton1Click:Connect(function()
     if not State.cellFarm.enabled then
         F.notify(
             "Cell Farm",
-            "Enable Full Auto The Cell Of Life first so Cell Farm can resume automatically after the hop.",
-            "warning",
+            "Server Hop mode is selected. Enable Full Auto The Cell Of Life to use it.",
+            "info",
             3
         )
         return
     end
 
-    task.spawn(function()
-        if F.cellFarmHop then
-            F.cellFarmHop(
-                State.cellFarm.token,
-                "Manual Cell Farm hop"
-            )
-        end
-    end)
+    -- Do not start a second hop coroutine beside the active Cell runner. Forced
+    -- mid-fight/reward hopping races movement, reward guards and delayed teleport
+    -- failures. The active runner owns the hop at its next policy-safe transition.
+    F.notify(
+        "Cell Farm",
+        "Server Hop mode is armed. The active Cell flow will hop from its next safe transition without bypassing reward/loot guards.",
+        "success",
+        4
+    )
+
+    F.recordDiagnosticEvent(
+        "CellFarm",
+        "HOP AFTER RUN confirmed; no concurrent manual hop coroutine started"
+    )
 end)
 
 State.cellStopButton.MouseButton1Click:Connect(function()
@@ -6785,7 +6874,7 @@ function F.pressVirtualKey(keyCode, fallbackVirtualKey, holdSeconds, actionName)
     return false
 end
 
--- v6.6.13 DIRECT custom-IY bridge for The Cradle.
+-- v6.6.16 DIRECT custom-IY bridge for The Cradle.
 --
 -- Synthetic keyboard events are intentionally not used here. The custom IY must expose
 -- the actual loop controls so the Hub can call them directly. Preferred contract:
@@ -7024,6 +7113,20 @@ local function registerCellIYBridge(bridge, source)
         State.cellFarm.cradleIYStatus =
             "DIRECT bridge registered: " .. descriptor.source
         State.cellFarm.cradleIYLastError = "None"
+
+        -- If a previous Stop() could not be delivered because the bridge was
+        -- missing, retry as soon as the bridge comes back instead of forgetting
+        -- a potentially-running external key loop.
+        if State.cellFarm.cradleAutoKeyStopPending
+            and F.stopCellCradleAutoKeyWithRetry
+        then
+            task.defer(function()
+                F.stopCellCradleAutoKeyWithRetry(
+                    "Bridge registered while Stop was pending",
+                    3
+                )
+            end)
+        end
     end
 
     return true
@@ -7087,6 +7190,7 @@ function F.releaseCellCradleAutoKey(reason)
 
     local wasActive =
         farm.cradleAutoKeyActive == true
+        or farm.cradleAutoKeyStopPending == true
 
     farm.cradleAutoKeyStopRequested = true
 
@@ -7098,6 +7202,10 @@ function F.releaseCellCradleAutoKey(reason)
         )
 
     if wasActive then
+        farm.cradleAutoKeyStopAttempts =
+            (farm.cradleAutoKeyStopAttempts or 0)
+            + 1
+
         local bridge =
             F.resolveCellCustomIYBridge(false)
 
@@ -7116,17 +7224,31 @@ function F.releaseCellCradleAutoKey(reason)
                     "DIRECT Stop() confirmed | "
                     .. tostring(reason or "Stopped")
                 farm.cradleIYLastError = "None"
+                farm.cradleAutoKeyActive = false
+                farm.cradleAutoKeyStopPending = false
             else
-                farm.cradleIYStatus = "DIRECT Stop() failed"
+                -- Never forget a possibly-running external loop. Keep it pending
+                -- so later cleanup/hop/stop calls can retry Stop().
+                farm.cradleIYStatus = "DIRECT Stop() failed - retry pending"
                 farm.cradleIYLastError = tostring(stopDetail)
+                farm.cradleAutoKeyActive = true
+                farm.cradleAutoKeyStopPending = true
             end
         else
             stopped = false
             driver = "DIRECT bridge missing"
+            farm.cradleIYStatus =
+                "DIRECT Stop() pending - bridge missing"
+            farm.cradleIYLastError =
+                "Cannot confirm external IY loop stopped until bridge is available"
+            farm.cradleAutoKeyActive = true
+            farm.cradleAutoKeyStopPending = true
         end
+    else
+        farm.cradleAutoKeyActive = false
+        farm.cradleAutoKeyStopPending = false
     end
 
-    farm.cradleAutoKeyActive = false
     farm.cradleAutoKeyLastStopReason =
         tostring(reason or "Stopped")
     farm.cradleAutoKeyLastAt = os.clock()
@@ -7141,6 +7263,51 @@ function F.releaseCellCradleAutoKey(reason)
         .. tostring(driver)
 
     return stopped
+end
+
+function F.stopCellCradleAutoKeyWithRetry(reason, attempts)
+    local farm = State.cellFarm
+    if not farm then
+        return false
+    end
+
+    local maxAttempts =
+        math.max(
+            1,
+            math.floor(
+                tonumber(attempts) or 3
+            )
+        )
+
+    for attempt = 1, maxAttempts do
+        local stopped =
+            F.releaseCellCradleAutoKey(
+                tostring(reason or "Stopped")
+                    .. " ["
+                    .. tostring(attempt)
+                    .. "/"
+                    .. tostring(maxAttempts)
+                    .. "]"
+            )
+
+        if stopped then
+            return true
+        end
+
+        if attempt < maxAttempts then
+            task.wait(
+                math.max(
+                    0.05,
+                    tonumber(Config.CELL_CRADLE_DIRECT_IY_PHASE_SETTLE)
+                        or 0.12
+                )
+            )
+        end
+    end
+
+    return
+        farm.cradleAutoKeyActive ~= true
+        and farm.cradleAutoKeyStopPending ~= true
 end
 
 function F.beginCellCradleAutoKeyPhase(name, keyCode, virtualKey)
@@ -7158,8 +7325,25 @@ function F.beginCellCradleAutoKeyPhase(name, keyCode, virtualKey)
         return false
     end
 
-    -- Stop the previous custom-IY loop before changing phase.
-    F.releaseCellCradleAutoKey("Switching phase")
+    -- Stop the previous custom-IY loop before changing phase. If Stop()
+    -- cannot be confirmed, do not start another phase on top of it.
+    local hadPreviousLoop =
+        farm.cradleAutoKeyActive == true
+        or farm.cradleAutoKeyStopPending == true
+
+    local previousStopped =
+        F.stopCellCradleAutoKeyWithRetry(
+            "Switching phase",
+            3
+        )
+
+    if hadPreviousLoop
+        and not previousStopped
+    then
+        farm.cradleIYStatus =
+            "DIRECT phase switch blocked: previous loop could not be stopped"
+        return false
+    end
 
     task.wait(
         math.max(
@@ -7213,6 +7397,8 @@ function F.beginCellCradleAutoKeyPhase(name, keyCode, virtualKey)
     end
 
     farm.cradleAutoKeyStopRequested = false
+    farm.cradleAutoKeyStopPending = false
+    farm.cradleAutoKeyStopAttempts = 0
     farm.cradleAutoKeyActive = true
     farm.cradleAutoKeyName = phaseName
     farm.cradleAutoKeyCode = keyCode
@@ -16249,6 +16435,7 @@ function F.captureProfileSettings()
         },
         Cell = {
             keep = F.deepCopySerializable(State.cellFarm.keepOrder),
+            lootNames = F.deepCopySerializable(State.cellFarm.lootNameOrder),
             weapon = State.cellFarm.selectedWeaponName,
             fightHeight = State.cellFarm.fightHeight,
             travelSpeed = State.cellFarm.travelSpeed,
@@ -16296,6 +16483,13 @@ function F.applyProfileSettings(profile)
             and cell.keep
             or State.cellFarm.keepOrder
         )
+    State.cellFarm.lootNameOrder =
+        F.deepCopySerializable(
+            type(cell.lootNames) == "table"
+            and cell.lootNames
+            or State.cellFarm.lootNameOrder
+        )
+
     State.cellFarm.selectedWeaponName =
         F.trimText(
             cell.weapon
@@ -16313,6 +16507,21 @@ function F.applyProfileSettings(profile)
         State.cellFarm.keepOrder = {"Shadowbeam Staff"}
         State.cellFarm.keepNames = {["shadowbeam staff"] = true}
     end
+
+    State.cellFarm.lootNames = {}
+    local normalizedLootOrder = {}
+    for _, itemName in ipairs(State.cellFarm.lootNameOrder) do
+        local cleaned = F.trimText(itemName)
+        if cleaned ~= "" then
+            local key = string.lower(cleaned)
+            if not State.cellFarm.lootNames[key] then
+                State.cellFarm.lootNames[key] = true
+                table.insert(normalizedLootOrder, cleaned)
+            end
+        end
+    end
+    State.cellFarm.lootNameOrder = normalizedLootOrder
+
     State.cellFarm.fightHeight =
         math.clamp(
             tonumber(cell.fightHeight)
@@ -17221,7 +17430,7 @@ function F.getConfigData()
     local grouped = F.captureProfileSettings()
 
     return {
-        version = 13,
+        version = 14,
         schemaVersion = Config.CONFIG_SCHEMA_VERSION,
         Automation = {farm = grouped.Farm.enabled, sell = State.sellEnabled},
         Farm = grouped.Farm,
@@ -17291,6 +17500,10 @@ function F.getConfigData()
             State.lowGraphicsEnabled,
         cellServerHopEnabled =
             grouped.Cell.serverHopEnabled == true,
+        cellLootNames =
+            F.deepCopySerializable(
+                grouped.Cell.lootNames
+            ),
 
         gachaEnabled =
             State.gachaEnabled,
@@ -17401,6 +17614,7 @@ function F.loadFarmConfig()
         decoded.goalKind = goal.kind
         decoded.goalName = goal.name
         decoded.cellKeep = cell.keep
+        decoded.cellLootNames = cell.lootNames
         decoded.cellWeapon = cell.weapon
         decoded.cellFightHeight = cell.fightHeight
         decoded.cellTravelSpeed = cell.travelSpeed
@@ -17526,6 +17740,30 @@ function F.loadFarmConfig()
     if next(State.cellFarm.keepNames) == nil then
         State.cellFarm.keepOrder = {"Shadowbeam Staff"}
         State.cellFarm.keepNames = {["shadowbeam staff"] = true}
+    end
+
+    if type(decoded.cellLootNames) == "table" then
+        State.cellFarm.lootNameOrder = {}
+        State.cellFarm.lootNames = {}
+
+        for _, itemName in ipairs(decoded.cellLootNames) do
+            local cleaned = F.trimText(itemName)
+            if cleaned ~= "" then
+                local key = string.lower(cleaned)
+                if not State.cellFarm.lootNames[key] then
+                    State.cellFarm.lootNames[key] = true
+                    table.insert(
+                        State.cellFarm.lootNameOrder,
+                        cleaned
+                    )
+                end
+            end
+        end
+    else
+        State.cellFarm.lootNameOrder =
+            State.cellFarm.lootNameOrder or {}
+        State.cellFarm.lootNames =
+            State.cellFarm.lootNames or {}
     end
 
     State.cellFarm.selectedWeaponName =
@@ -17968,13 +18206,20 @@ function F.applyFarmConfigToUI()
     if State.cellHopButton then
         State.cellHopButton.Text =
             State.cellFarm.serverHopEnabled
-            and "HOP NOW"
+            and "HOP AFTER RUN"
             or "SAME SERVER"
     end
 
     if State.cellKeepInput then
         State.cellKeepInput:SetTags(
             State.cellFarm.keepOrder,
+            true
+        )
+    end
+
+    if State.cellLootInput then
+        State.cellLootInput:SetTags(
+            State.cellFarm.lootNameOrder,
             true
         )
     end
@@ -18220,6 +18465,9 @@ function F.getCellResumeFlag()
 end
 
 function F.queueCellTeleportBootstrap()
+    local currentJobId =
+        tostring(game.JobId or "")
+
     local queueFunction = F.getQueueOnTeleport()
 
     if not queueFunction then
@@ -18263,7 +18511,7 @@ function F.queueCellTeleportBootstrap()
         )
     then
         return false,
-            "Local v6.4 runtime file missing and no HTTPS reload URL is configured"
+            "Local " .. tostring(Config.HUB_VERSION) .. " runtime file missing and no HTTPS reload URL is configured"
     end
 
     local codeLines = {
@@ -18275,6 +18523,9 @@ function F.queueCellTeleportBootstrap()
         "if not resume then return end",
         "local g=_G",
         "pcall(function() if getgenv then g=getgenv() end end)",
+        "local job=tostring(game.JobId or '')",
+        "if tostring(g.__TheVeilHub_CellBootstrapLoadedJobId or '')==job or tostring(g.__TheVeilHub_CellBootstrapLoadingJobId or '')==job then return end",
+        "g.__TheVeilHub_CellBootstrapLoadingJobId=job",
         "g.__TheVeilHub_CellResume=true",
         "local src=nil",
         "if type(readfile)=='function' then pcall(function() src=readfile("
@@ -18293,7 +18544,9 @@ function F.queueCellTeleportBootstrap()
 
     table.insert(
         codeLines,
-        "if src and src~='' and type(loadstring)=='function' then local fn=loadstring(src); if fn then fn() end end"
+        "local loaded=false; if src and src~='' and type(loadstring)=='function' then local fn=loadstring(src); if fn then local ok=pcall(fn); loaded=ok end end; if loaded then g.__TheVeilHub_CellBootstrapLoadedJobId=job; if type(writefile)=='function' then pcall(function() writefile("
+            .. string.format("%q", Config.CELL_RESUME_FLAG_FILE)
+            .. ", '0') end) end end; if tostring(g.__TheVeilHub_CellBootstrapLoadingJobId or '')==job then g.__TheVeilHub_CellBootstrapLoadingJobId=nil end"
     )
 
     local queuedCode =
@@ -18307,6 +18560,16 @@ function F.queueCellTeleportBootstrap()
             queueFunction,
             queuedCode
         )
+
+    if success
+        and currentJobId ~= ""
+    then
+        -- Diagnostic only. Every teleport attempt queues a bootstrap because
+        -- executor queue retention after a failed teleport is implementation-specific.
+        -- Duplicate queued entries are deduplicated in the destination JobId.
+        State.cellFarm.cellTeleportBootstrapQueuedJobId =
+            currentJobId
+    end
 
     return success, err
 end
@@ -18597,6 +18860,18 @@ function F.finishServerHopFailure(statusText)
     State.serverHopStartedAt = 0
     State.serverHopStatus =
         statusText or "Teleport failed"
+
+    -- A Cell resume flag is only armed for a Cell-owned hop. If that teleport
+    -- later fails in this JobId, consume the stale transaction marker; the next
+    -- retry will arm it again immediately before queueing.
+    if State.cellFarm
+        and State.cellFarm.enabled
+        and F.getCellResumeFlag
+        and F.getCellResumeFlag()
+        and F.setCellResumeFlag
+    then
+        F.setCellResumeFlag(false)
+    end
 
     F.updateServerHopStatus()
 end
@@ -21355,7 +21630,7 @@ function F.describeCellEventArgs(...)
         or "(no args)"
 end
 
-function F.startCellDialogObserver(dialogRemote)
+function F.startCellDialogObserver(dialogRemote, token)
     if not dialogRemote
         or not dialogRemote:IsA("RemoteEvent")
     then
@@ -21369,6 +21644,12 @@ function F.startCellDialogObserver(dialogRemote)
             connection =
                 dialogRemote.OnClientEvent:Connect(
                     function(...)
+                        if token
+                            and not F.isCellFarmActive(token)
+                        then
+                            return
+                        end
+
                         State.cellFarm.dialogClientEvents =
                             (
                                 State.cellFarm.dialogClientEvents
@@ -21433,7 +21714,7 @@ function F.findCellBossModelRaw()
     return nil
 end
 
-function F.startCellBossSpawnWatcher(remotes)
+function F.startCellBossSpawnWatcher(remotes, token)
     local watcher = {
         model = nil,
         source = "None",
@@ -21461,6 +21742,12 @@ function F.startCellBossSpawnWatcher(remotes)
             watcher.childConnection =
                 monsters.ChildAdded:Connect(
                     function(object)
+                        if token
+                            and not F.isCellFarmActive(token)
+                        then
+                            return
+                        end
+
                         if object:IsA("Model")
                             and tostring(
                                 object.Name
@@ -21477,6 +21764,41 @@ function F.startCellBossSpawnWatcher(remotes)
 
                             State.cellFarm.bossSpawnSource =
                                 watcher.source
+
+                            -- Event-driven fast engage: stop the custom-IY key loop and
+                            -- start moving on the exact frame the Cell model is inserted.
+                            -- startCellBossApproach is idempotent for the same live model,
+                            -- so the polling confirmation path can safely call it again.
+                            if token
+                                and F.isCellFarmActive(token)
+                            then
+                                if F.startCellBossApproach then
+                                    pcall(
+                                        F.startCellBossApproach,
+                                        token,
+                                        object
+                                    )
+                                end
+
+                                if State.cellFarm.cradleAutoKeyActive
+                                    or State.cellFarm.cradleAutoKeyStopPending
+                                then
+                                    task.defer(function()
+                                        if F.stopCellCradleAutoKeyWithRetry then
+                                            pcall(
+                                                F.stopCellCradleAutoKeyWithRetry,
+                                                "The Cell Of Life model appeared via ChildAdded",
+                                                3
+                                            )
+                                        elseif F.releaseCellCradleAutoKey then
+                                            pcall(
+                                                F.releaseCellCradleAutoKey,
+                                                "The Cell Of Life model appeared via ChildAdded"
+                                            )
+                                        end
+                                    end)
+                                end
+                            end
 
                             if F.updateCellFarmUI then
                                 F.updateCellFarmUI()
@@ -21500,6 +21822,12 @@ function F.startCellBossSpawnWatcher(remotes)
             watcher.remoteConnection =
                 bossSpawnRemote.OnClientEvent:Connect(
                     function(...)
+                        if token
+                            and not F.isCellFarmActive(token)
+                        then
+                            return
+                        end
+
                         State.cellFarm.bossSpawnRemoteEvents =
                             (
                                 State.cellFarm.bossSpawnRemoteEvents
@@ -21654,10 +21982,14 @@ function F.waitForCellBossConfirmed(
                     F.updateCellFarmUI()
                 end
 
-                if F.stopCellBossApproach then
-                    F.stopCellBossApproach(
-                        "Boss alive confirmed - handing off to combat"
-                    )
+                -- Keep the pre-fight CELL approach alive until prepareCellFight()
+                -- performs the movement-owner handoff. Stopping it here created a
+                -- visible zero-velocity gap between alive confirmation and Monster Lock.
+                if State.cellFarm
+                    and State.cellFarm.bossApproachActive
+                then
+                    State.cellFarm.bossApproachStatus =
+                        "Boss alive confirmed - combat handoff pending"
                 end
 
                 return boss
@@ -21679,8 +22011,12 @@ end
 function F.waitForCellBossSpawn(token, timeout)
     local watcher =
         F.startCellBossSpawnWatcher(
-            F.getCellRemotes()
+            F.getCellRemotes(),
+            token
         )
+
+    State.cellFarm.activeBossWatcher =
+        watcher
 
     local boss =
         F.waitForCellBossConfirmed(
@@ -21692,6 +22028,13 @@ function F.waitForCellBossSpawn(token, timeout)
     F.stopCellBossSpawnWatcher(
         watcher
     )
+
+    if State.cellFarm.activeBossWatcher
+        == watcher
+    then
+        State.cellFarm.activeBossWatcher =
+            nil
+    end
 
     return boss
 end
@@ -22192,7 +22535,7 @@ function F.runCellCradlePhysicalSpamSequence(
 
     State.cellFarm.cradleESpamCount = 0
     State.cellFarm.cradleOneSpamCount = 0
-    State.cellFarm.cradleSpamPhase = "E UNTIL DIALOG"
+    State.cellFarm.cradleSpamPhase = "DIRECT E UNTIL DIALOG"
 
     State.cellFarm.npcInteractionMethod =
         "Direct custom-IY bridge: StartE() -> Start1() -> Stop()"
@@ -22207,36 +22550,115 @@ function F.runCellCradlePhysicalSpamSequence(
             0x45
         )
 
-    if not eAutoKeyStarted then
+    local dialogAlreadyReady = false
+
+    while F.isCellFarmActive(token)
+        and not eAutoKeyStarted
+    do
+        local rawBoss =
+            (
+                bossWatcher
+                and bossWatcher.model
+            )
+            or F.findCellBossModelRaw()
+
+        if rawBoss
+            and rawBoss.Parent
+        then
+            local confirmedBoss =
+                F.waitForCellBossConfirmed(
+                    token,
+                    bossWatcher,
+                    Config.CELL_CRADLE_BOSS_ALIVE_WAIT
+                )
+
+            if confirmedBoss then
+                State.cellFarm.cradleSpamPhase =
+                    "COMPLETE"
+                return true, confirmedBoss
+            end
+        end
+
+        local dialogVisible,
+            releaseVisible =
+                F.getCellCradleDialogueEvidence()
+
+        dialogAlreadyReady =
+            dialogVisible
+            and releaseVisible
+            and State.cellFarm.dialogTitleConfirmed
+            and State.cellFarm.dialogBodyConfirmed
+            and State.cellFarm.dialogOptionsConfirmed
+
+        if dialogAlreadyReady then
+            State.cellFarm.cradleSpamPhase =
+                "DIALOG READY"
+            break
+        end
+
         F.setCellFarmStage(
-            "CRADLE DIRECT BRIDGE ERROR",
-            tostring(State.cellFarm.cradleIYStatus or "Direct IY StartE() could not start E loop")
+            "CRADLE DIRECT BRIDGE WAIT",
+            "Waiting for Direct-IY StartE() bridge; manual custom-IY input can still advance the dialog"
         )
+
+        State.cellFarm.status =
+            tostring(
+                State.cellFarm.cradleIYLastError
+                or State.cellFarm.cradleIYStatus
+                or "DIRECT BRIDGE MISSING"
+            )
+
+        if not F.cellFarmWait(
+            token,
+            0.50
+        ) then
+            return false
+        end
+
+        eAutoKeyStarted =
+            F.beginCellCradleAutoKeyPhase(
+                "E",
+                Enum.KeyCode.E,
+                0x45
+            )
+    end
+
+    if not F.isCellFarmActive(token) then
         return false
     end
 
-    F.setCellFarmStage(
-        "CRADLE E SPAM",
-        "Direct IY StartE() active; waiting for the exact The Cradle dialog"
-    )
+    if eAutoKeyStarted then
+        F.setCellFarmStage(
+            "CRADLE DIRECT E",
+            "Direct IY StartE() active; waiting for the exact The Cradle dialog"
+        )
+    else
+        F.setCellFarmStage(
+            "CRADLE DIALOG READY",
+            "Cradle dialog detected without a Direct-IY StartE() call"
+        )
+    end
 
     local lastPositionRecheck =
         os.clock()
 
-    while F.isCellFarmActive(token) do
+    while F.isCellFarmActive(token)
+        and not dialogAlreadyReady
+    do
         local alreadyBoss =
             F.getCellBoss()
 
         if alreadyBoss then
-            F.releaseCellCradleAutoKey(
-                "Boss detected during E phase"
+            F.stopCellCradleAutoKeyWithRetry(
+                "Boss detected during E phase",
+                3
             )
 
             State.cellFarm.bossSpawnConfirmed =
                 true
 
             State.cellFarm.bossSpawnSource =
-                "Already present during E spam"
+                "Already present during Direct-IY E phase"
 
             State.cellFarm.cradleSpamPhase =
                 "COMPLETE"
@@ -22258,8 +22680,9 @@ function F.runCellCradlePhysicalSpamSequence(
             and State.cellFarm.dialogOptionsConfirmed
 
         if exactDialog then
-            F.releaseCellCradleAutoKey(
-                "Cradle dialog confirmed; E phase complete"
+            F.stopCellCradleAutoKeyWithRetry(
+                "Cradle dialog confirmed; E phase complete",
+                3
             )
 
             State.cellFarm.dialogUiConfirmed =
@@ -22303,12 +22726,25 @@ function F.runCellCradlePhysicalSpamSequence(
             F.stopCellCradleTravelInput()
         end
 
+        if State.cellFarm.cradleAutoKeyStopRequested then
+            local restarted =
+                F.beginCellCradleAutoKeyPhase(
+                    "E",
+                    Enum.KeyCode.E,
+                    0x45
+                )
+
+            if not restarted then
+                return false
+            end
+        end
+
         local inputOk =
             F.pressCellCradleAutoKey(
                 Enum.KeyCode.E,
                 0x45,
                 Config.CELL_CRADLE_E_SPAM_HOLD,
-                "Custom IY E loop active after J; monitoring dialog"
+                "Direct IY StartE() loop active; monitoring dialog"
             )
 
         State.cellFarm.cradleESpamCount =
@@ -22343,7 +22779,7 @@ function F.runCellCradlePhysicalSpamSequence(
         end
 
         State.cellFarm.status =
-            "Custom IY J->E active | monitor "
+            "Direct IY StartE() active | monitor "
             .. tostring(
                 State.cellFarm.cradleESpamCount
             )
@@ -22375,7 +22811,7 @@ function F.runCellCradlePhysicalSpamSequence(
     end
 
     State.cellFarm.cradleSpamPhase =
-        "1 UNTIL CELL SPAWNS"
+        "DIRECT 1 UNTIL CELL SPAWNS"
 
     local oneAutoKeyStarted =
         F.beginCellCradleAutoKeyPhase(
@@ -22384,16 +22820,59 @@ function F.runCellCradlePhysicalSpamSequence(
             0x31
         )
 
-    if not oneAutoKeyStarted then
+    while F.isCellFarmActive(token)
+        and not oneAutoKeyStarted
+    do
+        local rawBoss =
+            (
+                bossWatcher
+                and bossWatcher.model
+            )
+            or F.findCellBossModelRaw()
+
+        if rawBoss
+            and rawBoss.Parent
+        then
+            local confirmedBoss =
+                F.waitForCellBossConfirmed(
+                    token,
+                    bossWatcher,
+                    Config.CELL_CRADLE_BOSS_ALIVE_WAIT
+                )
+
+            if confirmedBoss then
+                State.cellFarm.cradleSpamPhase =
+                    "COMPLETE"
+                return true, confirmedBoss
+            end
+        end
+
         F.setCellFarmStage(
-            "CRADLE DIRECT BRIDGE ERROR",
-            tostring(State.cellFarm.cradleIYStatus or "Direct IY Start1() could not start key-1 loop")
+            "CRADLE DIRECT BRIDGE WAIT",
+            "Dialog ready; waiting for Direct-IY Start1() bridge or manual custom-IY boss summon"
         )
+
+        if not F.cellFarmWait(
+            token,
+            0.50
+        ) then
+            return false
+        end
+
+        oneAutoKeyStarted =
+            F.beginCellCradleAutoKeyPhase(
+                "1",
+                Enum.KeyCode.One,
+                0x31
+            )
+    end
+
+    if not F.isCellFarmActive(token) then
         return false
     end
 
     F.setCellFarmStage(
-        "CRADLE 1 SPAM",
+        "CRADLE DIRECT 1",
         "Dialog confirmed; direct IY Start1() active until The Cell Of Life spawns"
     )
 
@@ -22408,15 +22887,16 @@ function F.runCellCradlePhysicalSpamSequence(
         if rawBoss
             and rawBoss.Parent
         then
-            F.releaseCellCradleAutoKey(
-                "The Cell Of Life model appeared"
+            F.stopCellCradleAutoKeyWithRetry(
+                "The Cell Of Life model appeared",
+                3
             )
 
             State.cellFarm.bossSpawnConfirmed =
                 true
 
             State.cellFarm.bossSpawnSource =
-                "Observed during physical 1 spam"
+                "Observed during direct-IY Start1() phase"
 
             State.cellFarm.dialogOptionSent =
                 true
@@ -22433,7 +22913,7 @@ function F.runCellCradlePhysicalSpamSequence(
                     State.cellFarm.cradleOneSpamCount
                     or 0
                 )
-                .. " key-1 monitor cycle(s); confirming alive"
+                .. " Start1 monitor cycle(s); confirming alive"
 
             if F.updateCellFarmUI then
                 F.updateCellFarmUI()
@@ -22458,7 +22938,7 @@ function F.runCellCradlePhysicalSpamSequence(
 
             F.setCellFarmStage(
                 "WAITING CELL ALIVE",
-                "Cell model observed but not alive-confirmed; same server, no hop"
+                "Cell model observed but not alive-confirmed; retrying alive confirmation in current server"
             )
 
             if not F.cellFarmWait(
@@ -22484,7 +22964,7 @@ function F.runCellCradlePhysicalSpamSequence(
                 Enum.KeyCode.One,
                 0x31,
                 Config.CELL_CRADLE_ONE_SPAM_HOLD,
-                "Custom IY key-1 loop active after K; monitoring Cell spawn"
+                "Direct IY Start1() loop active; monitoring Cell spawn"
             )
 
             State.cellFarm.cradleOneSpamCount =
@@ -22522,7 +23002,7 @@ function F.runCellCradlePhysicalSpamSequence(
                 true
 
             State.cellFarm.status =
-                "Custom IY K->1 active | monitor "
+                "Direct IY Start1() active | monitor "
                 .. tostring(
                     State.cellFarm.cradleOneSpamCount
                 )
@@ -22668,23 +23148,44 @@ function F.summonCellBoss(token)
 
     local dialogObserver =
         F.startCellDialogObserver(
-            remotes.Dialog
+            remotes.Dialog,
+            token
         )
 
     local bossWatcher =
         F.startCellBossSpawnWatcher(
-            remotes
+            remotes,
+            token
         )
 
+    State.cellFarm.activeDialogObserver =
+        dialogObserver
+    State.cellFarm.activeBossWatcher =
+        bossWatcher
+
     local function cleanup()
-        F.releaseCellCradleAutoKey(
-            "Cradle summon cleanup"
-        )
+        if F.stopCellCradleAutoKeyWithRetry then
+            F.stopCellCradleAutoKeyWithRetry(
+                "Cradle summon cleanup",
+                3
+            )
+        else
+            F.releaseCellCradleAutoKey(
+                "Cradle summon cleanup"
+            )
+        end
 
         if dialogObserver then
             pcall(function()
                 dialogObserver:Disconnect()
             end)
+
+            if State.cellFarm.activeDialogObserver
+                == dialogObserver
+            then
+                State.cellFarm.activeDialogObserver =
+                    nil
+            end
 
             dialogObserver = nil
         end
@@ -22692,6 +23193,13 @@ function F.summonCellBoss(token)
         F.stopCellBossSpawnWatcher(
             bossWatcher
         )
+
+        if State.cellFarm.activeBossWatcher
+            == bossWatcher
+        then
+            State.cellFarm.activeBossWatcher =
+                nil
+        end
     end
 
     if Config.CELL_CRADLE_PHYSICAL_SPAM_MODE then
@@ -25962,6 +26470,43 @@ function F.isCellDropWithinLootAnchors(
     return false
 end
 
+function F.isCellLootNameWanted(drop)
+    if not drop then
+        return false
+    end
+
+    local cleaned =
+        F.trimText(
+            tostring(drop.Name or "")
+        )
+
+    if cleaned == "" then
+        return false
+    end
+
+    return
+        type(State.cellFarm.lootNames) == "table"
+        and State.cellFarm.lootNames[
+            string.lower(cleaned)
+        ] == true
+end
+
+function F.getCellLootFilterSummary()
+    local namedCount =
+        type(State.cellFarm.lootNameOrder) == "table"
+        and #State.cellFarm.lootNameOrder
+        or 0
+
+    if namedCount > 0 then
+        return
+            "Legendary/Mythic + "
+            .. tostring(namedCount)
+            .. " named target(s)"
+    end
+
+    return "Legendary/Mythic"
+end
+
 -- Optional collection filters are deliberately separate from reward-wave
 -- detection. Calls without anchor/radius/rarity arguments still observe every
 -- post-snapshot reward drop, which keeps chest-open confirmation reliable.
@@ -26022,8 +26567,9 @@ function F.collectCellLootCandidates(
         end
 
         -- Actual Cell pickup allowlist. Reward-wave counting passes nil here,
-        -- so lower rarities still participate in spawn-stability detection but
-        -- are intentionally never added to the pickup queue.
+        -- so every rarity still participates in spawn-stability detection.
+        -- During pickup, an exact configured Cell Loot Name is an OR condition
+        -- with the rarity allowlist, so named Common/Rare/etc. rewards are kept.
         if include
             and type(allowedRarities) == "table"
         then
@@ -26036,6 +26582,9 @@ function F.collectCellLootCandidates(
             include =
                 allowedRarities[rarityKey]
                 == true
+                or F.isCellLootNameWanted(
+                    drop
+                )
         end
 
         if include then
@@ -26391,6 +26940,37 @@ function F.applyCellExclusiveMode()
     F.stopLootLock("FARM")
     F.releaseMovement("FARM")
 
+    -- Cell Farm is movement/combat exclusive from the moment it starts.
+    -- Preserve the user's previous settings in restore, but do not allow a
+    -- pre-existing Monster Lock/Weapon/Finisher to interfere with Cradle travel.
+    State.monsterLockEnabled = false
+    State.monsterLockWaiting = false
+    State.monsterLockManualSelection = false
+    State.lockedMonster = nil
+    State.weaponAutoAttackEnabled = false
+    State.finisherEnabled = false
+    State.monsterLockSuspendUntil = 0
+
+    F.stopMovementFlight("MONSTER_LOCK")
+    F.releaseMovement("MONSTER_LOCK")
+
+    if monsterLockToggle then
+        monsterLockToggle:SetSilent(false)
+    end
+
+    if weaponToggle then
+        weaponToggle:SetSilent(false)
+    end
+
+    if finisherToggle then
+        finisherToggle:SetSilent(false)
+    end
+
+    if State.updateMonsterButtons then
+        State.updateMonsterButtons()
+    end
+    State.updateCombatStatus()
+
     if State.farmToggle then
         State.farmToggle:SetSilent(false)
     end
@@ -26603,7 +27183,18 @@ function F.getNearbyCellBossPlayer(boss)
 end
 
 function F.stopCellCombatForPlayerHop()
+    -- The raw-boss approach uses CELL movement before Monster Lock is enabled.
+    -- Cancel it as part of player avoidance so we never continue flying toward a
+    -- contested boss while combat is intentionally paused/hopping.
+    if F.stopCellBossApproach then
+        F.stopCellBossApproach(
+            "Nearby-player avoidance"
+        )
+    end
+
     State.monsterLockEnabled = false
+    State.monsterLockWaiting = false
+    State.monsterLockManualSelection = false
     State.weaponAutoAttackEnabled = false
     State.finisherEnabled = false
     State.lockedMonster = nil
@@ -26640,7 +27231,8 @@ end
 
 function F.handleCellBossPlayerAvoidance(
     token,
-    boss
+    boss,
+    resumeCombat
 )
     local player,
         distance,
@@ -26687,15 +27279,35 @@ function F.handleCellBossPlayerAvoidance(
                 )
 
         if not currentPlayer then
+            -- A TeleportService request cannot be cancelled after initiation. If the
+            -- player leaves while it is still pending, wait for success/failure instead
+            -- of restarting combat concurrently with an in-flight teleport.
+            if State.serverHopBusy then
+                State.cellFarm.nearbyBossPlayerName = "None"
+                State.cellFarm.nearbyBossPlayerDistance = -1
+                State.cellFarm.nearbyBossPlayerEvidence =
+                    "Player left; teleport outcome still pending"
+
+                if not F.cellFarmWait(
+                    token,
+                    0.25
+                ) then
+                    return true
+                end
+
+                continue
+            end
+
             State.cellFarm.nearbyBossPlayerName = "None"
             State.cellFarm.nearbyBossPlayerDistance = -1
             State.cellFarm.nearbyBossPlayerEvidence =
                 State.cellFarm.serverHopEnabled
-                and "Player left before hop; fight resume"
+                and "Player left after hop failure; fight resume"
                 or "Nearby player left; same-server fight resume"
             State.cellFarm.playerAvoidHopTriggered = false
 
-            if boss
+            if resumeCombat == true
+                and boss
                 and boss.Parent
                 and (
                     not F.isMonsterAlive
@@ -26707,10 +27319,15 @@ function F.handleCellBossPlayerAvoidance(
                     "Nearby player left - resuming Cell fight"
                 )
 
-                F.prepareCellFight(
-                    boss,
-                    token
-                )
+                local resumedFight =
+                    F.prepareCellFight(
+                        boss,
+                        token
+                    )
+
+                if not resumedFight then
+                    return true
+                end
             end
 
             return false
@@ -26881,7 +27498,7 @@ function F.stopCellAttacksForRewards(reason)
         or monsterLockWasEnabled
 end
 
--- v6.6.13: The raw Cell model can exist several seconds before HP/alive data
+-- v6.6.16: The raw Cell model can exist several seconds before HP/alive data
 -- becomes readable. Do not waste that window standing at The Cradle. This
 -- approach controller uses the CELL movement owner only; it never enables
 -- Weapon Auto Attack or Finisher. Once alive is confirmed, control is handed
@@ -26901,8 +27518,13 @@ function F.stopCellBossApproach(reason)
     farm.bossApproachStatus =
         tostring(reason or "Stopped")
 
-    F.stopMovementFlight("CELL")
-    F.releaseMovement("CELL")
+    -- CELL is also used by reward-chest/loot travel. Only release that channel
+    -- when this approach controller actually owned an active approach. This keeps
+    -- late/duplicate cleanup calls from cutting unrelated Cell movement.
+    if wasActive then
+        F.stopMovementFlight("CELL")
+        F.releaseMovement("CELL")
+    end
 
     return wasActive
 end
@@ -26916,6 +27538,15 @@ function F.startCellBossApproach(token, boss)
         or not boss.Parent
     then
         return false
+    end
+
+    if farm.bossApproachActive
+        and farm.boss == boss
+        and boss.Parent
+    then
+        farm.bossApproachStatus =
+            "Boss model observed - approach already active"
+        return true
     end
 
     F.stopCellBossApproach(
@@ -27055,15 +27686,9 @@ function F.prepareCellFight(boss, token)
         return false
     end
 
-    -- Ensure the pre-fight CELL approach no longer owns the movement lease.
-    -- Monster Lock can then take over immediately and keep following the boss
-    -- even while weapon equip/validation is still in progress.
-    if F.stopCellBossApproach then
-        F.stopCellBossApproach(
-            "Combat handoff"
-        )
-    end
-
+    -- Prepare the Monster Lock target/state while the CELL approach is still
+    -- maintaining position. We release CELL only immediately before the explicit
+    -- Monster Lock apply below, minimizing the handoff's zero-velocity window.
     State.cellFarm.boss = boss
     State.lockedMonster = boss
     State.monsterLockManualSelection = true
@@ -27090,6 +27715,15 @@ function F.prepareCellFight(boss, token)
 
     if finisherToggle then
         finisherToggle:SetSilent(false)
+    end
+
+    -- Synchronous movement-owner handoff: keep CELL approach alive until every
+    -- Monster Lock state field is ready, then release CELL and immediately acquire
+    --/apply MONSTER_LOCK in the same call path.
+    if F.stopCellBossApproach then
+        F.stopCellBossApproach(
+            "Combat handoff"
+        )
     end
 
     if State.applyMonsterLockPosition then
@@ -27157,7 +27791,8 @@ function F.fightCellBoss(token, boss)
     -- Do not even engage if another live player is already close to the boss.
     if F.handleCellBossPlayerAvoidance(
         token,
-        boss
+        boss,
+        false
     ) then
         return false
     end
@@ -27235,7 +27870,8 @@ function F.fightCellBoss(token, boss)
 
             if F.handleCellBossPlayerAvoidance(
                 token,
-                boss
+                boss,
+                true
             ) then
                 return false
             end
@@ -27700,11 +28336,20 @@ function F.formatCellRewardItemList(payload)
 end
 
 function F.startCellRewardEventObserver(token)
+    if State.cellFarm.activeRewardObserver
+        and F.stopCellRewardEventObserver
+    then
+        F.stopCellRewardEventObserver(
+            State.cellFarm.activeRewardObserver
+        )
+    end
+
     local remotes =
         F.getCellRemotes()
 
     local observer = {
         connections = {},
+        token = token,
     }
 
     local function addConnection(connection)
@@ -27891,6 +28536,9 @@ function F.startCellRewardEventObserver(token)
         end
     end
 
+    State.cellFarm.activeRewardObserver =
+        observer
+
     return observer
 end
 
@@ -27915,6 +28563,112 @@ function F.stopCellRewardEventObserver(observer)
     table.clear(
         observer.connections
     )
+
+    if State.cellFarm.activeRewardObserver
+        == observer
+    then
+        State.cellFarm.activeRewardObserver =
+            nil
+    end
+end
+
+function F.cleanupCellTransientRuntime(reason)
+    local farm = State.cellFarm
+    if not farm then
+        return false
+    end
+
+    local detail =
+        tostring(reason or "Transient cleanup")
+
+    local externalInputStopped = true
+
+    if F.stopCellCradleAutoKeyWithRetry then
+        local ok, stopped =
+            pcall(
+                F.stopCellCradleAutoKeyWithRetry,
+                detail,
+                3
+            )
+
+        externalInputStopped =
+            ok and stopped == true
+    elseif F.releaseCellCradleAutoKey then
+        local ok, stopped =
+            pcall(
+                F.releaseCellCradleAutoKey,
+                detail
+            )
+
+        externalInputStopped =
+            ok and stopped == true
+    end
+
+    if F.stopCellBossApproach then
+        pcall(
+            F.stopCellBossApproach,
+            detail
+        )
+    end
+
+    local dialogObserver =
+        farm.activeDialogObserver
+
+    if dialogObserver then
+        pcall(function()
+            dialogObserver:Disconnect()
+        end)
+
+        farm.activeDialogObserver =
+            nil
+    end
+
+    local bossWatcher =
+        farm.activeBossWatcher
+
+    if bossWatcher
+        and F.stopCellBossSpawnWatcher
+    then
+        pcall(
+            F.stopCellBossSpawnWatcher,
+            bossWatcher
+        )
+
+        farm.activeBossWatcher =
+            nil
+    end
+
+    local rewardObserver =
+        farm.activeRewardObserver
+
+    if rewardObserver
+        and F.stopCellRewardEventObserver
+    then
+        pcall(
+            F.stopCellRewardEventObserver,
+            rewardObserver
+        )
+    end
+
+    local rewardChestConnection =
+        farm.activeRewardChestConnection
+
+    if rewardChestConnection then
+        pcall(function()
+            rewardChestConnection:Disconnect()
+        end)
+
+        farm.activeRewardChestConnection =
+            nil
+    end
+
+    F.stopLootLock("CELL")
+    F.stopMovementFlight("CELL")
+    F.stopMovementFlight("MONSTER_LOCK")
+    F.releaseMovement("CELL")
+    F.releaseMovement("MONSTER_LOCK")
+
+    return externalInputStopped
 end
 
 function F.getCellInstanceDebugId(object)
@@ -28107,21 +28861,81 @@ function F.getCellRewardChestRoot(object)
     return nil
 end
 
+function F.getCellRewardChestCFrame(chest)
+    if typeof(chest) ~= "Instance" then
+        return nil
+    end
+
+    if chest.Parent then
+        return F.getDropCFrame(
+            chest
+        )
+    end
+
+    -- Inspector Bundle contains a nil-parent "Chest" instance and Cobalt
+    -- observed OpenChest receiving that detached Instance. Generic drop helpers
+    -- intentionally reject Parent=nil, so Cell reward chests need a dedicated
+    -- detached-instance position path.
+    if not F.isCellNilRewardChestCandidate(
+        chest
+    ) then
+        return nil
+    end
+
+    if chest:IsA("Model") then
+        local ok, pivot =
+            pcall(function()
+                return chest:GetPivot()
+            end)
+
+        if ok
+            and typeof(pivot) == "CFrame"
+        then
+            return pivot
+        end
+    elseif chest:IsA("BasePart") then
+        return chest.CFrame
+    end
+
+    local part =
+        chest:FindFirstChildWhichIsA(
+            "BasePart",
+            true
+        )
+
+    if part then
+        return part.CFrame
+    end
+
+    return nil
+end
+
 function F.isCellRewardChestNearBoss(chest)
-    if not chest
-        or not chest.Parent
-        or not chest:IsDescendantOf(workspace)
+    if typeof(chest) ~= "Instance" then
+        return false
+    end
+
+    if chest.Parent
+        and not chest:IsDescendantOf(workspace)
     then
         return false
     end
 
     local chestCFrame =
-        F.getDropCFrame(
+        F.getCellRewardChestCFrame(
             chest
         )
 
     if not chestCFrame then
-        return false
+        -- A detached Chest can be a server-interaction token with no remaining
+        -- client geometry. It is still valid if it is a new nil-instance chest;
+        -- beforeChestSnapshot prevents stale pre-existing tokens from entering
+        -- the current reward batch.
+        return
+            chest.Parent == nil
+            and F.isCellNilRewardChestCandidate(
+                chest
+            )
     end
 
     local bossPosition =
@@ -28181,12 +28995,21 @@ function F.collectCellRewardChestCandidates(beforeSnapshot)
         )
     end
 
-    for _, object in ipairs(
+    local workspaceObjects =
         workspace:GetDescendants()
+
+    for index, object in ipairs(
+        workspaceObjects
     ) do
         consider(
             object
         )
+
+        -- One full scan is still needed for the pre-fight snapshot / initial
+        -- reward discovery, but yield in chunks to avoid a large single-frame hitch.
+        if index % 750 == 0 then
+            task.wait()
+        end
     end
 
     -- Cobalt showed OpenChest receiving a nil-parent Chest instance.
@@ -29135,6 +29958,12 @@ F.Controllers.AutoChest = {
 }
 
 function F.stopCellRewardMovement()
+    if F.stopCellBossApproach then
+        F.stopCellBossApproach(
+            "Reward movement takeover"
+        )
+    end
+
     -- Reward chest/loot movement is exclusive. Clear any stale combat target
     -- before releasing movement channels so the Monster Lock Heartbeat cannot
     -- reacquire and pull the character away between chest-open attempts.
@@ -29206,7 +30035,7 @@ function F.openCellRewardChest(chest, token, beforeDropSnapshot)
         debugId
 
     local chestCFrame =
-        F.getDropCFrame(
+        F.getCellRewardChestCFrame(
             chest
         )
 
@@ -29294,12 +30123,7 @@ function F.openCellRewardChest(chest, token, beforeDropSnapshot)
 
         local sent =
             pcall(function()
-                local Event =
-                    game:GetService(
-                        "ReplicatedStorage"
-                    ).Remotes.InteractPromptEvent
-
-                Event:FireServer(
+                interactPrompt:FireServer(
                     "OpenChest",
                     chest
                 )
@@ -29376,6 +30200,10 @@ function F.openCellRewardChest(chest, token, beforeDropSnapshot)
             if itemNotifyNow > itemNotifyBefore
                 or itemCountNow > itemCountBefore
             then
+                State.cellFarm.rewardChestItemNotifyEvidence =
+                    (State.cellFarm.rewardChestItemNotifyEvidence or 0)
+                    + 1
+
                 State.cellFarm.status =
                     "CONFIRMED chest opened: ItemNotifyEvent received"
 
@@ -29420,11 +30248,30 @@ function F.waitForCellRewardDropsStable(token, beforeDropSnapshot)
 
     local guardSince = nil
 
+    local lastItemNotifyEvents =
+        State.cellFarm.rewardChestItemNotifyEvidence
+        or 0
+
     local lastNotice =
         os.clock()
 
     while F.isCellFarmActive(token) do
         task.wait(0.15)
+
+        local currentItemNotifyEvents =
+            State.cellFarm.rewardChestItemNotifyEvidence
+            or 0
+
+        if currentItemNotifyEvents
+            ~= lastItemNotifyEvents
+        then
+            lastItemNotifyEvents =
+                currentItemNotifyEvents
+            stableSince =
+                os.clock()
+            guardSince =
+                nil
+        end
 
         local currentCount =
             F.countCellRewardDrops(
@@ -29487,7 +30334,38 @@ function F.waitForCellRewardDropsStable(token, beforeDropSnapshot)
                     currentCount
             end
         else
-            guardSince = nil
+            local hasInventoryRewardEvidence =
+                (State.cellFarm.rewardChestItemNotifyEvidence or 0) > 0
+
+            if hasInventoryRewardEvidence then
+                if not guardSince
+                    and os.clock() - stableSince
+                        >= Config.CELL_REWARD_DROP_STABLE_WINDOW
+                then
+                    guardSince =
+                        os.clock()
+
+                    State.cellFarm.status =
+                        "No world drops; chest-correlated ItemNotify evidence confirmed | final delayed-wave guard running"
+
+                    if F.updateCellFarmUI then
+                        F.updateCellFarmUI()
+                    end
+                elseif guardSince
+                    and os.clock() - guardSince
+                        >= Config.CELL_REWARD_DROP_FINAL_GUARD
+                then
+                    -- All five chests were already confirmed open before this
+                    -- function is entered. Only ItemNotify observed inside an
+                    -- OpenChest confirmation window is accepted as evidence that
+                    -- the zero-world-drop result was delivered directly to inventory.
+                    return
+                        true,
+                        0
+                end
+            else
+                guardSince = nil
+            end
         end
 
         if os.clock() - lastNotice
@@ -29497,8 +30375,9 @@ function F.waitForCellRewardDropsStable(token, beforeDropSnapshot)
                 os.clock()
 
             if currentCount == 0 then
-                F.recordCellFailure(
-                    "All reward chests opened but no drops detected yet; still waiting and hop remains blocked"
+                F.recordDiagnosticEvent(
+                    "CellFarm",
+                    "All reward chests opened but no world drops or ItemNotify evidence detected yet; still waiting and next transition remains blocked"
                 )
             else
                 F.recordDiagnosticEvent(
@@ -29524,6 +30403,7 @@ function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapsho
     State.lockedMonster = nil
     State.cellFarm.rewardChestsFound = 0
     State.cellFarm.rewardChestsOpened = 0
+    State.cellFarm.rewardChestItemNotifyEvidence = 0
     State.cellFarm.rewardLootAnchors = {}
     State.cellFarm.rewardLootAnchorCount = 0
     State.cellFarm.rewardLootAnchorPosition = nil
@@ -29541,9 +30421,13 @@ function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapsho
     local lastNewChestAt = os.clock()
     local lastNotice = os.clock()
     local lastNilScan = 0
+    local watcherActive = true
 
     local function registerCandidate(object)
-        if not object then
+        if not watcherActive
+            or not F.isCellFarmActive(token)
+            or not object
+        then
             return
         end
 
@@ -29593,6 +30477,25 @@ function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapsho
         end
     end
 
+    -- Connect before the initial scan so reward objects inserted during the
+    -- scan cannot fall into a race window.
+    local descendantConnection =
+        workspace.DescendantAdded:Connect(
+            function(object)
+                if watcherActive
+                    and F.isCellFarmActive(token)
+                then
+                    task.defer(
+                        registerCandidate,
+                        object
+                    )
+                end
+            end
+        )
+
+    State.cellFarm.activeRewardChestConnection =
+        descendantConnection
+
     for _, chest in ipairs(
         F.collectCellRewardChestCandidates(
             beforeChestSnapshot
@@ -29603,27 +30506,26 @@ function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapsho
         )
     end
 
-    local descendantConnection =
-        workspace.DescendantAdded:Connect(
-            function(object)
-                task.defer(
-                    registerCandidate,
-                    object
-                )
-            end
-        )
-
     local function disconnectWatcher()
+        watcherActive = false
+
         if descendantConnection then
             pcall(function()
                 descendantConnection:Disconnect()
             end)
 
+            if State.cellFarm.activeRewardChestConnection
+                == descendantConnection
+            then
+                State.cellFarm.activeRewardChestConnection =
+                    nil
+            end
+
             descendantConnection = nil
         end
     end
 
-    local function rescanRewardChests()
+    local function scanDetachedRewardChests()
         if os.clock() - lastNilScan
             < Config.CELL_REWARD_CHEST_NIL_SCAN_INTERVAL
         then
@@ -29633,21 +30535,39 @@ function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapsho
         lastNilScan =
             os.clock()
 
-        for _, chest in ipairs(
-            F.collectCellRewardChestCandidates(
-                beforeChestSnapshot
+        -- Workspace reward chests are event-driven via DescendantAdded. Only
+        -- detached/nil-parent chests need polling; the Bundle shows this path
+        -- exists and the nil-instance set is tiny compared with Workspace.
+        if type(getnilinstances) ~= "function" then
+            return
+        end
+
+        local ok, objects =
+            pcall(
+                getnilinstances
             )
-        ) do
-            registerCandidate(
-                chest
-            )
+
+        if not ok
+            or type(objects) ~= "table"
+        then
+            return
+        end
+
+        for _, object in ipairs(objects) do
+            if F.isCellNilRewardChestCandidate(
+                object
+            ) then
+                registerCandidate(
+                    object
+                )
+            end
         end
     end
 
     -- Do not leave this server while the death/reward sequence has not
     -- produced either reward chests or actual new drops.
     while F.isCellFarmActive(token) do
-        rescanRewardChests()
+        scanDetachedRewardChests()
 
         local newDropCount =
             F.countCellRewardDrops(
@@ -29681,7 +30601,8 @@ function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapsho
         then
             lastNotice = os.clock()
 
-            F.recordCellFailure(
+            F.recordDiagnosticEvent(
+                "CellFarm",
                 "Still waiting for Cell reward chests; next round is blocked to protect loot"
             )
 
@@ -29701,7 +30622,7 @@ function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapsho
     local noNewDeadline = nil
 
     while F.isCellFarmActive(token) do
-        rescanRewardChests()
+        scanDetachedRewardChests()
 
         local chest =
             discoveredOrder[index]
@@ -29709,7 +30630,7 @@ function F.processCellRewardChests(token, beforeChestSnapshot, beforeDropSnapsho
         if chest then
             if not opened[chest] then
                 local chestAnchorCFrame =
-                    F.getDropCFrame(
+                    F.getCellRewardChestCFrame(
                         chest
                     )
 
@@ -29847,7 +30768,7 @@ function F.collectCellBossLoot(token, beforeSnapshot)
             lootAnchors
     end
 
-    -- Compatibility fallback only. Normal v6.6.13 flow records one anchor for
+    -- Compatibility fallback only. Normal v6.6.16 flow records one anchor for
     -- every successfully opened reward chest before it disappears.
     if #lootAnchors == 0 then
         local anchorRoot =
@@ -29879,7 +30800,8 @@ function F.collectCellBossLoot(token, beforeSnapshot)
 
     F.setCellFarmStage(
         "LOOT FILTER",
-        "Legendary/Mythic only | "
+        F.getCellLootFilterSummary()
+            .. " | "
             .. tostring(#lootAnchors)
             .. " chest anchor(s) x "
             .. tostring(Config.CELL_REWARD_LOOT_NEARBY_RADIUS)
@@ -29955,7 +30877,7 @@ function F.collectCellBossLoot(token, beforeSnapshot)
 
             F.setCellFarmStage(
                 "LOOT RESCAN",
-                "No Legendary/Mythic near opened reward chests | quiet "
+                "No eligible Cell reward loot near opened reward chests | quiet "
                     .. string.format(
                         "%.1f",
                         quietFor
@@ -30078,6 +31000,82 @@ function F.collectCellBossLoot(token, beforeSnapshot)
     return
         collected,
         false
+end
+
+function F.ensureCellTargetLootCleared(
+    token,
+    beforeSnapshot,
+    stageName
+)
+    if not F.isCellFarmActive(token) then
+        return false, 0
+    end
+
+    local candidates =
+        F.collectCellLootCandidates(
+            beforeSnapshot,
+            State.cellFarm.rewardLootAnchors,
+            Config.CELL_REWARD_LOOT_NEARBY_RADIUS,
+            Config.CELL_REWARD_LOOT_RARITIES
+        )
+
+    State.cellFarm.rewardLootEligible =
+        #candidates
+    State.cellFarm.lootKnownRemaining =
+        #candidates
+
+    if #candidates == 0 then
+        return true, 0
+    end
+
+    F.setCellFarmStage(
+        tostring(stageName or "LOOT FINAL GUARD"),
+        tostring(#candidates)
+            .. " eligible reward item(s) remain ("
+            .. F.getCellLootFilterSummary()
+            .. ") - returning to pickup"
+    )
+
+    local extraCollected,
+        extraComplete =
+            F.collectCellBossLoot(
+                token,
+                beforeSnapshot
+            )
+
+    extraCollected =
+        tonumber(extraCollected) or 0
+
+    if not F.isCellFarmActive(token)
+        or not extraComplete
+    then
+        return false, extraCollected
+    end
+
+    local remaining =
+        F.collectCellLootCandidates(
+            beforeSnapshot,
+            State.cellFarm.rewardLootAnchors,
+            Config.CELL_REWARD_LOOT_NEARBY_RADIUS,
+            Config.CELL_REWARD_LOOT_RARITIES
+        )
+
+    State.cellFarm.rewardLootEligible =
+        #remaining
+    State.cellFarm.lootKnownRemaining =
+        #remaining
+
+    if #remaining > 0 then
+        F.setCellFarmStage(
+            tostring(stageName or "LOOT FINAL GUARD"),
+            tostring(#remaining)
+                .. " eligible reward item(s) still present - Sell/Hop blocked"
+        )
+
+        return false, extraCollected
+    end
+
+    return true, extraCollected
 end
 
 function F.isBundleItem(item)
@@ -30337,6 +31335,16 @@ function F.isCellKeepItem(item)
         return true
     end
 
+    -- A named Cell reward target means "collect and keep". Protect it from the
+    -- lower-rarity Cell sell pass automatically.
+    if type(State.cellFarm.lootNames) == "table"
+        and State.cellFarm.lootNames[
+            nameKey
+        ] == true
+    then
+        return true
+    end
+
     local rarity =
         F.getInventoryItemRarity(
             item
@@ -30494,7 +31502,7 @@ end
 function F.sellCellInventory(token)
     F.setCellFarmStage(
         "SELLING",
-        "Keeping Legendary/Mythic + whitelist"
+        "Target reward loot cleared | keeping Legendary/Mythic + Always Keep + Cell Loot Names"
     )
 
     for _ = 1, Config.CELL_SELL_RETRIES do
@@ -30552,7 +31560,7 @@ function F.updateCellFarmUI()
     if State.cellHopButton then
         State.cellHopButton.Text =
             State.cellFarm.serverHopEnabled
-            and "HOP NOW"
+            and "HOP AFTER RUN"
             or "SAME SERVER"
     end
 
@@ -30702,11 +31710,11 @@ function F.updateCellFarmUI()
         .. tostring(State.cellFarm.cradleRecorderReportPath or "None")
         .. " | result="
         .. tostring(State.cellFarm.cradleRecorderResult or "None")
-        .. "\nCradle spam: "
+        .. "\nCradle monitor: "
         .. tostring(State.cellFarm.cradleSpamPhase or "OFF")
-        .. " | E="
+        .. " | E-cycles="
         .. tostring(State.cellFarm.cradleESpamCount or 0)
-        .. " | 1="
+        .. " | 1-cycles="
         .. tostring(State.cellFarm.cradleOneSpamCount or 0)
         .. "\nAutoKey: "
         .. (State.cellFarm.cradleAutoKeyActive and "ACTIVE " or "STOPPED ")
@@ -30715,6 +31723,10 @@ function F.updateCellFarmUI()
         .. tostring(State.cellFarm.cradleAutoKeyDriver or "None")
         .. " | stop="
         .. tostring(State.cellFarm.cradleAutoKeyLastStopReason or "None")
+        .. " | pending="
+        .. tostring(State.cellFarm.cradleAutoKeyStopPending == true)
+        .. " | stop tries="
+        .. tostring(State.cellFarm.cradleAutoKeyStopAttempts or 0)
         .. "\nDirect IY Bridge: "
         .. tostring(State.cellFarm.cradleIYStatus or "Direct IY bridge expected")
         .. " | ready="
@@ -30747,6 +31759,20 @@ function F.updateCellFarmUI()
         .. tostring(State.cellFarm.bossSpawnSource or "None")
         .. " | SpawnEvent RX: "
         .. tostring(State.cellFarm.bossSpawnRemoteEvents or 0)
+        .. "\nBoss approach: "
+        .. (State.cellFarm.bossApproachActive and "ACTIVE" or "STOPPED")
+        .. " | "
+        .. tostring(State.cellFarm.bossApproachStatus or "Idle")
+        .. "\nCell Loot Names: "
+        .. (
+            type(State.cellFarm.lootNameOrder) == "table"
+            and #State.cellFarm.lootNameOrder > 0
+            and table.concat(
+                State.cellFarm.lootNameOrder,
+                ", "
+            )
+            or "None (Legendary/Mythic only)"
+        )
         .. "\nWeapon: "
         .. tostring(State.cellFarm.weaponStatus)
         .. "\nBoss: The Cell Of Life | "
@@ -30786,6 +31812,8 @@ function F.updateCellFarmUI()
         .. tostring(State.cellFarm.rewardChestsFound or 0)
         .. " | OpenRemote: "
         .. tostring(State.cellFarm.rewardChestRemoteCalls or 0)
+        .. " | ChestNotify: "
+        .. tostring(State.cellFarm.rewardChestItemNotifyEvidence or 0)
         .. " | Drop waves: "
         .. tostring(State.cellFarm.rewardDropWaves or 0)
         .. " | Drops: "
@@ -30839,18 +31867,12 @@ function F.cellFarmHop(token, reason)
     end
 
     if not State.cellFarm.serverHopEnabled then
-        if F.releaseCellCradleAutoKey then
+        if F.cleanupCellTransientRuntime then
             pcall(
-                F.releaseCellCradleAutoKey,
+                F.cleanupCellTransientRuntime,
                 "Cell Farm same-server hop guard"
             )
         end
-
-        F.stopLootLock("CELL")
-        F.stopMovementFlight("CELL")
-        F.stopMovementFlight("MONSTER_LOCK")
-        F.releaseMovement("CELL")
-        F.releaseMovement("MONSTER_LOCK")
 
         F.setCellFarmStage(
             "SAME SERVER MODE",
@@ -30871,9 +31893,23 @@ function F.cellFarmHop(token, reason)
         return false
     end
 
-    if F.releaseCellCradleAutoKey then
+    local previousStage =
+        tostring(
+            State.cellFarm.stage
+            or ""
+        )
+
+    -- A manual/avoidance hop can occur during combat. Stop every Hub-owned
+    -- combat path before asking TeleportService to move the client.
+    if F.stopCellCombatForPlayerHop then
         pcall(
-            F.releaseCellCradleAutoKey,
+            F.stopCellCombatForPlayerHop
+        )
+    end
+
+    if F.cleanupCellTransientRuntime then
+        pcall(
+            F.cleanupCellTransientRuntime,
             "Cell Farm server hop"
         )
     end
@@ -30885,14 +31921,6 @@ function F.cellFarmHop(token, reason)
         tostring(reason or "Searching next server")
     )
 
-    F.stopLootLock("CELL")
-    F.stopMovementFlight("CELL")
-    F.stopMovementFlight("MONSTER_LOCK")
-    F.releaseMovement("CELL")
-    F.releaseMovement("MONSTER_LOCK")
-
-    State.cellFarm.hops =
-        State.cellFarm.hops + 1
     F.markConfigDirty()
     F.saveFarmConfig(true)
 
@@ -30906,16 +31934,156 @@ function F.cellFarmHop(token, reason)
             }
         )
 
-    if not success then
-        F.recordCellFailure(
-            "Server hop could not start"
-        )
+    if success then
+        -- Do not count an initiated teleport as a completed hop. The destination
+        -- runtime increments Cell hops only when it actually starts in resume mode.
+        return true
     end
 
-    return success
+    -- Do not leave stale resume state when no teleport was started.
+    F.setCellResumeFlag(false)
+
+    F.recordCellFailure(
+        "Server hop could not start"
+    )
+
+    -- If this was a manual hop attempted mid-fight and the boss is still safe,
+    -- restore combat rather than silently leaving the active fight disabled.
+    if previousStage == "WAITING FOR BOSS"
+        and F.isCellFarmActive(token)
+    then
+        local rawBoss =
+            F.findCellBossModelRaw()
+
+        if rawBoss
+            and rawBoss.Parent
+            and F.startCellBossApproach
+        then
+            F.startCellBossApproach(
+                token,
+                rawBoss
+            )
+        end
+    elseif previousStage == "FIGHTING"
+        and F.isCellFarmActive(token)
+    then
+        local liveBoss =
+            F.getCellBoss()
+
+        local nearbyPlayer =
+            liveBoss
+            and F.getNearbyCellBossPlayer(
+                liveBoss
+            )
+            or nil
+
+        if liveBoss
+            and not nearbyPlayer
+        then
+            F.setCellFarmStage(
+                "FIGHTING",
+                "Server hop failed - resuming current Cell fight"
+            )
+
+            F.prepareCellFight(
+                liveBoss,
+                token
+            )
+        end
+    end
+
+    return false
+end
+
+function F.retryCellFarmHopUntilTransfer(token, reason)
+    local originalJobId =
+        tostring(game.JobId)
+
+    while F.isCellFarmActive(token)
+        and State.cellFarm.serverHopEnabled
+    do
+        if not State.serverHopBusy then
+            local started =
+                F.cellFarmHop(
+                    token,
+                    reason
+                )
+
+            if not started then
+                if not F.isCellFarmActive(token)
+                    or not State.cellFarm.serverHopEnabled
+                then
+                    break
+                end
+
+                F.setCellFarmStage(
+                    "SERVER HOP RETRY",
+                    "Server hop did not start; retrying without advancing the Cell round"
+                )
+
+                if not F.cellFarmWait(
+                    token,
+                    Config.CELL_CRADLE_SAME_SERVER_RETRY
+                ) then
+                    return false
+                end
+            end
+        end
+
+        -- A successful TeleportService call is only an initiation, not proof of
+        -- transfer. Stay alive in the current server until Roblox either removes
+        -- this script via teleport or TeleportInitFailed/timeout clears busy.
+        while F.isCellFarmActive(token)
+            and State.serverHopBusy
+            and tostring(game.JobId) == originalJobId
+        do
+            task.wait(0.25)
+        end
+
+        if tostring(game.JobId) ~= originalJobId then
+            return true
+        end
+
+        if not F.isCellFarmActive(token)
+            or not State.cellFarm.serverHopEnabled
+        then
+            break
+        end
+
+        F.setCellFarmStage(
+            "SERVER HOP RETRY",
+            "Teleport attempt failed in the current server; selecting another server"
+        )
+
+        if not F.cellFarmWait(
+            token,
+            Config.CELL_CRADLE_SAME_SERVER_RETRY
+        ) then
+            return false
+        end
+    end
+
+    return false
 end
 
 function F.runCellFarm(token, resumed)
+    -- A previous same-server iteration may have exited through a guarded return.
+    -- Clear inert observer/connection handles before creating a new round.
+    if State.cellFarm.activeRewardObserver
+        and F.stopCellRewardEventObserver
+    then
+        F.stopCellRewardEventObserver(
+            State.cellFarm.activeRewardObserver
+        )
+    end
+
+    if State.cellFarm.activeRewardChestConnection then
+        pcall(function()
+            State.cellFarm.activeRewardChestConnection:Disconnect()
+        end)
+        State.cellFarm.activeRewardChestConnection = nil
+    end
+
     local needsMenuBootstrap =
         resumed
         or State.cellFarm.launchFromMenu
@@ -30973,10 +32141,20 @@ function F.runCellFarm(token, resumed)
             F.recordCellFailure(
                 "World readiness timeout; Server Hop mode active"
             )
-            return F.cellFarmHop(
-                token,
-                "World readiness timeout"
-            )
+
+            local hopStarted =
+                F.retryCellFarmHopUntilTransfer(
+                    token,
+                    "World readiness timeout"
+                )
+
+            if hopStarted then
+                return true
+            end
+
+            if not F.isCellFarmActive(token) then
+                return false
+            end
         end
 
         F.recordCellFailure(
@@ -31088,6 +32266,16 @@ function F.runCellFarm(token, resumed)
         return false
     end
 
+    local currentBossPart =
+        F.getMonsterPart(
+            boss
+        )
+
+    if currentBossPart then
+        State.cellFarm.lastBossPosition =
+            currentBossPart.Position
+    end
+
     local dropSnapshot =
         F.captureCellDropSnapshot()
 
@@ -31097,6 +32285,7 @@ function F.runCellFarm(token, resumed)
     State.cellFarm.rewardChestsFound = 0
     State.cellFarm.rewardChestsOpened = 0
     State.cellFarm.rewardChestRemoteCalls = 0
+    State.cellFarm.rewardChestItemNotifyEvidence = 0
     State.cellFarm.rewardLastChestDebugId = "None"
     State.cellFarm.rewardDropWaves = 0
     State.cellFarm.rewardDropCount = 0
@@ -31152,7 +32341,8 @@ function F.runCellFarm(token, resumed)
             local avoidStillActive =
                 F.handleCellBossPlayerAvoidance(
                     token,
-                    boss
+                    boss,
+                    false
                 )
 
             if not avoidStillActive then
@@ -31181,6 +32371,8 @@ function F.runCellFarm(token, resumed)
                 and "Fight interrupted - waiting/reacquiring The Cell Of Life"
                 or "Fight interrupted - waiting/reacquiring The Cell Of Life; NO HOP"
         )
+
+        local lastRecoveryChestScan = 0
 
         while F.isCellFarmActive(token)
             and not fought
@@ -31215,14 +32407,32 @@ function F.runCellFarm(token, resumed)
                 fought = true
                 break
             else
-                local rewardCandidates =
-                    F.collectCellRewardChestCandidates(
-                        rewardChestSnapshot
-                    )
-
-                if #rewardCandidates > 0 then
+                -- Cheap reward evidence first. Avoid a ~50k Workspace descendant
+                -- scan on every one-second recovery tick.
+                if State.cellFarm.bossDefeatEventConfirmed
+                    or F.countCellRewardDrops(
+                        dropSnapshot
+                    ) > 0
+                then
                     fought = true
                     break
+                end
+
+                if os.clock() - lastRecoveryChestScan
+                    >= 3.0
+                then
+                    lastRecoveryChestScan =
+                        os.clock()
+
+                    local rewardCandidates =
+                        F.collectCellRewardChestCandidates(
+                            rewardChestSnapshot
+                        )
+
+                    if #rewardCandidates > 0 then
+                        fought = true
+                        break
+                    end
                 end
 
                 State.cellFarm.status =
@@ -31230,7 +32440,7 @@ function F.runCellFarm(token, resumed)
 
                 if not F.cellFarmWait(
                     token,
-                    1.00
+                    0.50
                 ) then
                     return false
                 end
@@ -31316,16 +32526,18 @@ function F.runCellFarm(token, resumed)
     if not lootComplete then
         F.setCellFarmStage(
             "LOOT INCOMPLETE",
-            "Nearby Legendary/Mythic pickup queue incomplete - next round blocked"
+            "Eligible Cell reward pickup queue incomplete - Sell/Hop blocked"
         )
 
         return false
     end
 
     State.cellFarm.status =
-        "Nearby Legendary/Mythic collected: "
+        "Eligible Cell reward loot collected: "
         .. tostring(collectedLoot)
-        .. " item(s) | radius "
+        .. " item(s) | "
+        .. F.getCellLootFilterSummary()
+        .. " | radius "
         .. tostring(Config.CELL_REWARD_LOOT_NEARBY_RADIUS)
         .. " studs"
 
@@ -31363,6 +32575,43 @@ function F.runCellFarm(token, resumed)
     if not F.isCellFarmActive(token) then
         return false
     end
+
+    -- v6.6.16 invariant: do not leave the reward area for the Merchant until
+    -- every eligible Legendary/Mythic OR exact-name target is confirmed gone.
+    F.setCellFarmStage(
+        "PRE-SELL LOOT GUARD",
+        "Confirming all target reward loot is collected before moving to Sell"
+    )
+
+    local preSellClear,
+        preSellCollected =
+            F.ensureCellTargetLootCleared(
+                token,
+                dropSnapshot,
+                "PRE-SELL LOOT GUARD"
+            )
+
+    collectedLoot =
+        collectedLoot
+        + (tonumber(preSellCollected) or 0)
+
+    if not preSellClear then
+        F.setCellFarmStage(
+            "PRE-SELL LOOT HOLD",
+            "Eligible reward loot remains unresolved - Sell/Hop blocked"
+        )
+
+        return false
+    end
+
+    if not F.isCellFarmActive(token) then
+        return false
+    end
+
+    F.setCellFarmStage(
+        "READY TO SELL",
+        "All eligible reward loot cleared - moving to Merchant"
+    )
 
     local soldAll =
         F.sellCellInventory(
@@ -31424,72 +32673,34 @@ function F.runCellFarm(token, resumed)
         return false
     end
 
-    -- v6.6.13 final anti-premature-transition guard. Rarity metadata or a delayed
-    -- reward layer can become visible after the first loot pass without
-    -- changing inventory state. Re-check every opened-chest anchor immediately
-    -- before allowing the server transition.
-    local finalEligible =
-        F.collectCellLootCandidates(
-            dropSnapshot,
-            State.cellFarm.rewardLootAnchors,
-            Config.CELL_REWARD_LOOT_NEARBY_RADIUS,
-            Config.CELL_REWARD_LOOT_RARITIES
-        )
-
-    if #finalEligible > 0 then
-        F.setCellFarmStage(
-            "LOOT FINAL GUARD",
-            tostring(#finalEligible)
-                .. " nearby Legendary/Mythic item(s) still present - returning to pickup"
-        )
-
-        local extraCollected,
-            extraComplete =
-                F.collectCellBossLoot(
-                    token,
-                    dropSnapshot
-                )
-
-        collectedLoot =
-            collectedLoot
-            + (tonumber(extraCollected) or 0)
-
-        if not F.isCellFarmActive(token) then
-            return false
-        end
-
-        if not extraComplete then
-            F.setCellFarmStage(
-                "LOOT FINAL GUARD",
-                "Eligible reward loot remains unresolved - next round blocked"
-            )
-
-            return false
-        end
-
-        finalEligible =
-            F.collectCellLootCandidates(
+    -- Secondary delayed-drop guard after Sell. This does not permit Sell to
+    -- happen early: PRE-SELL LOOT GUARD already had to pass first. It only catches
+    -- a late reward layer that materializes while travelling/selling.
+    local postSellClear,
+        postSellCollected =
+            F.ensureCellTargetLootCleared(
+                token,
                 dropSnapshot,
-                State.cellFarm.rewardLootAnchors,
-                Config.CELL_REWARD_LOOT_NEARBY_RADIUS,
-                Config.CELL_REWARD_LOOT_RARITIES
+                "POST-SELL LOOT GUARD"
             )
 
-        if #finalEligible > 0 then
-            F.setCellFarmStage(
-                "LOOT FINAL GUARD",
-                tostring(#finalEligible)
-                    .. " eligible reward item(s) still present - next round blocked"
-            )
+    collectedLoot =
+        collectedLoot
+        + (tonumber(postSellCollected) or 0)
 
-            return false
-        end
+    if not postSellClear then
+        F.setCellFarmStage(
+            "POST-SELL LOOT HOLD",
+            "Late eligible reward loot remains unresolved - Hop/next round blocked"
+        )
+
+        return false
     end
 
     if State.cellFarm.serverHopEnabled then
         F.setCellFarmStage(
             "READY TO HOP",
-            "Legendary/Mythic reward loot cleared; Bundle/Sell complete | Server Hop mode"
+            "Eligible reward loot cleared; Bundle/Sell complete | Server Hop mode"
         )
 
         if not F.cellFarmWait(
@@ -31502,16 +32713,25 @@ function F.runCellFarm(token, resumed)
         -- Re-check the live mode after the delay so the user can switch to
         -- Same Server while READY TO HOP without being teleported unexpectedly.
         if State.cellFarm.serverHopEnabled then
-            return F.cellFarmHop(
-                token,
-                "Cell run complete"
-            )
+            local hopStarted =
+                F.retryCellFarmHopUntilTransfer(
+                    token,
+                    "Cell run complete"
+                )
+
+            if hopStarted then
+                return true
+            end
+
+            if not F.isCellFarmActive(token) then
+                return false
+            end
         end
     end
 
     F.setCellFarmStage(
         "ROUND COMPLETE",
-        "Legendary/Mythic reward loot cleared; Bundle/Sell complete | staying in same server"
+        "Eligible reward loot cleared; Bundle/Sell complete | staying in same server"
     )
 
     F.stopLootLock("CELL")
@@ -31534,6 +32754,7 @@ function F.runCellFarm(token, resumed)
     State.cellFarm.rewardChestsFound = 0
     State.cellFarm.rewardChestsOpened = 0
     State.cellFarm.rewardChestRemoteCalls = 0
+    State.cellFarm.rewardChestItemNotifyEvidence = 0
     State.cellFarm.rewardLootAnchors = {}
     State.cellFarm.rewardLootAnchorCount = 0
     State.cellFarm.rewardLootAnchorPosition = nil
@@ -31548,8 +32769,15 @@ function F.runCellFarm(token, resumed)
     State.cellFarm.lastBossHealthState = "WAITING"
     State.cellFarm.bossSpawnConfirmed = false
     State.cellFarm.bossSpawnSource = "None"
-    State.cellFarm.bossApproachActive = false
+
+    if F.stopCellBossApproach then
+        F.stopCellBossApproach(
+            "Same-server round reset"
+        )
+    end
+
     State.cellFarm.bossApproachStatus = "Idle"
+    State.cellFarm.lastBossPosition = nil
     State.cellFarm.playerAvoidHopTriggered = false
 
     F.setCellFarmStage(
@@ -31563,18 +32791,17 @@ end
 function F.stopCellFarm(restorePrevious, reason)
     F.setCellResumeFlag(false)
 
-    if F.releaseCellCradleAutoKey then
-        pcall(
-            F.releaseCellCradleAutoKey,
-            "Cell Farm stopped"
-        )
-    end
+    local transientCleanupConfirmed = true
 
-    if F.stopCellBossApproach then
-        pcall(
-            F.stopCellBossApproach,
-            "Cell Farm stopped"
-        )
+    if F.cleanupCellTransientRuntime then
+        local ok, cleaned =
+            pcall(
+                F.cleanupCellTransientRuntime,
+                "Cell Farm stopped"
+            )
+
+        transientCleanupConfirmed =
+            ok and cleaned ~= false
     end
 
     local wasEnabled =
@@ -31589,6 +32816,21 @@ function F.stopCellFarm(restorePrevious, reason)
     State.cellFarm.stage = "OFF"
     State.cellFarm.status =
         tostring(reason or "Stopped")
+
+    if not transientCleanupConfirmed then
+        State.cellFarm.status =
+            State.cellFarm.status
+            .. " | WARNING: DIRECT-IY Stop() unconfirmed"
+
+        if F.notify then
+            F.notify(
+                "Cell Farm",
+                "Cell Farm stopped, but the external DIRECT-IY loop could not be confirmed stopped. Restore/register the bridge and use its Stop control.",
+                "warning",
+                5
+            )
+        end
+    end
 
     F.stopLootLock("CELL")
     F.stopMovementFlight("CELL")
@@ -31644,6 +32886,42 @@ function F.startCellFarm(resumed)
     end
 
     F.captureCellRestoreState()
+
+    if F.cleanupCellTransientRuntime then
+        pcall(
+            F.cleanupCellTransientRuntime,
+            "Starting Cell Farm - clearing stale transient state"
+        )
+    end
+
+    if State.cellFarm.cradleAutoKeyStopPending then
+        State.cellFarm.restore = nil
+        State.cellFarm.enabled = false
+        State.cellFarm.running = false
+        State.cellFarm.status =
+            "Cannot start Cell Farm: previous Direct-IY loop Stop() is still unconfirmed"
+
+        if State.cellFarmToggle then
+            State.cellFarmToggle:SetSilent(false)
+        end
+
+        F.setCellFarmHubHidden(
+            false
+        )
+
+        if F.notify then
+            F.notify(
+                "Cell Farm",
+                "Direct IY Stop() is still pending. Restore/register the bridge and stop the old loop before starting again.",
+                "error",
+                5
+            )
+        end
+
+        F.updateCellFarmUI()
+        return false
+    end
+
     F.applyCellExclusiveMode()
 
     if not resumed then
@@ -31653,6 +32931,7 @@ function F.startCellFarm(resumed)
         State.cellFarm.rewardChestsFound = 0
         State.cellFarm.rewardChestsOpened = 0
         State.cellFarm.rewardChestRemoteCalls = 0
+        State.cellFarm.rewardChestItemNotifyEvidence = 0
         State.cellFarm.rewardLootAnchors = {}
         State.cellFarm.rewardLootAnchorCount = 0
         State.cellFarm.rewardLootAnchorPosition = nil
@@ -31723,6 +33002,8 @@ function F.startCellFarm(resumed)
         State.cellFarm.cradleAutoKeyVirtualKey = nil
         State.cellFarm.cradleAutoKeyCode = nil
         State.cellFarm.cradleAutoKeyStopRequested = false
+        State.cellFarm.cradleAutoKeyStopPending = false
+        State.cellFarm.cradleAutoKeyStopAttempts = 0
         State.cellFarm.cradleAutoKeyLastStopReason = "None"
         State.cellFarm.cradleAutoKeyLastAt = 0
         State.cellFarm.cradleIYExecAvailable = false
@@ -31744,8 +33025,22 @@ function F.startCellFarm(resumed)
         State.cellFarm.bossApproachActive = false
         State.cellFarm.bossApproachToken = 0
         State.cellFarm.bossApproachStatus = "Idle"
+        State.cellFarm.activeDialogObserver = nil
+        State.cellFarm.activeBossWatcher = nil
+        State.cellFarm.activeRewardObserver = nil
+        State.cellFarm.activeRewardChestConnection = nil
+        State.cellFarm.lastBossPosition = nil
         State.cellFarm.bossLastSpawnEvent = "None"
         State.cellFarm.startedAt = os.clock()
+    end
+
+    if resumed then
+        -- This is the first point that proves a Cell teleport actually reached a
+        -- destination runtime. Count successful hops here, never at initiation.
+        State.cellFarm.hops =
+            (State.cellFarm.hops or 0) + 1
+        F.markConfigDirty()
+        F.saveFarmConfig(true)
     end
 
     State.cellFarm.token =
@@ -31762,7 +33057,8 @@ function F.startCellFarm(resumed)
         true
     )
 
-    F.setCellResumeFlag(true)
+    -- Resume flag is a teleport transaction marker, not a general "Cell enabled"
+    -- flag. cellFarmHop() arms it immediately before queueing a teleport.
     State.cellFarm.stage =
         resumed
         and "RESUME"
@@ -31823,6 +33119,15 @@ function F.startCellFarm(resumed)
                         )
                     end,
                     function(message)
+                        if debug
+                            and type(debug.traceback) == "function"
+                        then
+                            return debug.traceback(
+                                tostring(message),
+                                2
+                            )
+                        end
+
                         return tostring(message)
                     end
                 )
@@ -31838,33 +33143,38 @@ function F.startCellFarm(resumed)
                     "Unhandled Cell Farm error: "
                         .. tostring(result)
                 )
-                break
+
+                if F.isCellFarmActive(token) then
+                    F.stopCellFarm(
+                        true,
+                        "Cell Farm stopped safely after runtime error"
+                    )
+                end
+
+                return
             end
 
             if result == "REPEAT_SAME_SERVER" then
                 if not F.isCellFarmActive(token) then
-                    break
+                    return
                 end
 
                 task.wait(0.05)
+            elseif result == true then
+                -- A true terminal result means a server teleport was successfully
+                -- started. Leave the resume flag/state intact for the new server.
+                return
             else
-                break
-            end
-        end
+                -- Any unrecoverable false/nil result must not leave Exclusive Mode,
+                -- hidden Hub state, combat toggles, or transient connections behind.
+                if F.isCellFarmActive(token) then
+                    F.stopCellFarm(
+                        true,
+                        "Cell Farm stopped safely after an unrecoverable flow result"
+                    )
+                end
 
-        if F.isCellFarmActive(token) then
-            State.cellFarm.running = false
-
-            if not success then
-                F.setCellFarmStage(
-                    "ERROR",
-                    "Unhandled error"
-                )
-            elseif result ~= true then
-                F.setCellFarmStage(
-                    "IDLE",
-                    (State.cellFarm.serverHopEnabled and "Server-hop run stopped" or "Same-server loop stopped")
-                )
+                return
             end
         end
     end)
@@ -35606,12 +36916,21 @@ function F.shutdown()
     State.stoneAccordEnabled = false
     State.nightCallEnabled = false
     State.nightCallBusy = false
-    if F.releaseCellCradleAutoKey then
-        pcall(
-            F.releaseCellCradleAutoKey,
-            "Hub shutdown"
-        )
+
+    if F.cleanupCellTransientRuntime then
+        local ok, cleaned =
+            pcall(
+                F.cleanupCellTransientRuntime,
+                "Hub shutdown"
+            )
+
+        if not ok or cleaned == false then
+            warn(
+                "[The Veil Hub][CellFarm] Hub shutdown could not confirm DIRECT-IY Stop()."
+            )
+        end
     end
+
     if State.cellFarm then
         State.cellFarm.enabled = false
         State.cellFarm.running = false
@@ -35885,7 +37204,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics (FPS untouched) / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("The Veil Hub v6.6.13: fast Cell boss engage / selectable SAME-SERVER or SERVER-HOP / DIRECT custom-IY bridge / reward movement lock / multi-anchor Legendary+Mythic loot")
+print("The Veil Hub v6.6.16: release-audited Cell lifecycle / exact-name Cell Loot targets / PRE-SELL + POST-SELL loot guards / fast boss engage / selectable SAME-SERVER or SERVER-HOP / DIRECT custom-IY bridge")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -35901,7 +37220,7 @@ print("==========================================")
 if type(writefile) == "function" then
     local saved, saveError = pcall(
         writefile,
-        "TheVeilHub_v6_6_13_Runtime.lua",
+        "TheVeilHub_v6_6_16_Runtime.lua",
         runtimeSource
     )
 
@@ -35911,19 +37230,19 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.6.13.")
+    warn("[The Veil Hub] loadstring is required to launch v6.6.16.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.6.13 compile failed:", compileError)
+    warn("[The Veil Hub] v6.6.16 compile failed:", compileError)
     return
 end
 
 local launched, runtimeError = pcall(chunk)
 
 if not launched then
-    warn("[The Veil Hub] v6.6.13 runtime failed:", runtimeError)
+    warn("[The Veil Hub] v6.6.16 runtime failed:", runtimeError)
 end
