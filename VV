@@ -1,10 +1,10 @@
--- The Veil Hub v6.6.10 Cell Custom-IY Hotkey Bridge loader
+-- The Veil Hub v6.6.13 Cell Fast Boss Engage loader
 -- Keeps a clean local runtime copy for teleport resume, then executes it.
 local runtimeSource = [==============[
 
 -- =========================================================
 -- THE VEIL HUB
--- v6.6.10: Cell Farm remains SAME-SERVER ONLY. The Cradle input bridge now targets the user's custom Infinite Yield hotkeys directly: J starts the custom E loop, K starts the custom key-1 loop, and Equals+Backspace stops either loop. The Hub no longer downloads or invokes official IY commands for this path.
+-- v6.6.13: Keeps selectable Same Server / Server Hop mode and the DIRECT custom-IY bridge, while adding immediate pre-fight Cell boss approach as soon as the boss model appears. Movement starts before HP/alive confirmation; attacks remain gated until the boss is alive and the weapon is equipped.
 -- Cleaned from a corrupted multi-version export.
 -- Sidebar UI + Collapse + ESP
 --
@@ -124,7 +124,7 @@ local Config = {
     MOVEMENT_LEASE_SECONDS = 0.75,
     RECOVERY_BASE_DELAY = 1,
     RECOVERY_MAX_DELAY = 30,
-    CONFIG_SCHEMA_VERSION = 12,
+    CONFIG_SCHEMA_VERSION = 13,
     AUTO_FARM_INTERVAL = 0.07,
     AUTO_SELL_CHECK_INTERVAL = 1.00,
     INVENTORY_MAX_CAPACITY = 150,
@@ -306,8 +306,9 @@ local Config = {
     CELL_POST_LOOT_SETTLE = 1.25,
     CELL_POST_BUNDLE_SETTLE = 1.25,
     CELL_POST_SELL_SETTLE = 2.50,
-    CELL_PRE_HOP_DELAY = 4.00, -- legacy; Cell Farm remains same-server only in v6.6.10
+    CELL_PRE_HOP_DELAY = 4.00,
     CELL_SAME_SERVER_ROUND_DELAY = 4.00,
+    CELL_SERVER_HOP_DEFAULT = false, -- OFF = Same Server, ON = Server Hop
     CELL_INVENTORY_STABLE_WINDOW = 1.50,
     CELL_FIGHT_TIMEOUT = 420,
     CELL_BOSS_HP_UI_INTERVAL = 0.20,
@@ -390,21 +391,21 @@ local Config = {
     CELL_DIALOG_CHECKPOINT_ONLY = false,
     CELL_DIALOG_CHECKPOINT_HEARTBEAT = 2.0,
 
-    -- v6.6.10: bridge to the user's already-running CUSTOM Infinite Yield.
-    -- Custom IY hotkeys supplied by the user:
-    --   J = start/drive the IY E auto-press loop
-    --   K = start/drive the IY key-1 auto-press loop
-    --   Equals + Backspace held together = stop the active E/1 loop
-    -- The Hub deliberately does NOT download official IY here; the user's custom
-    -- IY must already be running so its private hotkey handlers receive these taps.
+    -- v6.6.13: DIRECT bridge to the user's already-running CUSTOM Infinite Yield.
+    -- Preferred contract:
+    --   getgenv().TheVeilIYBridge = {
+    --       StartE = function() ... end,
+    --       Start1 = function() ... end,
+    --       Stop = function() ... end,
+    --   }
+    -- The bridge can also live in shared/_G and several compatibility table names
+    -- are accepted. No synthetic J/K/Equals+Backspace input is used anymore.
     CELL_CRADLE_PHYSICAL_SPAM_MODE = true,
-    CELL_CRADLE_CUSTOM_IY_HOTKEY_MODE = true,
-    CELL_CRADLE_CUSTOM_IY_HOTKEY_HOLD = 0.10,
-    CELL_CRADLE_CUSTOM_IY_STOP_HOLD = 0.14,
-    CELL_CRADLE_CUSTOM_IY_PHASE_SETTLE = 0.22,
-    CELL_CRADLE_E_SPAM_INTERVAL = 0.10, -- monitor cadence only; IY owns E repetition
+    CELL_CRADLE_DIRECT_IY_BRIDGE_MODE = true,
+    CELL_CRADLE_DIRECT_IY_PHASE_SETTLE = 0.12,
+    CELL_CRADLE_E_SPAM_INTERVAL = 0.10, -- monitor cadence only; custom IY owns E repetition
     CELL_CRADLE_E_SPAM_HOLD = 0.10,
-    CELL_CRADLE_ONE_SPAM_INTERVAL = 0.10, -- monitor cadence only; IY owns 1 repetition
+    CELL_CRADLE_ONE_SPAM_INTERVAL = 0.10, -- monitor cadence only; custom IY owns 1 repetition
     CELL_CRADLE_ONE_SPAM_HOLD = 0.10,
     CELL_CRADLE_BACKGROUND_REMOTE_INTERVAL = 0.35,
     CELL_CRADLE_SPAM_RECHECK_POSITION_EVERY = 4.0,
@@ -421,6 +422,10 @@ local Config = {
     CELL_CRADLE_OPTION_RETRIES = 2,
     CELL_CRADLE_BOSS_MODEL_WAIT = 30.0,
     CELL_CRADLE_BOSS_ALIVE_WAIT = 10.0,
+    -- v6.6.13: move toward the Cell immediately when its model appears instead
+    -- of standing at The Cradle for the alive/HP confirmation window.
+    CELL_BOSS_APPROACH_POLL = 0.03,
+    CELL_BOSS_APPROACH_ARRIVAL_DISTANCE = 1.25,
     CELL_CRADLE_BOSS_WAIT_NOTICE = 20.0,
     CELL_CRADLE_RETRY_DELAY = 1.25,
     CELL_CRADLE_SAME_SERVER_RETRY = 2.0,
@@ -439,8 +444,8 @@ local Config = {
     CELL_MENU_PROTOCOL_ATTEMPTS = 5,
     CELL_MENU_PROTOCOL_INTERVAL = 1.35,
     CELL_WEAPON_WAIT_TIMEOUT = 12,
-    CELL_RUNTIME_FILE = "TheVeilHub_v6_6_10_Runtime.lua",
-    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_6_10_CellResume.flag",
+    CELL_RUNTIME_FILE = "TheVeilHub_v6_6_13_Runtime.lua",
+    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_6_13_CellResume.flag",
     CELL_DEFAULT_FIGHT_HEIGHT = 20,
     CELL_DEFAULT_TRAVEL_SPEED = 2.0,
 
@@ -463,7 +468,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.6.10 Cell Custom-IY Hotkeys",
+    HUB_VERSION = "v6.6.13 Cell Fast Boss Engage",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -998,8 +1003,11 @@ local State = {
         cradleAutoKeyLastAt = 0,
         cradleIYLoaded = false,
         cradleIYExecAvailable = false,
-        cradleIYStatus = "External custom IY expected (J/K hotkeys)",
+        cradleIYStatus = "Direct IY bridge not resolved yet",
         cradleIYLastError = "None",
+        cradleIYBridgeReady = false,
+        cradleIYBridgeSource = "None",
+        cradleIYBridgeRegisteredAt = 0,
         cradleBackgroundMode = false,
         cradleBackgroundStartCalls = 0,
         cradleBackgroundOptionCalls = 0,
@@ -1010,8 +1018,12 @@ local State = {
         bossSpawnSource = "None",
         bossSpawnRemoteEvents = 0,
         bossLastSpawnEvent = "None",
+        bossApproachActive = false,
+        bossApproachToken = 0,
+        bossApproachStatus = "Idle",
         fightHeight = Config.CELL_DEFAULT_FIGHT_HEIGHT,
         travelSpeed = Config.CELL_DEFAULT_TRAVEL_SPEED,
+        serverHopEnabled = Config.CELL_SERVER_HOP_DEFAULT,
         runs = 0,
         kills = 0,
         lootCollected = 0,
@@ -5727,6 +5739,13 @@ end)
 
 State.cellFarmSection = F.createSection(State.cellFarmBody)
 
+State.cellServerHopToggle = F.createToggle(
+    State.cellFarmSection,
+    "Cell Server Hop",
+    "OFF = keep farming in the current server. ON = after reward/loot/bundle/sell guards, hop to a new server and resume Cell Farm automatically. The selected policy also applies to world-readiness timeout and nearby-player avoidance.",
+    State.cellFarm.serverHopEnabled
+)
+
 State.cellFarmToggle = F.createToggle(
     State.cellFarmSection,
     "Full Auto The Cell Of Life",
@@ -5847,7 +5866,7 @@ State.cellHopButton,
 State.cellStopButton = F.createActionRow(
     State.cellFarmSection,
     "Cell Farm Control",
-    "SAME SERVER",
+    State.cellFarm.serverHopEnabled and "HOP NOW" or "SAME SERVER",
     "STOP NOW"
 )
 
@@ -5864,6 +5883,28 @@ State.cellStatusLabel = F.createTextLabel(
 )
 State.cellStatusLabel.TextWrapped = true
 State.cellStatusLabel.TextYAlignment = Enum.TextYAlignment.Top
+
+State.cellServerHopToggle:OnChanged(function(state)
+    State.cellFarm.serverHopEnabled = state == true
+    F.markConfigDirty()
+
+    if State.cellHopButton then
+        State.cellHopButton.Text =
+            State.cellFarm.serverHopEnabled
+            and "HOP NOW"
+            or "SAME SERVER"
+    end
+
+    F.recordDiagnosticEvent(
+        "CellFarm",
+        "Farm mode changed to "
+            .. (State.cellFarm.serverHopEnabled and "SERVER HOP" or "SAME SERVER")
+    )
+
+    if F.updateCellFarmUI then
+        F.updateCellFarmUI()
+    end
+end)
 
 State.cellFarmToggle:OnChanged(function(state)
     if state then
@@ -5946,12 +5987,34 @@ State.cellTravelSpeedSlider:OnChanged(function(value)
 end)
 
 State.cellHopButton.MouseButton1Click:Connect(function()
-    F.notify(
-        "Cell Farm",
-        "Same-server mode is active. Cell Farm will not server hop.",
-        "info",
-        3
-    )
+    if not State.cellFarm.serverHopEnabled then
+        F.notify(
+            "Cell Farm",
+            "Same Server mode is active. Turn Cell Server Hop ON if you want to change servers.",
+            "info",
+            3
+        )
+        return
+    end
+
+    if not State.cellFarm.enabled then
+        F.notify(
+            "Cell Farm",
+            "Enable Full Auto The Cell Of Life first so Cell Farm can resume automatically after the hop.",
+            "warning",
+            3
+        )
+        return
+    end
+
+    task.spawn(function()
+        if F.cellFarmHop then
+            F.cellFarmHop(
+                State.cellFarm.token,
+                "Manual Cell Farm hop"
+            )
+        end
+    end)
 end)
 
 State.cellStopButton.MouseButton1Click:Connect(function()
@@ -6722,174 +6785,298 @@ function F.pressVirtualKey(keyCode, fallbackVirtualKey, holdSeconds, actionName)
     return false
 end
 
--- v6.6.10 CUSTOM Infinite Yield hotkey bridge for The Cradle.
--- The user's private IY owns the actual E/1 repeat loops. The Hub only sends the
--- user's control hotkeys once per phase and watches game state:
---   J -> custom IY starts pressing E
---   Equals + Backspace -> custom IY stops the active loop
---   K -> custom IY starts pressing 1
---   Equals + Backspace -> stop immediately when The Cell Of Life appears
--- Prefer executor keypress/keyrelease because the target is another local script's
--- hotkey listener. VirtualInputManager is a fallback when executor primitives are absent.
-function F.sendCellCustomIYHotkey(keyCode, virtualKey, label)
-    local farm = State.cellFarm
-    if not farm then
-        return false, "none"
+-- v6.6.13 DIRECT custom-IY bridge for The Cradle.
+--
+-- Synthetic keyboard events are intentionally not used here. The custom IY must expose
+-- the actual loop controls so the Hub can call them directly. Preferred contract:
+--
+-- getgenv().TheVeilIYBridge = {
+--     StartE = function() ... end,
+--     Start1 = function() ... end,
+--     Stop = function() ... end,
+-- }
+--
+-- If the Hub starts first, custom IY may instead call:
+-- getgenv().TheVeil_RegisterIYBridge({ StartE=..., Start1=..., Stop=... })
+--
+-- Compatibility table names and function aliases are accepted, but all three actions
+-- must resolve before Cell Farm will attempt the Cradle sequence.
+local CellIYBridgeCache = {
+    bridge = nil,
+    source = "None",
+}
+
+local CELL_IY_BRIDGE_TABLE_NAMES = {
+    "TheVeilIYBridge",
+    "TheVeil_IY_Bridge",
+    "CellIYBridge",
+    "CustomIYBridge",
+    "IYBridge",
+}
+
+local CELL_IY_START_E_NAMES = {
+    "StartE", "startE", "StartAutoE", "startAutoE", "BeginE", "beginE",
+}
+
+local CELL_IY_START_ONE_NAMES = {
+    "Start1", "start1", "StartOne", "startOne", "StartAuto1", "startAuto1",
+    "StartAutoOne", "startAutoOne", "Begin1", "begin1",
+}
+
+local CELL_IY_STOP_NAMES = {
+    "Stop", "stop", "StopAuto", "stopAuto", "StopAll", "stopAll",
+    "StopKeys", "stopKeys", "StopAutoKey", "stopAutoKey",
+}
+
+local function getFirstFunction(container, names)
+    if type(container) ~= "table" then
+        return nil, nil
     end
 
-    local hold =
-        math.max(
-            0.03,
-            tonumber(Config.CELL_CRADLE_CUSTOM_IY_HOTKEY_HOLD)
-                or 0.10
-        )
-
-    if type(keypress) == "function"
-        and type(keyrelease) == "function"
-        and virtualKey ~= nil
-    then
-        local ok = pcall(function()
-            keypress(virtualKey)
-            task.wait(hold)
-            keyrelease(virtualKey)
-        end)
-
-        if ok then
-            farm.cradleIYStatus =
-                "Custom IY hotkey sent: "
-                .. tostring(label or keyCode)
-            farm.cradleIYExecAvailable = false
-            farm.cradleIYLoaded = false
-            farm.cradleIYLastError = "None"
-            return true, "executor keypress/keyrelease"
+    for _, name in ipairs(names) do
+        local value = rawget(container, name)
+        if type(value) == "function" then
+            return value, name
         end
     end
 
-    local virtualInput = nil
-    pcall(function()
-        virtualInput =
-            game:GetService("VirtualInputManager")
-    end)
-
-    if virtualInput then
-        local ok = pcall(function()
-            virtualInput:SendKeyEvent(
-                true,
-                keyCode,
-                false,
-                game
-            )
-            task.wait(hold)
-            virtualInput:SendKeyEvent(
-                false,
-                keyCode,
-                false,
-                game
-            )
-        end)
-
-        if ok then
-            farm.cradleIYStatus =
-                "Custom IY hotkey sent: "
-                .. tostring(label or keyCode)
-            farm.cradleIYExecAvailable = false
-            farm.cradleIYLoaded = false
-            farm.cradleIYLastError = "None"
-            return true, "VirtualInputManager"
-        end
-    end
-
-    farm.cradleIYStatus =
-        "Custom IY hotkey send failed"
-    farm.cradleIYLastError =
-        "No working keypress/keyrelease or VirtualInputManager path"
-    return false, "unavailable"
+    return nil, nil
 end
 
-function F.sendCellCustomIYStopChord(reason)
+local function buildCellIYBridgeDescriptor(bridge, source)
+    if type(bridge) ~= "table" then
+        return nil
+    end
+
+    local startE, startEName =
+        getFirstFunction(bridge, CELL_IY_START_E_NAMES)
+    local start1, start1Name =
+        getFirstFunction(bridge, CELL_IY_START_ONE_NAMES)
+    local stop, stopName =
+        getFirstFunction(bridge, CELL_IY_STOP_NAMES)
+
+    if not startE or not start1 or not stop then
+        return nil
+    end
+
+    return {
+        owner = bridge,
+        source = tostring(source or "Unknown"),
+        StartE = startE,
+        Start1 = start1,
+        Stop = stop,
+        StartEName = tostring(startEName),
+        Start1Name = tostring(start1Name),
+        StopName = tostring(stopName),
+    }
+end
+
+local function addUniqueEnvironment(result, seen, env, label)
+    if type(env) ~= "table" or seen[env] then
+        return
+    end
+
+    seen[env] = true
+    table.insert(result, {
+        env = env,
+        label = tostring(label or "env"),
+    })
+end
+
+function F.resolveCellCustomIYBridge(force)
     local farm = State.cellFarm
     if not farm then
-        return false, "none"
+        return nil
     end
 
-    local hold =
-        math.max(
-            0.05,
-            tonumber(Config.CELL_CRADLE_CUSTOM_IY_STOP_HOLD)
-                or 0.14
+    if not force
+        and CellIYBridgeCache.bridge
+        and type(CellIYBridgeCache.bridge.owner) == "table"
+    then
+        return CellIYBridgeCache.bridge
+    end
+
+    local environments = {}
+    local seen = {}
+
+    if type(getgenv) == "function" then
+        local ok, env = pcall(getgenv)
+        if ok then
+            addUniqueEnvironment(environments, seen, env, "getgenv")
+        end
+    end
+
+    if type(globalEnv) == "table" then
+        addUniqueEnvironment(environments, seen, globalEnv, "globalEnv")
+    end
+
+    if type(shared) == "table" then
+        addUniqueEnvironment(environments, seen, shared, "shared")
+    end
+
+    if type(_G) == "table" then
+        addUniqueEnvironment(environments, seen, _G, "_G")
+    end
+
+    for _, entry in ipairs(environments) do
+        for _, tableName in ipairs(CELL_IY_BRIDGE_TABLE_NAMES) do
+            local candidate = rawget(entry.env, tableName)
+            local descriptor =
+                buildCellIYBridgeDescriptor(
+                    candidate,
+                    entry.label .. "." .. tableName
+                )
+
+            if descriptor then
+                CellIYBridgeCache.bridge = descriptor
+                CellIYBridgeCache.source = descriptor.source
+                farm.cradleIYBridgeReady = true
+                farm.cradleIYBridgeSource = descriptor.source
+                farm.cradleIYStatus =
+                    "DIRECT bridge ready: " .. descriptor.source
+                farm.cradleIYLastError = "None"
+                return descriptor
+            end
+        end
+
+        -- Flat-global compatibility. This lets a custom IY expose three functions
+        -- without wrapping them in a table.
+        local startE, startEName =
+            getFirstFunction(entry.env, {
+                "TheVeilIY_StartE", "IY_StartE", "CellIY_StartE",
+            })
+        local start1, start1Name =
+            getFirstFunction(entry.env, {
+                "TheVeilIY_Start1", "IY_Start1", "CellIY_Start1",
+            })
+        local stop, stopName =
+            getFirstFunction(entry.env, {
+                "TheVeilIY_Stop", "IY_Stop", "CellIY_Stop",
+            })
+
+        if startE and start1 and stop then
+            local descriptor = {
+                owner = nil,
+                source = entry.label .. ".flat",
+                StartE = startE,
+                Start1 = start1,
+                Stop = stop,
+                StartEName = tostring(startEName),
+                Start1Name = tostring(start1Name),
+                StopName = tostring(stopName),
+            }
+
+            CellIYBridgeCache.bridge = descriptor
+            CellIYBridgeCache.source = descriptor.source
+            farm.cradleIYBridgeReady = true
+            farm.cradleIYBridgeSource = descriptor.source
+            farm.cradleIYStatus =
+                "DIRECT bridge ready: " .. descriptor.source
+            farm.cradleIYLastError = "None"
+            return descriptor
+        end
+    end
+
+    CellIYBridgeCache.bridge = nil
+    CellIYBridgeCache.source = "None"
+    farm.cradleIYBridgeReady = false
+    farm.cradleIYBridgeSource = "None"
+    farm.cradleIYStatus = "DIRECT BRIDGE MISSING"
+    farm.cradleIYLastError =
+        "Expose TheVeilIYBridge.StartE / Start1 / Stop in getgenv(), shared, or _G"
+    return nil
+end
+
+local function registerCellIYBridge(bridge, source)
+    local descriptor =
+        buildCellIYBridgeDescriptor(
+            bridge,
+            source or "registered"
         )
 
-    -- Windows virtual-key codes: OEM_PLUS (= on the main keyboard) and BACKSPACE.
-    local equalsVirtualKey = 0xBB
-    local backspaceVirtualKey = 0x08
-
-    if type(keypress) == "function"
-        and type(keyrelease) == "function"
-    then
-        local ok = pcall(function()
-            keypress(equalsVirtualKey)
-            keypress(backspaceVirtualKey)
-            task.wait(hold)
-            keyrelease(backspaceVirtualKey)
-            keyrelease(equalsVirtualKey)
-        end)
-
-        if ok then
-            farm.cradleIYStatus =
-                "Custom IY STOP chord sent"
-            farm.cradleIYLastError = "None"
-            return true, "executor keypress/keyrelease"
+    if not descriptor then
+        if State.cellFarm then
+            State.cellFarm.cradleIYBridgeReady = false
+            State.cellFarm.cradleIYStatus = "DIRECT BRIDGE REGISTRATION FAILED"
+            State.cellFarm.cradleIYLastError =
+                "Bridge must provide StartE, Start1 and Stop functions"
         end
+        return false
     end
 
-    local virtualInput = nil
-    pcall(function()
-        virtualInput =
-            game:GetService("VirtualInputManager")
-    end)
+    CellIYBridgeCache.bridge = descriptor
+    CellIYBridgeCache.source = descriptor.source
 
-    if virtualInput then
-        local ok = pcall(function()
-            virtualInput:SendKeyEvent(
-                true,
-                Enum.KeyCode.Equals,
-                false,
-                game
-            )
-            virtualInput:SendKeyEvent(
-                true,
-                Enum.KeyCode.Backspace,
-                false,
-                game
-            )
-            task.wait(hold)
-            virtualInput:SendKeyEvent(
-                false,
-                Enum.KeyCode.Backspace,
-                false,
-                game
-            )
-            virtualInput:SendKeyEvent(
-                false,
-                Enum.KeyCode.Equals,
-                false,
-                game
-            )
-        end)
-
-        if ok then
-            farm.cradleIYStatus =
-                "Custom IY STOP chord sent"
-            farm.cradleIYLastError = "None"
-            return true, "VirtualInputManager"
-        end
+    -- Persist the registered object into the shared executor environment so a
+    -- force-refresh later in the Cradle sequence resolves the exact same bridge.
+    if type(globalEnv) == "table" then
+        globalEnv.TheVeilIYBridge = bridge
     end
 
-    farm.cradleIYStatus =
-        "Custom IY STOP chord failed"
-    farm.cradleIYLastError =
-        "Could not synthesize Equals+Backspace"
-    return false, "unavailable"
+    if type(shared) == "table" then
+        shared.TheVeilIYBridge = bridge
+    end
+
+    if State.cellFarm then
+        State.cellFarm.cradleIYBridgeReady = true
+        State.cellFarm.cradleIYBridgeSource = descriptor.source
+        State.cellFarm.cradleIYBridgeRegisteredAt = os.clock()
+        State.cellFarm.cradleIYStatus =
+            "DIRECT bridge registered: " .. descriptor.source
+        State.cellFarm.cradleIYLastError = "None"
+    end
+
+    return true
+end
+
+-- Public registration hook for a custom IY that starts after the Hub.
+if type(globalEnv) == "table" then
+    globalEnv.TheVeil_RegisterIYBridge = function(bridge)
+        return registerCellIYBridge(
+            bridge,
+            "getgenv().TheVeil_RegisterIYBridge"
+        )
+    end
+end
+
+if type(shared) == "table" then
+    shared.TheVeil_RegisterIYBridge = function(bridge)
+        return registerCellIYBridge(
+            bridge,
+            "shared.TheVeil_RegisterIYBridge"
+        )
+    end
+end
+
+local function callCellIYBridgeFunction(descriptor, functionName)
+    if type(descriptor) ~= "table" then
+        return false, "Bridge descriptor missing"
+    end
+
+    local fn = descriptor[functionName]
+    if type(fn) ~= "function" then
+        return false, tostring(functionName) .. " is unavailable"
+    end
+
+    local ok, result, detail
+
+    if descriptor.owner ~= nil then
+        -- Extra arguments are harmless for zero-argument dot functions, while this
+        -- also supports colon-style methods that expect self.
+        ok, result, detail = pcall(fn, descriptor.owner)
+    else
+        ok, result, detail = pcall(fn)
+    end
+
+    if not ok then
+        return false, tostring(result)
+    end
+
+    if result == false then
+        return false, tostring(detail or (functionName .. " returned false"))
+    end
+
+    return true, tostring(detail or result or "ok")
 end
 
 function F.releaseCellCradleAutoKey(reason)
@@ -6910,13 +7097,33 @@ function F.releaseCellCradleAutoKey(reason)
             or "None"
         )
 
-    -- Do not inject the stop chord when no custom IY loop is believed active.
-    -- This prevents stray Equals/Backspace input during ordinary cleanup.
     if wasActive then
-        stopped, driver =
-            F.sendCellCustomIYStopChord(
-                reason
-            )
+        local bridge =
+            F.resolveCellCustomIYBridge(false)
+
+        if bridge then
+            local stopOk, stopDetail =
+                callCellIYBridgeFunction(
+                    bridge,
+                    "Stop"
+                )
+
+            stopped = stopOk
+            driver = "DIRECT " .. tostring(bridge.source)
+
+            if stopOk then
+                farm.cradleIYStatus =
+                    "DIRECT Stop() confirmed | "
+                    .. tostring(reason or "Stopped")
+                farm.cradleIYLastError = "None"
+            else
+                farm.cradleIYStatus = "DIRECT Stop() failed"
+                farm.cradleIYLastError = tostring(stopDetail)
+            end
+        else
+            stopped = false
+            driver = "DIRECT bridge missing"
+        end
     end
 
     farm.cradleAutoKeyActive = false
@@ -6926,7 +7133,7 @@ function F.releaseCellCradleAutoKey(reason)
     farm.cradleAutoKeyDriver = driver
 
     State.movementTelemetry.lastAction =
-        "Cell custom-IY STOP: "
+        "Cell direct-IY STOP: "
         .. tostring(farm.cradleAutoKeyName or "None")
         .. " | "
         .. farm.cradleAutoKeyLastStopReason
@@ -6942,59 +7149,66 @@ function F.beginCellCradleAutoKeyPhase(name, keyCode, virtualKey)
         return false
     end
 
-    if not Config.CELL_CRADLE_CUSTOM_IY_HOTKEY_MODE then
+    if not Config.CELL_CRADLE_DIRECT_IY_BRIDGE_MODE then
         farm.cradleAutoKeyActive = false
         farm.cradleAutoKeyDriver =
-            "Custom IY hotkey mode disabled"
+            "Direct IY bridge mode disabled"
         farm.cradleIYStatus =
-            "Custom IY hotkey mode disabled"
+            "Direct IY bridge mode disabled"
         return false
     end
 
-    -- Stop the previous custom-IY loop only if one was active.
+    -- Stop the previous custom-IY loop before changing phase.
     F.releaseCellCradleAutoKey("Switching phase")
 
     task.wait(
         math.max(
-            0.05,
-            tonumber(Config.CELL_CRADLE_CUSTOM_IY_PHASE_SETTLE)
-                or 0.22
+            0.03,
+            tonumber(Config.CELL_CRADLE_DIRECT_IY_PHASE_SETTLE)
+                or 0.12
         )
     )
 
-    local phaseName = tostring(name or "Unknown")
-    local triggerKeyCode = nil
-    local triggerVirtualKey = nil
-    local triggerLabel = nil
+    local bridge =
+        F.resolveCellCustomIYBridge(true)
 
-    if phaseName == "E" then
-        triggerKeyCode = Enum.KeyCode.J
-        triggerVirtualKey = 0x4A
-        triggerLabel = "J -> custom IY E loop"
-    elseif phaseName == "1" then
-        triggerKeyCode = Enum.KeyCode.K
-        triggerVirtualKey = 0x4B
-        triggerLabel = "K -> custom IY key-1 loop"
-    else
+    if not bridge then
         farm.cradleAutoKeyActive = false
-        farm.cradleAutoKeyDriver =
-            "Unknown custom IY phase"
-        farm.cradleIYStatus =
-            "Unknown custom IY phase: " .. phaseName
+        farm.cradleAutoKeyDriver = "DIRECT bridge missing"
         return false
     end
 
-    local started, driver =
-        F.sendCellCustomIYHotkey(
-            triggerKeyCode,
-            triggerVirtualKey,
-            triggerLabel
+    local phaseName = tostring(name or "Unknown")
+    local functionName = nil
+    local phaseLabel = nil
+
+    if phaseName == "E" then
+        functionName = "StartE"
+        phaseLabel = "StartE()"
+    elseif phaseName == "1" then
+        functionName = "Start1"
+        phaseLabel = "Start1()"
+    else
+        farm.cradleAutoKeyActive = false
+        farm.cradleAutoKeyDriver = "Unknown direct-IY phase"
+        farm.cradleIYStatus =
+            "Unknown direct-IY phase: " .. phaseName
+        return false
+    end
+
+    local started, detail =
+        callCellIYBridgeFunction(
+            bridge,
+            functionName
         )
 
     if not started then
         farm.cradleAutoKeyActive = false
         farm.cradleAutoKeyDriver =
-            "Custom IY hotkey send failed"
+            "DIRECT " .. tostring(bridge.source)
+        farm.cradleIYStatus =
+            "DIRECT " .. phaseLabel .. " failed"
+        farm.cradleIYLastError = tostring(detail)
         return false
     end
 
@@ -7004,25 +7218,25 @@ function F.beginCellCradleAutoKeyPhase(name, keyCode, virtualKey)
     farm.cradleAutoKeyCode = keyCode
     farm.cradleAutoKeyVirtualKey = virtualKey
     farm.cradleAutoKeyDriver =
-        "Custom IY hotkey via "
-        .. tostring(driver)
+        "DIRECT " .. tostring(bridge.source)
     farm.cradleAutoKeyLastAt = os.clock()
+    farm.cradleIYBridgeReady = true
+    farm.cradleIYBridgeSource = tostring(bridge.source)
     farm.cradleIYStatus =
-        "ACTIVE external custom IY: "
-        .. tostring(triggerLabel)
+        "ACTIVE direct custom IY: " .. phaseLabel
     farm.cradleIYLastError = "None"
 
     State.movementTelemetry.lastAction =
-        "Cell custom-IY START: "
-        .. tostring(triggerLabel)
+        "Cell direct-IY START: "
+        .. phaseLabel
         .. " | "
-        .. tostring(driver)
+        .. tostring(bridge.source)
 
     return true
 end
 
 -- The user's custom IY owns the repeated E/1 input. This function only keeps
--- the existing Cradle state-monitor loop compatible; it never sends E or 1.
+-- the existing Cradle state-monitor loop compatible; it never synthesizes keys.
 function F.pressCellCradleAutoKey(
     keyCode,
     virtualKey,
@@ -16038,6 +16252,7 @@ function F.captureProfileSettings()
             weapon = State.cellFarm.selectedWeaponName,
             fightHeight = State.cellFarm.fightHeight,
             travelSpeed = State.cellFarm.travelSpeed,
+            serverHopEnabled = State.cellFarm.serverHopEnabled == true,
         },
     }
 end
@@ -16112,6 +16327,10 @@ function F.applyProfileSettings(profile)
             0.5,
             3.0
         )
+    if cell.serverHopEnabled ~= nil then
+        State.cellFarm.serverHopEnabled =
+            cell.serverHopEnabled == true
+    end
     State.movementSpeeds.Cell = State.cellFarm.travelSpeed
 
     State.farmEnabled = farm.enabled == true
@@ -17002,7 +17221,7 @@ function F.getConfigData()
     local grouped = F.captureProfileSettings()
 
     return {
-        version = 12,
+        version = 13,
         schemaVersion = Config.CONFIG_SCHEMA_VERSION,
         Automation = {farm = grouped.Farm.enabled, sell = State.sellEnabled},
         Farm = grouped.Farm,
@@ -17070,6 +17289,8 @@ function F.getConfigData()
             State.hubReloadUrl,
         lowGraphicsEnabled =
             State.lowGraphicsEnabled,
+        cellServerHopEnabled =
+            grouped.Cell.serverHopEnabled == true,
 
         gachaEnabled =
             State.gachaEnabled,
@@ -17183,6 +17404,7 @@ function F.loadFarmConfig()
         decoded.cellWeapon = cell.weapon
         decoded.cellFightHeight = cell.fightHeight
         decoded.cellTravelSpeed = cell.travelSpeed
+        decoded.cellServerHopEnabled = cell.serverHopEnabled
         decoded.cellSession = cellSession
         decoded.farmEnabled = farm.enabled
         decoded.farmContainsMode = farm.containsMode
@@ -17332,6 +17554,10 @@ function F.loadFarmConfig()
             0.5,
             3.0
         )
+    if decoded.cellServerHopEnabled ~= nil then
+        State.cellFarm.serverHopEnabled =
+            decoded.cellServerHopEnabled == true
+    end
     State.movementSpeeds.Cell = State.cellFarm.travelSpeed
 
     if type(decoded.cellSession) == "table" then
@@ -17731,6 +17957,19 @@ function F.applyFarmConfigToUI()
         State.cellFarmToggle:SetSilent(
             State.cellFarm.enabled
         )
+    end
+
+    if State.cellServerHopToggle then
+        State.cellServerHopToggle:SetSilent(
+            State.cellFarm.serverHopEnabled == true
+        )
+    end
+
+    if State.cellHopButton then
+        State.cellHopButton.Text =
+            State.cellFarm.serverHopEnabled
+            and "HOP NOW"
+            or "SAME SERVER"
     end
 
     if State.cellKeepInput then
@@ -21358,10 +21597,19 @@ function F.waitForCellBossConfirmed(
         return nil
     end
 
-    F.setCellFarmStage(
-        "BOSS MODEL CONFIRMED",
-        "The Cell Of Life model exists; waiting for alive state"
-    )
+    -- Start moving immediately on raw model evidence. This removes the old
+    -- visible pause at The Cradle while HP/alive metadata initializes.
+    if F.startCellBossApproach then
+        F.startCellBossApproach(
+            token,
+            rawModel
+        )
+    else
+        F.setCellFarmStage(
+            "WAITING FOR BOSS",
+            "The Cell Of Life model exists; waiting for alive state"
+        )
+    end
 
     local aliveDeadline =
         os.clock()
@@ -21406,11 +21654,23 @@ function F.waitForCellBossConfirmed(
                     F.updateCellFarmUI()
                 end
 
+                if F.stopCellBossApproach then
+                    F.stopCellBossApproach(
+                        "Boss alive confirmed - handing off to combat"
+                    )
+                end
+
                 return boss
             end
         end
 
         task.wait(0.08)
+    end
+
+    if F.stopCellBossApproach then
+        F.stopCellBossApproach(
+            "Boss alive confirmation timed out"
+        )
     end
 
     return nil
@@ -21935,10 +22195,10 @@ function F.runCellCradlePhysicalSpamSequence(
     State.cellFarm.cradleSpamPhase = "E UNTIL DIALOG"
 
     State.cellFarm.npcInteractionMethod =
-        "Custom IY hotkeys: J -> E loop, K -> 1 loop"
+        "Direct custom-IY bridge: StartE() -> Start1() -> Stop()"
 
     State.cellFarm.npcInteractionSource =
-        'External custom IY hotkeys: J / K / Equals+Backspace'
+        'Direct custom-IY bridge: StartE / Start1 / Stop'
 
     local eAutoKeyStarted =
         F.beginCellCradleAutoKeyPhase(
@@ -21949,15 +22209,15 @@ function F.runCellCradlePhysicalSpamSequence(
 
     if not eAutoKeyStarted then
         F.setCellFarmStage(
-            "CRADLE CUSTOM IY HOTKEY ERROR",
-            tostring(State.cellFarm.cradleIYStatus or "Custom IY J hotkey could not start E loop")
+            "CRADLE DIRECT BRIDGE ERROR",
+            tostring(State.cellFarm.cradleIYStatus or "Direct IY StartE() could not start E loop")
         )
         return false
     end
 
     F.setCellFarmStage(
         "CRADLE E SPAM",
-        "Custom IY triggered with J; waiting for the exact The Cradle dialog"
+        "Direct IY StartE() active; waiting for the exact The Cradle dialog"
     )
 
     local lastPositionRecheck =
@@ -22062,7 +22322,7 @@ function F.runCellCradlePhysicalSpamSequence(
             RobloxWindowFocused == false
 
         if RobloxWindowFocused == false
-            and not Config.CELL_CRADLE_CUSTOM_IY_HOTKEY_MODE
+            and not Config.CELL_CRADLE_DIRECT_IY_BRIDGE_MODE
         then
             local now =
                 os.clock()
@@ -22126,15 +22386,15 @@ function F.runCellCradlePhysicalSpamSequence(
 
     if not oneAutoKeyStarted then
         F.setCellFarmStage(
-            "CRADLE CUSTOM IY HOTKEY ERROR",
-            tostring(State.cellFarm.cradleIYStatus or "Custom IY K hotkey could not start key-1 loop")
+            "CRADLE DIRECT BRIDGE ERROR",
+            tostring(State.cellFarm.cradleIYStatus or "Direct IY Start1() could not start key-1 loop")
         )
         return false
     end
 
     F.setCellFarmStage(
         "CRADLE 1 SPAM",
-        "Dialog confirmed; custom IY triggered with K until The Cell Of Life spawns"
+        "Dialog confirmed; direct IY Start1() active until The Cell Of Life spawns"
     )
 
     while F.isCellFarmActive(token) do
@@ -22238,7 +22498,7 @@ function F.runCellCradlePhysicalSpamSequence(
                 RobloxWindowFocused == false
 
             if RobloxWindowFocused == false
-                and not Config.CELL_CRADLE_CUSTOM_IY_HOTKEY_MODE
+                and not Config.CELL_CRADLE_DIRECT_IY_BRIDGE_MODE
             then
                 local now =
                     os.clock()
@@ -22390,8 +22650,11 @@ function F.summonCellBoss(token)
     State.cellFarm.cradleAutoKeyLastAt = 0
     State.cellFarm.cradleIYExecAvailable = false
     State.cellFarm.cradleIYLoaded = false
-    State.cellFarm.cradleIYStatus = "External custom IY expected (J/K hotkeys)"
+    State.cellFarm.cradleIYStatus = "Direct IY bridge not resolved yet"
     State.cellFarm.cradleIYLastError = "None"
+    State.cellFarm.cradleIYBridgeReady = false
+    State.cellFarm.cradleIYBridgeSource = "None"
+    State.cellFarm.cradleIYBridgeRegisteredAt = 0
     State.cellFarm.cradleBackgroundMode = false
     State.cellFarm.cradleBackgroundStartCalls = 0
     State.cellFarm.cradleBackgroundOptionCalls = 0
@@ -26390,9 +26653,6 @@ function F.handleCellBossPlayerAvoidance(
         return false
     end
 
-    -- v6.6.10 SAME-SERVER policy: never leave the server because another player
-    -- is near The Cell Of Life. Pause all Cell combat/movement, wait until the
-    -- player leaves the configured radius, then resume the same boss fight.
     State.cellFarm.nearbyBossPlayerName =
         tostring(player.Name)
     State.cellFarm.nearbyBossPlayerDistance =
@@ -26402,17 +26662,6 @@ function F.handleCellBossPlayerAvoidance(
     State.cellFarm.playerAvoidHopTriggered = true
 
     F.stopCellCombatForPlayerHop()
-
-    F.setCellFarmStage(
-        "PLAYER NEAR BOSS - PAUSED",
-        tostring(player.Name)
-            .. " @ "
-            .. string.format(
-                "%.1f",
-                tonumber(distance) or -1
-            )
-            .. " studs | waiting in SAME SERVER"
-    )
 
     while F.isCellFarmActive(token) do
         if not boss
@@ -26426,7 +26675,7 @@ function F.handleCellBossPlayerAvoidance(
             State.cellFarm.nearbyBossPlayerName = "None"
             State.cellFarm.nearbyBossPlayerDistance = -1
             State.cellFarm.nearbyBossPlayerEvidence =
-                "Boss ended while player-pause was active"
+                "Boss ended while player-avoidance was active"
             return false
         end
 
@@ -26441,7 +26690,9 @@ function F.handleCellBossPlayerAvoidance(
             State.cellFarm.nearbyBossPlayerName = "None"
             State.cellFarm.nearbyBossPlayerDistance = -1
             State.cellFarm.nearbyBossPlayerEvidence =
-                "Nearby player left; same-server fight resume"
+                State.cellFarm.serverHopEnabled
+                and "Player left before hop; fight resume"
+                or "Nearby player left; same-server fight resume"
             State.cellFarm.playerAvoidHopTriggered = false
 
             if boss
@@ -26453,7 +26704,7 @@ function F.handleCellBossPlayerAvoidance(
             then
                 F.setCellFarmStage(
                     "FIGHTING",
-                    "Nearby player left - resuming Cell fight in same server"
+                    "Nearby player left - resuming Cell fight"
                 )
 
                 F.prepareCellFight(
@@ -26472,26 +26723,79 @@ function F.handleCellBossPlayerAvoidance(
         State.cellFarm.nearbyBossPlayerEvidence =
             tostring(currentEvidence or "NEAR CELL BOSS")
 
-        F.setCellFarmStage(
-            "PLAYER NEAR BOSS - PAUSED",
-            tostring(currentPlayer.Name)
-                .. " @ "
-                .. string.format(
-                    "%.1f",
-                    tonumber(currentDistance) or -1
-                )
-                .. " studs | combat paused; NO SERVER HOP"
-        )
+        if State.cellFarm.serverHopEnabled then
+            F.setCellFarmStage(
+                "PLAYER NEAR BOSS - HOP",
+                tostring(currentPlayer.Name)
+                    .. " @ "
+                    .. string.format(
+                        "%.1f",
+                        tonumber(currentDistance) or -1
+                    )
+                    .. " studs | Server Hop mode - finding a new server"
+            )
 
-        if F.updateCellFarmUI then
-            F.updateCellFarmUI()
-        end
+            if F.updateCellFarmUI then
+                F.updateCellFarmUI()
+            end
 
-        if not F.cellFarmWait(
-            token,
-            Config.CELL_PLAYER_NEAR_BOSS_HOP_RETRY
-        ) then
-            return true
+            if not State.serverHopBusy then
+                State.cellFarm.playerAvoidHopAttempts =
+                    (State.cellFarm.playerAvoidHopAttempts or 0) + 1
+
+                local hopStarted =
+                    F.cellFarmHop(
+                        token,
+                        "Other player near The Cell Of Life: "
+                            .. tostring(currentPlayer.Name)
+                            .. " ("
+                            .. string.format(
+                                "%.1f",
+                                tonumber(currentDistance) or -1
+                            )
+                            .. " studs)"
+                    )
+
+                if not hopStarted
+                    and State.cellFarm.serverHopEnabled
+                then
+                    F.setCellFarmStage(
+                        "PLAYER HOP RETRY",
+                        "Could not start server hop yet - retrying while player remains near boss"
+                    )
+                end
+            end
+
+            if not F.cellFarmWait(
+                token,
+                State.serverHopBusy
+                and 0.25
+                or Config.CELL_PLAYER_NEAR_BOSS_HOP_RETRY
+            ) then
+                return true
+            end
+        else
+            F.setCellFarmStage(
+                "PLAYER NEAR BOSS - PAUSED",
+                tostring(currentPlayer.Name)
+                    .. " @ "
+                    .. string.format(
+                        "%.1f",
+                        tonumber(currentDistance) or -1
+                    )
+                    .. " studs | Same Server mode - combat paused"
+            )
+
+            if F.updateCellFarmUI then
+                F.updateCellFarmUI()
+            end
+
+            if not F.cellFarmWait(
+                token,
+                Config.CELL_PLAYER_NEAR_BOSS_HOP_RETRY
+            ) then
+                return true
+            end
         end
     end
 
@@ -26503,6 +26807,12 @@ end
 -- explicitly re-enables it via prepareCellFight(). The original pre-Cell user
 -- settings are preserved in State.cellFarm.restore and restored when Cell Farm stops.
 function F.stopCellAttacksForRewards(reason)
+    if F.stopCellBossApproach then
+        F.stopCellBossApproach(
+            "Reward phase"
+        )
+    end
+
     local weaponWasEnabled =
         State.weaponAutoAttackEnabled == true
 
@@ -26571,6 +26881,158 @@ function F.stopCellAttacksForRewards(reason)
         or monsterLockWasEnabled
 end
 
+-- v6.6.13: The raw Cell model can exist several seconds before HP/alive data
+-- becomes readable. Do not waste that window standing at The Cradle. This
+-- approach controller uses the CELL movement owner only; it never enables
+-- Weapon Auto Attack or Finisher. Once alive is confirmed, control is handed
+-- off synchronously to Monster Lock / prepareCellFight().
+function F.stopCellBossApproach(reason)
+    local farm = State.cellFarm
+    if not farm then
+        return false
+    end
+
+    local wasActive =
+        farm.bossApproachActive == true
+
+    farm.bossApproachToken =
+        (farm.bossApproachToken or 0) + 1
+    farm.bossApproachActive = false
+    farm.bossApproachStatus =
+        tostring(reason or "Stopped")
+
+    F.stopMovementFlight("CELL")
+    F.releaseMovement("CELL")
+
+    return wasActive
+end
+
+function F.startCellBossApproach(token, boss)
+    local farm = State.cellFarm
+
+    if not farm
+        or not F.isCellFarmActive(token)
+        or not boss
+        or not boss.Parent
+    then
+        return false
+    end
+
+    F.stopCellBossApproach(
+        "Restarting boss approach"
+    )
+
+    local approachToken =
+        (farm.bossApproachToken or 0) + 1
+
+    farm.bossApproachToken = approachToken
+    farm.bossApproachActive = true
+    farm.bossApproachStatus =
+        "Boss model observed - moving now"
+    farm.boss = boss
+
+    -- Attacks and ordinary Monster Lock remain OFF during raw-model approach.
+    -- CELL owns movement exclusively until alive confirmation.
+    State.weaponAutoAttackEnabled = false
+    State.finisherEnabled = false
+    State.monsterLockEnabled = false
+    State.monsterLockWaiting = false
+    State.monsterLockManualSelection = false
+    State.lockedMonster = nil
+
+    F.stopMovementFlight("MONSTER_LOCK")
+    F.releaseMovement("MONSTER_LOCK")
+
+    if monsterLockToggle then
+        monsterLockToggle:SetSilent(false)
+    end
+
+    if weaponToggle then
+        weaponToggle:SetSilent(false)
+    end
+
+    if finisherToggle then
+        finisherToggle:SetSilent(false)
+    end
+
+    F.setCellFarmStage(
+        "WAITING FOR BOSS",
+        "The Cell Of Life model appeared - flying into fight position immediately"
+    )
+
+    task.spawn(function()
+        while F.isCellFarmActive(token)
+            and farm.bossApproachActive
+            and farm.bossApproachToken == approachToken
+            and boss
+            and boss.Parent
+        do
+            local part =
+                F.getMonsterPart(
+                    boss
+                )
+
+            if part then
+                farm.lastBossPosition =
+                    part.Position
+
+                local height =
+                    tonumber(farm.fightHeight)
+                    or Config.CELL_DEFAULT_FIGHT_HEIGHT
+
+                local targetPosition =
+                    part.Position
+                    + Vector3.new(
+                        0,
+                        height,
+                        0
+                    )
+
+                local targetCFrame =
+                    CFrame.lookAt(
+                        targetPosition,
+                        part.Position
+                    )
+
+                if F.acquireMovement(
+                    "CELL",
+                    0.35
+                ) then
+                    F.updateMovementFlight(
+                        targetCFrame,
+                        "CELL",
+                        Config.CELL_BOSS_APPROACH_ARRIVAL_DISTANCE,
+                        "Cell"
+                    )
+                end
+            else
+                farm.bossApproachStatus =
+                    "Boss model present; waiting for a movable part"
+            end
+
+            task.wait(
+                Config.CELL_BOSS_APPROACH_POLL
+            )
+        end
+
+        if farm.bossApproachToken
+            == approachToken
+        then
+            farm.bossApproachActive = false
+
+            if not F.isCellFarmActive(token)
+                or not boss
+                or not boss.Parent
+            then
+                F.stopMovementFlight("CELL")
+                F.releaseMovement("CELL")
+            end
+        end
+    end)
+
+    return true
+end
+
 function F.isCellMonsterLockMovementAllowed()
     if not State.cellFarm
         or not State.cellFarm.enabled
@@ -26593,9 +27055,67 @@ function F.prepareCellFight(boss, token)
         return false
     end
 
+    -- Ensure the pre-fight CELL approach no longer owns the movement lease.
+    -- Monster Lock can then take over immediately and keep following the boss
+    -- even while weapon equip/validation is still in progress.
+    if F.stopCellBossApproach then
+        F.stopCellBossApproach(
+            "Combat handoff"
+        )
+    end
+
+    State.cellFarm.boss = boss
+    State.lockedMonster = boss
+    State.monsterLockManualSelection = true
+    State.monsterLockWaiting = false
+    State.monsterLockEnabled = true
+
+    -- Movement starts first; attacks stay gated until the selected weapon is
+    -- confirmed equipped.
+    State.weaponAutoAttackEnabled = false
+    State.finisherEnabled = false
+
+    F.setCellFarmStage(
+        "WAITING FOR BOSS",
+        "Boss alive - locking fight position while equipping weapon"
+    )
+
+    if monsterLockToggle then
+        monsterLockToggle:SetSilent(true)
+    end
+
+    if weaponToggle then
+        weaponToggle:SetSilent(false)
+    end
+
+    if finisherToggle then
+        finisherToggle:SetSilent(false)
+    end
+
+    if State.applyMonsterLockPosition then
+        pcall(
+            State.applyMonsterLockPosition
+        )
+    end
+
+    State.updateMonsterButtons()
+    State.updateCombatStatus()
+
     if not F.equipCellFarmWeapon(
         token
     ) then
+        State.monsterLockEnabled = false
+        State.monsterLockWaiting = false
+        State.monsterLockManualSelection = false
+        State.lockedMonster = nil
+
+        F.stopMovementFlight("MONSTER_LOCK")
+        F.releaseMovement("MONSTER_LOCK")
+
+        if monsterLockToggle then
+            monsterLockToggle:SetSilent(false)
+        end
+
         F.recordCellFailure(
             "Selected Cell weapon could not be equipped: "
                 .. tostring(
@@ -26605,20 +27125,13 @@ function F.prepareCellFight(boss, token)
                 )
         )
 
+        State.updateMonsterButtons()
+        State.updateCombatStatus()
         return false
     end
 
-    State.cellFarm.boss = boss
-    State.lockedMonster = boss
-    State.monsterLockManualSelection = true
-    State.monsterLockWaiting = false
-    State.monsterLockEnabled = true
     State.weaponAutoAttackEnabled = true
     State.finisherEnabled = true
-
-    if monsterLockToggle then
-        monsterLockToggle:SetSilent(true)
-    end
 
     if weaponToggle then
         weaponToggle:SetSilent(true)
@@ -26626,6 +27139,12 @@ function F.prepareCellFight(boss, token)
 
     if finisherToggle then
         finisherToggle:SetSilent(true)
+    end
+
+    if State.applyMonsterLockPosition then
+        pcall(
+            State.applyMonsterLockPosition
+        )
     end
 
     State.updateMonsterButtons()
@@ -26654,6 +27173,20 @@ function F.fightCellBoss(token, boss)
         "FIGHTING",
         "The Cell Of Life"
     )
+
+    -- Do not wait for the periodic weapon scheduler for the first hit.
+    -- The normal scheduler continues subsequent attacks.
+    if State.weaponAutoAttackEnabled
+        and F.fireEquippedWeapon
+    then
+        task.defer(function()
+            if F.isCellFarmActive(token)
+                and tostring(State.cellFarm.stage) == "FIGHTING"
+            then
+                F.fireEquippedWeapon()
+            end
+        end)
+    end
 
     local fightStartedAt =
         os.clock()
@@ -29314,7 +29847,7 @@ function F.collectCellBossLoot(token, beforeSnapshot)
             lootAnchors
     end
 
-    -- Compatibility fallback only. Normal v6.6.10 flow records one anchor for
+    -- Compatibility fallback only. Normal v6.6.13 flow records one anchor for
     -- every successfully opened reward chest before it disappears.
     if #lootAnchors == 0 then
         local anchorRoot =
@@ -30016,6 +30549,13 @@ function F.sellCellInventory(token)
 end
 
 function F.updateCellFarmUI()
+    if State.cellHopButton then
+        State.cellHopButton.Text =
+            State.cellFarm.serverHopEnabled
+            and "HOP NOW"
+            or "SAME SERVER"
+    end
+
     local label =
         State.cellStatusLabel
 
@@ -30175,8 +30715,12 @@ function F.updateCellFarmUI()
         .. tostring(State.cellFarm.cradleAutoKeyDriver or "None")
         .. " | stop="
         .. tostring(State.cellFarm.cradleAutoKeyLastStopReason or "None")
-        .. "\nCustom IY Bridge: "
-        .. tostring(State.cellFarm.cradleIYStatus or "External custom IY expected")
+        .. "\nDirect IY Bridge: "
+        .. tostring(State.cellFarm.cradleIYStatus or "Direct IY bridge expected")
+        .. " | ready="
+        .. tostring(State.cellFarm.cradleIYBridgeReady == true)
+        .. " | source="
+        .. tostring(State.cellFarm.cradleIYBridgeSource or "None")
         .. " | err="
         .. tostring(State.cellFarm.cradleIYLastError or "None")
         .. "\nWindow: "
@@ -30274,7 +30818,10 @@ function F.updateCellFarmUI()
         .. tostring(State.cellFarm.bundlesOpened)
         .. "\nSold: "
         .. tostring(State.cellFarm.itemsSold)
-        .. " | Mode: SAME SERVER"
+        .. " | Mode: "
+        .. (State.cellFarm.serverHopEnabled and "SERVER HOP" or "SAME SERVER")
+        .. " | Hops: "
+        .. tostring(State.cellFarm.hops)
         .. " | Failures: "
         .. tostring(State.cellFarm.failures)
         .. "\nResume: "
@@ -30291,14 +30838,52 @@ function F.cellFarmHop(token, reason)
         return false
     end
 
-    -- v6.6.10: Cell Farm is intentionally same-server only. Keep this function
-    -- as a compatibility/safety barrier so stale callers can never teleport.
+    if not State.cellFarm.serverHopEnabled then
+        if F.releaseCellCradleAutoKey then
+            pcall(
+                F.releaseCellCradleAutoKey,
+                "Cell Farm same-server hop guard"
+            )
+        end
+
+        F.stopLootLock("CELL")
+        F.stopMovementFlight("CELL")
+        F.stopMovementFlight("MONSTER_LOCK")
+        F.releaseMovement("CELL")
+        F.releaseMovement("MONSTER_LOCK")
+
+        F.setCellFarmStage(
+            "SAME SERVER MODE",
+            "Server hop is disabled"
+                .. (
+                    reason
+                    and (" | " .. tostring(reason))
+                    or ""
+                )
+        )
+
+        F.recordDiagnosticEvent(
+            "CellFarm",
+            "Blocked Cell server hop because mode is SAME SERVER: "
+                .. tostring(reason or "unspecified")
+        )
+
+        return false
+    end
+
     if F.releaseCellCradleAutoKey then
         pcall(
             F.releaseCellCradleAutoKey,
-            "Cell Farm same-server hop guard"
+            "Cell Farm server hop"
         )
     end
+
+    F.setCellResumeFlag(true)
+
+    F.setCellFarmStage(
+        "SERVER HOP",
+        tostring(reason or "Searching next server")
+    )
 
     F.stopLootLock("CELL")
     F.stopMovementFlight("CELL")
@@ -30306,23 +30891,28 @@ function F.cellFarmHop(token, reason)
     F.releaseMovement("CELL")
     F.releaseMovement("MONSTER_LOCK")
 
-    F.setCellFarmStage(
-        "SAME SERVER MODE",
-        "Server hop blocked by v6.6.10"
-            .. (
-                reason
-                and (" | " .. tostring(reason))
-                or ""
-            )
-    )
+    State.cellFarm.hops =
+        State.cellFarm.hops + 1
+    F.markConfigDirty()
+    F.saveFarmConfig(true)
 
-    F.recordDiagnosticEvent(
-        "CellFarm",
-        "Blocked Cell server hop: "
-            .. tostring(reason or "unspecified")
-    )
+    local success =
+        F.serverHop(
+            reason or "Cell Farm",
+            {
+                skipSell = true,
+                cellResume = true,
+                requirePersistence = true,
+            }
+        )
 
-    return false
+    if not success then
+        F.recordCellFailure(
+            "Server hop could not start"
+        )
+    end
+
+    return success
 end
 
 function F.runCellFarm(token, resumed)
@@ -30379,6 +30969,16 @@ function F.runCellFarm(token, resumed)
     if not F.ensureWorldReady(
         Config.WORLD_READY_TIMEOUT
     ) then
+        if State.cellFarm.serverHopEnabled then
+            F.recordCellFailure(
+                "World readiness timeout; Server Hop mode active"
+            )
+            return F.cellFarmHop(
+                token,
+                "World readiness timeout"
+            )
+        end
+
         F.recordCellFailure(
             "World readiness timeout; retrying same server"
         )
@@ -30540,8 +31140,10 @@ function F.runCellFarm(token, resumed)
         and State.cellFarm.playerAvoidHopTriggered
     then
         F.setCellFarmStage(
-            "PLAYER PAUSE RECOVERY",
-            "Waiting for nearby player to clear; same-server mode"
+            "PLAYER AVOIDANCE RECOVERY",
+            State.cellFarm.serverHopEnabled
+                and "Server-hop avoidance still active"
+                or "Waiting for nearby player to clear; Same Server mode"
         )
 
         while F.isCellFarmActive(token)
@@ -30568,12 +31170,16 @@ function F.runCellFarm(token, resumed)
 
     if not fought then
         F.recordCellFailure(
-            "Cell fight recovery interrupted; staying in the same server"
+            State.cellFarm.serverHopEnabled
+            and "Cell fight recovery interrupted; attempting local recovery before next hop decision"
+            or "Cell fight recovery interrupted; staying in the same server"
         )
 
         F.setCellFarmStage(
             "FIGHT RECOVERY",
-            "Fight interrupted - waiting/reacquiring The Cell Of Life; NO HOP"
+            State.cellFarm.serverHopEnabled
+                and "Fight interrupted - waiting/reacquiring The Cell Of Life"
+                or "Fight interrupted - waiting/reacquiring The Cell Of Life; NO HOP"
         )
 
         while F.isCellFarmActive(token)
@@ -30765,7 +31371,9 @@ function F.runCellFarm(token, resumed)
 
     if not soldAll then
         F.recordCellFailure(
-            "Some lower-rarity items could not be sold; keeping them for the next same-server round"
+            State.cellFarm.serverHopEnabled
+            and "Some lower-rarity items could not be sold; carrying them to the next server"
+            or "Some lower-rarity items could not be sold; keeping them for the next same-server round"
         )
     end
 
@@ -30816,7 +31424,7 @@ function F.runCellFarm(token, resumed)
         return false
     end
 
-    -- v6.6.10 final anti-premature-round guard. Rarity metadata or a delayed
+    -- v6.6.13 final anti-premature-transition guard. Rarity metadata or a delayed
     -- reward layer can become visible after the first loot pass without
     -- changing inventory state. Re-check every opened-chest anchor immediately
     -- before allowing the server transition.
@@ -30878,12 +31486,33 @@ function F.runCellFarm(token, resumed)
         end
     end
 
+    if State.cellFarm.serverHopEnabled then
+        F.setCellFarmStage(
+            "READY TO HOP",
+            "Legendary/Mythic reward loot cleared; Bundle/Sell complete | Server Hop mode"
+        )
+
+        if not F.cellFarmWait(
+            token,
+            Config.CELL_PRE_HOP_DELAY
+        ) then
+            return false
+        end
+
+        -- Re-check the live mode after the delay so the user can switch to
+        -- Same Server while READY TO HOP without being teleported unexpectedly.
+        if State.cellFarm.serverHopEnabled then
+            return F.cellFarmHop(
+                token,
+                "Cell run complete"
+            )
+        end
+    end
+
     F.setCellFarmStage(
         "ROUND COMPLETE",
         "Legendary/Mythic reward loot cleared; Bundle/Sell complete | staying in same server"
     )
-
-    State.cellFarm.hops = 0
 
     F.stopLootLock("CELL")
     F.stopMovementFlight("CELL")
@@ -30898,7 +31527,7 @@ function F.runCellFarm(token, resumed)
         return false
     end
 
-    -- Clear only per-round reward state. Persistent totals (runs/kills/loot/sold)
+    -- Clear only per-round reward state. Persistent totals (runs/kills/loot/sold/hops)
     -- remain intact. The outer runner immediately starts the next cycle in this
     -- same server and will either pick up an already-respawned Cell or retry The
     -- Cradle locally until the next cycle is available.
@@ -30919,6 +31548,8 @@ function F.runCellFarm(token, resumed)
     State.cellFarm.lastBossHealthState = "WAITING"
     State.cellFarm.bossSpawnConfirmed = false
     State.cellFarm.bossSpawnSource = "None"
+    State.cellFarm.bossApproachActive = false
+    State.cellFarm.bossApproachStatus = "Idle"
     State.cellFarm.playerAvoidHopTriggered = false
 
     F.setCellFarmStage(
@@ -30935,6 +31566,13 @@ function F.stopCellFarm(restorePrevious, reason)
     if F.releaseCellCradleAutoKey then
         pcall(
             F.releaseCellCradleAutoKey,
+            "Cell Farm stopped"
+        )
+    end
+
+    if F.stopCellBossApproach then
+        pcall(
+            F.stopCellBossApproach,
             "Cell Farm stopped"
         )
     end
@@ -31089,8 +31727,11 @@ function F.startCellFarm(resumed)
         State.cellFarm.cradleAutoKeyLastAt = 0
         State.cellFarm.cradleIYExecAvailable = false
         State.cellFarm.cradleIYLoaded = false
-        State.cellFarm.cradleIYStatus = "External custom IY expected (J/K hotkeys)"
+        State.cellFarm.cradleIYStatus = "Direct IY bridge not resolved yet"
         State.cellFarm.cradleIYLastError = "None"
+        State.cellFarm.cradleIYBridgeReady = false
+        State.cellFarm.cradleIYBridgeSource = "None"
+        State.cellFarm.cradleIYBridgeRegisteredAt = 0
         State.cellFarm.cradleBackgroundMode = false
         State.cellFarm.cradleBackgroundStartCalls = 0
         State.cellFarm.cradleBackgroundOptionCalls = 0
@@ -31100,6 +31741,9 @@ function F.startCellFarm(resumed)
         State.cellFarm.bossSpawnConfirmed = false
         State.cellFarm.bossSpawnSource = "None"
         State.cellFarm.bossSpawnRemoteEvents = 0
+        State.cellFarm.bossApproachActive = false
+        State.cellFarm.bossApproachToken = 0
+        State.cellFarm.bossApproachStatus = "Idle"
         State.cellFarm.bossLastSpawnEvent = "None"
         State.cellFarm.startedAt = os.clock()
     end
@@ -31125,8 +31769,16 @@ function F.startCellFarm(resumed)
         or "STARTING"
     State.cellFarm.status =
         resumed
-        and "Resuming Cell Farm after teleport"
-        or "Starting full auto Cell Farm | SAME SERVER mode"
+        and (
+            "Resuming Cell Farm after teleport | "
+            .. (State.cellFarm.serverHopEnabled and "SERVER HOP" or "SAME SERVER")
+            .. " mode"
+        )
+        or (
+            "Starting full auto Cell Farm | "
+            .. (State.cellFarm.serverHopEnabled and "SERVER HOP" or "SAME SERVER")
+            .. " mode"
+        )
 
     State.cellFarm.weaponStatus =
         State.cellFarm.selectedWeaponName ~= ""
@@ -31151,9 +31803,9 @@ function F.startCellFarm(resumed)
     F.updateCellFarmUI()
     F.recordDiagnosticEvent(
         "CellFarm",
-        resumed
-        and "Teleport resume started (same-server automation enabled)"
-        or "Full Auto Cell Farm started | SAME SERVER mode"
+        (resumed and "Teleport resume started | " or "Full Auto Cell Farm started | ")
+            .. (State.cellFarm.serverHopEnabled and "SERVER HOP" or "SAME SERVER")
+            .. " mode"
     )
 
     task.spawn(function()
@@ -31211,7 +31863,7 @@ function F.startCellFarm(resumed)
             elseif result ~= true then
                 F.setCellFarmStage(
                     "IDLE",
-                    "Same-server loop stopped"
+                    (State.cellFarm.serverHopEnabled and "Server-hop run stopped" or "Same-server loop stopped")
                 )
             end
         end
@@ -31223,7 +31875,7 @@ end
 F.Controllers.CellFarm = {
     Start = F.startCellFarm,
     Stop = F.stopCellFarm,
-    Hop = F.cellFarmHop, -- compatibility guard; always blocked in same-server mode
+    Hop = F.cellFarmHop,
     FindBoss = F.getCellBoss,
     FindCradle = F.findCellCradle,
     Update = F.updateCellFarmUI,
@@ -35233,7 +35885,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics (FPS untouched) / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("The Veil Hub v6.6.10: SAME-SERVER Cell loop / custom IY J->E, K->1, Equals+Backspace stop / reward movement lock / multi-anchor Legendary+Mythic loot / performance-safe Auto Chest")
+print("The Veil Hub v6.6.13: fast Cell boss engage / selectable SAME-SERVER or SERVER-HOP / DIRECT custom-IY bridge / reward movement lock / multi-anchor Legendary+Mythic loot")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -35249,7 +35901,7 @@ print("==========================================")
 if type(writefile) == "function" then
     local saved, saveError = pcall(
         writefile,
-        "TheVeilHub_v6_6_10_Runtime.lua",
+        "TheVeilHub_v6_6_13_Runtime.lua",
         runtimeSource
     )
 
@@ -35259,19 +35911,19 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.6.10.")
+    warn("[The Veil Hub] loadstring is required to launch v6.6.13.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.6.10 compile failed:", compileError)
+    warn("[The Veil Hub] v6.6.13 compile failed:", compileError)
     return
 end
 
 local launched, runtimeError = pcall(chunk)
 
 if not launched then
-    warn("[The Veil Hub] v6.6.10 runtime failed:", runtimeError)
+    warn("[The Veil Hub] v6.6.13 runtime failed:", runtimeError)
 end
