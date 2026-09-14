@@ -1,10 +1,10 @@
--- The Veil Hub v6.6.16 Target Loot + Pre-Sell Guard loader
+-- The Veil Hub v6.6.17 Cell Boss Monster Lock Stability loader
 -- Keeps a clean local runtime copy for teleport resume, then executes it.
 local runtimeSource = [==============[
 
 -- =========================================================
 -- THE VEIL HUB
--- v6.6.16: Release-audited Cell flow plus exact-name Cell Loot Targets. Target names are collected in addition to Legendary/Mythic, automatically protected from Cell selling, and guarded before Sell and again before Server Hop / next round. Keeps fail-safe lifecycle cleanup, exclusive combat quarantine, fast event-driven boss approach, selectable Same Server / Server Hop, DIRECT custom-IY bridge, nil-parent reward-chest support, and performance-safe reward discovery.
+-- v6.6.17: Cell boss stability release. The Cell Of Life is permanently excluded from Universal Finisher; Cell combat uses Weapon Auto Attack only. Monster Lock keeps the live Cell target through transient health/filter glitches, raw-model reacquisition bypasses generic monster filters, and boss death requires server defeat evidence or a short stable confirmation instead of one HP=0 sample. Preserves target-loot, pre/post-sell guards, fail-safe lifecycle cleanup, fast boss engage, selectable Same Server / Server Hop, DIRECT custom-IY bridge, nil-parent reward-chest support, and performance-safe reward discovery.
 -- Cleaned from a corrupted multi-version export.
 -- Sidebar UI + Collapse + ESP
 --
@@ -312,6 +312,11 @@ local Config = {
     CELL_INVENTORY_STABLE_WINDOW = 1.50,
     CELL_FIGHT_TIMEOUT = 420,
     CELL_BOSS_HP_UI_INTERVAL = 0.20,
+    -- One client-side HP=0 sample is not enough to release the Cell fight.
+    -- BossDefeatLabel can confirm immediately; otherwise HP/model evidence must
+    -- remain stable for these short windows.
+    CELL_BOSS_DEATH_CONFIRM_WINDOW = 0.85,
+    CELL_BOSS_MODEL_MISSING_CONFIRM_WINDOW = 0.55,
     CELL_RESPAWN_WAIT = 22,
     CELL_PLAYER_NEAR_BOSS_HOP_RADIUS = 120,
     CELL_PLAYER_NEAR_BOSS_CHECK_INTERVAL = 0.15,
@@ -391,7 +396,7 @@ local Config = {
     CELL_DIALOG_CHECKPOINT_ONLY = false,
     CELL_DIALOG_CHECKPOINT_HEARTBEAT = 2.0,
 
-    -- v6.6.16: DIRECT bridge to the user's already-running CUSTOM Infinite Yield.
+    -- v6.6.17: DIRECT bridge to the user's already-running CUSTOM Infinite Yield.
     -- Preferred contract:
     --   getgenv().TheVeilIYBridge = {
     --       StartE = function() ... end,
@@ -422,7 +427,7 @@ local Config = {
     CELL_CRADLE_OPTION_RETRIES = 2,
     CELL_CRADLE_BOSS_MODEL_WAIT = 30.0,
     CELL_CRADLE_BOSS_ALIVE_WAIT = 10.0,
-    -- v6.6.16: move toward the Cell immediately when its model appears instead
+    -- v6.6.17: move toward the Cell immediately when its model appears instead
     -- of standing at The Cradle for the alive/HP confirmation window.
     CELL_BOSS_APPROACH_POLL = 0.03,
     CELL_BOSS_APPROACH_ARRIVAL_DISTANCE = 1.25,
@@ -444,8 +449,8 @@ local Config = {
     CELL_MENU_PROTOCOL_ATTEMPTS = 5,
     CELL_MENU_PROTOCOL_INTERVAL = 1.35,
     CELL_WEAPON_WAIT_TIMEOUT = 12,
-    CELL_RUNTIME_FILE = "TheVeilHub_v6_6_16_Runtime.lua",
-    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_6_16_CellResume.flag",
+    CELL_RUNTIME_FILE = "TheVeilHub_v6_6_17_Runtime.lua",
+    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_6_17_CellResume.flag",
     CELL_DEFAULT_FIGHT_HEIGHT = 20,
     CELL_DEFAULT_TRAVEL_SPEED = 2.0,
 
@@ -468,7 +473,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.6.16 Target Loot Pre-Sell Guard",
+    HUB_VERSION = "v6.6.17 Cell Boss Monster Lock Stability",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -1070,6 +1075,10 @@ local State = {
         lastBossHealthState = "WAITING",
         lastBossHealthUIAt = 0,
         lastBossPosition = nil,
+        bossHealthZeroSince = 0,
+        bossModelMissingSince = 0,
+        bossLockRecoveryCount = 0,
+        bossLockLastRecovery = "None",
         nearbyBossPlayerName = "None",
         nearbyBossPlayerDistance = -1,
         nearbyBossPlayerEvidence = "None",
@@ -6874,7 +6883,7 @@ function F.pressVirtualKey(keyCode, fallbackVirtualKey, holdSeconds, actionName)
     return false
 end
 
--- v6.6.16 DIRECT custom-IY bridge for The Cradle.
+-- v6.6.17 DIRECT custom-IY bridge for The Cradle.
 --
 -- Synthetic keyboard events are intentionally not used here. The custom IY must expose
 -- the actual loop controls so the Hub can call them directly. Preferred contract:
@@ -27256,18 +27265,19 @@ function F.handleCellBossPlayerAvoidance(
     F.stopCellCombatForPlayerHop()
 
     while F.isCellFarmActive(token) do
-        if not boss
+        -- Do not treat one client-side health sample as Cell death while combat
+        -- is intentionally paused for player avoidance.
+        if State.cellFarm.bossDefeatEventConfirmed == true
+            or not boss
             or not boss.Parent
-            or (
-                F.isMonsterAlive
-                and not F.isMonsterAlive(boss)
-            )
         then
             State.cellFarm.playerAvoidHopTriggered = false
             State.cellFarm.nearbyBossPlayerName = "None"
             State.cellFarm.nearbyBossPlayerDistance = -1
             State.cellFarm.nearbyBossPlayerEvidence =
-                "Boss ended while player-avoidance was active"
+                State.cellFarm.bossDefeatEventConfirmed
+                and "BossDefeatLabel confirmed while player-avoidance was active"
+                or "Boss model ended while player-avoidance was active"
             return false
         end
 
@@ -27309,10 +27319,7 @@ function F.handleCellBossPlayerAvoidance(
             if resumeCombat == true
                 and boss
                 and boss.Parent
-                and (
-                    not F.isMonsterAlive
-                    or F.isMonsterAlive(boss)
-                )
+                and State.cellFarm.bossDefeatEventConfirmed ~= true
             then
                 F.setCellFarmStage(
                     "FIGHTING",
@@ -27498,7 +27505,7 @@ function F.stopCellAttacksForRewards(reason)
         or monsterLockWasEnabled
 end
 
--- v6.6.16: The raw Cell model can exist several seconds before HP/alive data
+-- v6.6.17: The raw Cell model can exist several seconds before HP/alive data
 -- becomes readable. Do not waste that window standing at The Cradle. This
 -- approach controller uses the CELL movement owner only; it never enables
 -- Weapon Auto Attack or Finisher. Once alive is confirmed, control is handed
@@ -27764,15 +27771,18 @@ function F.prepareCellFight(boss, token)
         return false
     end
 
+    -- Permanent Cell policy: Weapon Auto Attack only. Universal Finisher
+    -- must never touch The Cell Of Life because it mutates client health state and
+    -- can make local death detection transition before the server confirms death.
     State.weaponAutoAttackEnabled = true
-    State.finisherEnabled = true
+    State.finisherEnabled = false
 
     if weaponToggle then
         weaponToggle:SetSilent(true)
     end
 
     if finisherToggle then
-        finisherToggle:SetSilent(true)
+        finisherToggle:SetSilent(false)
     end
 
     if State.applyMonsterLockPosition then
@@ -27829,18 +27839,76 @@ function F.fightCellBoss(token, boss)
     local timeoutNoticeSent =
         false
 
+    local zeroHealthSince = nil
+    local modelMissingSince = nil
+
+    State.cellFarm.bossHealthZeroSince = 0
+    State.cellFarm.bossModelMissingSince = 0
+
     while F.isCellFarmActive(token) do
-        if not boss
-            or not boss.Parent
-            or (
-                F.isMonsterAlive
-                and not F.isMonsterAlive(boss)
-            )
-        then
+        -- Authoritative defeat evidence can end the fight immediately.
+        if State.cellFarm.bossDefeatEventConfirmed == true then
             F.stopCellAttacksForRewards(
-                "Boss instance no longer alive"
+                "BossDefeatLabel confirmed"
             )
             return true
+        end
+
+        -- A briefly missing/reparented model is not immediately treated as death.
+        -- Try the raw Cell lookup first, then require a short stable absence.
+        if not boss
+            or not boss.Parent
+        then
+            if not modelMissingSince then
+                modelMissingSince = os.clock()
+                State.cellFarm.bossModelMissingSince =
+                    modelMissingSince
+                State.cellFarm.lastBossHealthState =
+                    "MODEL MISSING / CONFIRMING"
+            end
+
+            local rawBoss =
+                F.findCellBossModelRaw
+                and F.findCellBossModelRaw()
+                or nil
+
+            if rawBoss
+                and rawBoss.Parent
+            then
+                boss = rawBoss
+                State.cellFarm.boss = rawBoss
+                State.lockedMonster = rawBoss
+                State.monsterLockManualSelection = true
+                State.monsterLockWaiting = false
+                State.monsterLockEnabled = true
+                modelMissingSince = nil
+                State.cellFarm.bossModelMissingSince = 0
+                State.cellFarm.bossLockRecoveryCount =
+                    (State.cellFarm.bossLockRecoveryCount or 0) + 1
+                State.cellFarm.bossLockLastRecovery =
+                    "Raw Cell model reacquired after transient model loss"
+
+                if State.applyMonsterLockPosition then
+                    pcall(
+                        State.applyMonsterLockPosition
+                    )
+                end
+            elseif os.clock() - modelMissingSince
+                >= Config.CELL_BOSS_MODEL_MISSING_CONFIRM_WINDOW
+            then
+                F.stopCellAttacksForRewards(
+                    "Boss model missing beyond confirmation window"
+                )
+                return true
+            else
+                task.wait(
+                    Config.CELL_PLAYER_NEAR_BOSS_CHECK_INTERVAL
+                )
+                continue
+            end
+        else
+            modelMissingSince = nil
+            State.cellFarm.bossModelMissingSince = 0
         end
 
         local nearbyPlayer,
@@ -27911,10 +27979,57 @@ function F.fightCellBoss(token, boss)
 
         State.cellFarm.lastBossHealthPercent =
             healthPercent
-        State.cellFarm.lastBossHealthState =
-            currentHealth > 0
-            and "ALIVE"
-            or "DEFEATED"
+
+        if maxHealth > 0
+            and currentHealth > 0
+        then
+            zeroHealthSince = nil
+            State.cellFarm.bossHealthZeroSince = 0
+            State.cellFarm.lastBossHealthState = "ALIVE"
+        elseif maxHealth > 0
+            and currentHealth <= 0
+        then
+            if not zeroHealthSince then
+                zeroHealthSince = os.clock()
+                State.cellFarm.bossHealthZeroSince =
+                    zeroHealthSince
+            end
+
+            local zeroFor =
+                os.clock() - zeroHealthSince
+
+            State.cellFarm.lastBossHealthState =
+                "HP 0 / CONFIRMING "
+                .. string.format(
+                    "%.2fs",
+                    zeroFor
+                )
+
+            -- Keep lock + weapon active during this short confirmation window.
+            -- This prevents a single replicated/client-side zero from dropping
+            -- Monster Lock. BossDefeatLabel above can still confirm immediately.
+            if zeroFor
+                >= Config.CELL_BOSS_DEATH_CONFIRM_WINDOW
+            then
+                State.cellFarm.lastBossHealth = 0
+                State.cellFarm.lastBossHealthPercent = 0
+                State.cellFarm.lastBossHealthState = "DEFEATED"
+
+                F.stopCellAttacksForRewards(
+                    "Boss HP remained 0 through confirmation window"
+                )
+
+                if F.updateCellFarmUI then
+                    F.updateCellFarmUI()
+                end
+
+                return true
+            end
+        else
+            -- Missing/initializing health metadata is not death evidence.
+            State.cellFarm.lastBossHealthState =
+                "HEALTH SYNC / LOCK HELD"
+        end
 
         if os.clock()
             - (State.cellFarm.lastBossHealthUIAt or 0)
@@ -27926,24 +28041,6 @@ function F.fightCellBoss(token, boss)
             if F.updateCellFarmUI then
                 F.updateCellFarmUI()
             end
-        end
-
-        if currentHealth <= 0
-            and maxHealth > 0
-        then
-            State.cellFarm.lastBossHealth = 0
-            State.cellFarm.lastBossHealthPercent = 0
-            State.cellFarm.lastBossHealthState = "DEFEATED"
-
-            F.stopCellAttacksForRewards(
-                "Boss HP reached 0"
-            )
-
-            if F.updateCellFarmUI then
-                F.updateCellFarmUI()
-            end
-
-            return true
         end
 
         if not F.getCharacterRoot() then
@@ -27987,7 +28084,29 @@ function F.fightCellBoss(token, boss)
             end
 
             State.lockedMonster = boss
+            State.monsterLockManualSelection = true
+            State.monsterLockWaiting = false
             State.monsterLockEnabled = true
+            State.weaponAutoAttackEnabled = true
+            State.finisherEnabled = false
+
+            if monsterLockToggle then
+                monsterLockToggle:SetSilent(true)
+            end
+
+            if weaponToggle then
+                weaponToggle:SetSilent(true)
+            end
+
+            if finisherToggle then
+                finisherToggle:SetSilent(false)
+            end
+
+            if State.applyMonsterLockPosition then
+                pcall(
+                    State.applyMonsterLockPosition
+                )
+            end
 
             F.setCellFarmStage(
                 "FIGHTING",
@@ -30768,7 +30887,7 @@ function F.collectCellBossLoot(token, beforeSnapshot)
             lootAnchors
     end
 
-    -- Compatibility fallback only. Normal v6.6.16 flow records one anchor for
+    -- Compatibility fallback only. Normal v6.6.17 flow records one anchor for
     -- every successfully opened reward chest before it disappears.
     if #lootAnchors == 0 then
         local anchorRoot =
@@ -31788,6 +31907,11 @@ function F.updateCellFarmUI()
         .. tostring(State.cellFarm.fightHeight)
         .. " | Travel: "
         .. string.format("%.1fx", State.cellFarm.travelSpeed)
+        .. "\nCell combat: Weapon AUTO | Finisher BLOCKED"
+        .. " | Lock recoveries="
+        .. tostring(State.cellFarm.bossLockRecoveryCount or 0)
+        .. " | "
+        .. tostring(State.cellFarm.bossLockLastRecovery or "None")
         .. "\nPlayer avoid: "
         .. tostring(State.cellFarm.nearbyBossPlayerName or "None")
         .. " @ "
@@ -32576,7 +32700,7 @@ function F.runCellFarm(token, resumed)
         return false
     end
 
-    -- v6.6.16 invariant: do not leave the reward area for the Merchant until
+    -- v6.6.17 invariant: do not leave the reward area for the Merchant until
     -- every eligible Legendary/Mythic OR exact-name target is confirmed gone.
     F.setCellFarmStage(
         "PRE-SELL LOOT GUARD",
@@ -32767,6 +32891,10 @@ function F.runCellFarm(token, resumed)
     State.cellFarm.lastBossMaxHealth = 0
     State.cellFarm.lastBossHealthPercent = 0
     State.cellFarm.lastBossHealthState = "WAITING"
+    State.cellFarm.bossHealthZeroSince = 0
+    State.cellFarm.bossModelMissingSince = 0
+    State.cellFarm.bossLockRecoveryCount = 0
+    State.cellFarm.bossLockLastRecovery = "None"
     State.cellFarm.bossSpawnConfirmed = false
     State.cellFarm.bossSpawnSource = "None"
 
@@ -32959,6 +33087,10 @@ function F.startCellFarm(resumed)
         State.cellFarm.lastBossHealthPercent = 0
         State.cellFarm.lastBossHealthState = "WAITING"
         State.cellFarm.lastBossHealthUIAt = 0
+        State.cellFarm.bossHealthZeroSince = 0
+        State.cellFarm.bossModelMissingSince = 0
+        State.cellFarm.bossLockRecoveryCount = 0
+        State.cellFarm.bossLockLastRecovery = "None"
         State.cellFarm.nearbyBossPlayerName = "None"
         State.cellFarm.nearbyBossPlayerDistance = -1
         State.cellFarm.nearbyBossPlayerEvidence = "None"
@@ -34380,8 +34512,17 @@ function F.forceCustomHealthDeath(monster, healthInfo)
 end
 
 function F.tryFinishMonster(monster)
-    -- v6.6.7: never execute finisher logic while Cell Farm is outside the
-    -- explicit boss-fight stage. This mirrors the weapon auto-attack gate.
+    -- Permanent safety policy: Universal Finisher never targets The Cell Of Life.
+    -- Its death/reward lifecycle is server-authoritative; forcing local
+    -- Health/MaxHealth to zero can make Monster Lock/reward logic transition early.
+    if monster
+        and tostring(monster.Name) == "The Cell Of Life"
+    then
+        return
+    end
+
+    -- Outside an active Cell fight, keep the existing finisher behavior for other
+    -- supported monsters only.
     if State.cellFarm
         and State.cellFarm.enabled
         and tostring(State.cellFarm.stage) ~= "FIGHTING"
@@ -34641,10 +34782,23 @@ State.applyMonsterLockPosition = function()
         return false
     end
 
+    local activeCellBossLock =
+        State.cellFarm
+        and State.cellFarm.enabled
+        and (
+            tostring(State.cellFarm.stage) == "FIGHTING"
+            or tostring(State.cellFarm.stage) == "WAITING FOR BOSS"
+        )
+        and State.lockedMonster
+        and tostring(State.lockedMonster.Name) == "The Cell Of Life"
+
     if F.shouldPauseMonsterLockForFarm()
         or State.sellBusy
         or State.chestBusy
-        or F.isMonsterLockSuspended()
+        or (
+            not activeCellBossLock
+            and F.isMonsterLockSuspended()
+        )
     then
         F.stopMovementFlight("MONSTER_LOCK")
         F.releaseMovement("MONSTER_LOCK")
@@ -36552,13 +36706,18 @@ State.lockConnection =
             return
         end
 
-        -- Other Hub systems may need temporary movement control.
-        -- This pauses POSITIONING only; it never changes the Lock toggle.
-        -- Auto Farm owns player positioning for the entire time it is enabled.
-        -- Pausing Monster Lock only while farmBusy is true leaves a Heartbeat-sized
-        -- gap between loot attempts, which can snap the player back to the monster.
-        -- Keep the lock toggle/state intact, but suspend POSITIONING until Auto Farm
-        -- is turned off.
+        local cellFightLockActive =
+            State.cellFarm
+            and State.cellFarm.enabled
+            and (
+                tostring(State.cellFarm.stage) == "FIGHTING"
+                or tostring(State.cellFarm.stage) == "WAITING FOR BOSS"
+            )
+
+        -- Other Hub systems may need temporary movement control. The Cell fight is
+        -- exclusive, so stale/manual Monster Lock suspension must not silently drop
+        -- its positioning while FIGHTING/WAITING FOR BOSS. Player avoidance/reward
+        -- transitions explicitly disable Monster Lock instead.
         if (
                 F.isCellMonsterLockMovementAllowed
                 and not F.isCellMonsterLockMovementAllowed()
@@ -36566,50 +36725,72 @@ State.lockConnection =
             or F.shouldPauseMonsterLockForFarm()
             or State.sellBusy
             or State.chestBusy
-            or F.isMonsterLockSuspended()
+            or (
+                not cellFightLockActive
+                and F.isMonsterLockSuspended()
+            )
         then
             F.stopMovementFlight("MONSTER_LOCK")
             F.releaseMovement("MONSTER_LOCK")
             return
         end
 
+        local lockedIsCell =
+            State.lockedMonster
+            and tostring(State.lockedMonster.Name)
+                == "The Cell Of Life"
+
         local targetInvalid =
             not State.lockedMonster
             or not State.lockedMonster.Parent
-            or (
-                State.lockedMonster
-                and F.isIgnoredMonster(
-                    State.lockedMonster
-                )
-            )
 
+        -- The dedicated Cell fight controller owns Cell death confirmation.
+        -- Generic whitelist/blacklist/boss-only filters and a single local health
+        -- sample must not clear the live megaboss target.
         if not targetInvalid
-            and F.isMonsterAlive
+            and not (
+                cellFightLockActive
+                and lockedIsCell
+            )
         then
-            targetInvalid =
-                not F.isMonsterAlive(
+            if F.isIgnoredMonster(
+                State.lockedMonster
+            )
+            then
+                targetInvalid = true
+            elseif F.isMonsterAlive
+                and not F.isMonsterAlive(
                     State.lockedMonster
                 )
+            then
+                targetInvalid = true
+            end
         end
 
         if targetInvalid then
-            State.lockedMonster = nil
-            State.monsterLockManualSelection = false
+            local previousTarget =
+                State.lockedMonster
 
-            -- Cell Farm never falls through to unrelated monsters while its
-            -- megaboss fight is active. Normal Monster Lock keeps old behavior.
-            if State.cellFarm
-                and State.cellFarm.enabled
-                and (
-                    State.cellFarm.stage == "FIGHTING"
-                    or State.cellFarm.stage == "WAITING FOR BOSS"
-                )
-            then
+            State.lockedMonster = nil
+
+            if cellFightLockActive then
+                State.monsterLockManualSelection = true
+
+                -- Raw lookup intentionally skips alive filtering. fightCellBoss()
+                -- decides when the Cell is actually dead.
                 State.lockedMonster =
-                    F.getCellBoss
-                    and F.getCellBoss()
+                    F.findCellBossModelRaw
+                    and F.findCellBossModelRaw()
                     or nil
+
+                if not State.lockedMonster
+                    and F.getCellBoss
+                then
+                    State.lockedMonster =
+                        F.getCellBoss()
+                end
             else
+                State.monsterLockManualSelection = false
                 State.lockedMonster =
                     F.getNearestMonster()
             end
@@ -36636,7 +36817,21 @@ State.lockConnection =
 
             State.monsterLockWaiting = false
 
-            -- Begin following the reacquired target immediately.
+            if cellFightLockActive
+                and tostring(State.lockedMonster.Name)
+                    == "The Cell Of Life"
+            then
+                State.monsterLockManualSelection = true
+                State.cellFarm.boss =
+                    State.lockedMonster
+                State.cellFarm.bossLockRecoveryCount =
+                    (State.cellFarm.bossLockRecoveryCount or 0) + 1
+                State.cellFarm.bossLockLastRecovery =
+                    previousTarget
+                    and "Cell target reacquired after invalid target"
+                    or "Cell target acquired by Heartbeat"
+            end
+
             State.applyMonsterLockPosition()
 
             task.defer(function()
@@ -37204,7 +37399,7 @@ print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
 print("No Fog / FullBright / Low Graphics (FPS untouched) / ESP / Insanity Block")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("The Veil Hub v6.6.16: release-audited Cell lifecycle / exact-name Cell Loot targets / PRE-SELL + POST-SELL loot guards / fast boss engage / selectable SAME-SERVER or SERVER-HOP / DIRECT custom-IY bridge")
+print("The Veil Hub v6.6.17: Cell Monster Lock stability / NO FINISHER on The Cell Of Life / confirmed boss death / exact-name Cell Loot targets / PRE-SELL + POST-SELL guards / selectable SAME-SERVER or SERVER-HOP / DIRECT custom-IY bridge")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -37220,7 +37415,7 @@ print("==========================================")
 if type(writefile) == "function" then
     local saved, saveError = pcall(
         writefile,
-        "TheVeilHub_v6_6_16_Runtime.lua",
+        "TheVeilHub_v6_6_17_Runtime.lua",
         runtimeSource
     )
 
@@ -37230,19 +37425,19 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.6.16.")
+    warn("[The Veil Hub] loadstring is required to launch v6.6.17.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.6.16 compile failed:", compileError)
+    warn("[The Veil Hub] v6.6.17 compile failed:", compileError)
     return
 end
 
 local launched, runtimeError = pcall(chunk)
 
 if not launched then
-    warn("[The Veil Hub] v6.6.16 runtime failed:", runtimeError)
+    warn("[The Veil Hub] v6.6.17 runtime failed:", runtimeError)
 end
