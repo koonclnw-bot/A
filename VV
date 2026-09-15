@@ -1,10 +1,10 @@
--- The Veil Hub v6.6.18 Pale Chest ESP + Pale-Only Auto Chest loader
+-- The Veil Hub v6.6.19 Sanity Lock + Pale Chest ESP loader
 -- Keeps a clean local runtime copy for teleport resume, then executes it.
 local runtimeSource = [==============[
 
 -- =========================================================
 -- THE VEIL HUB
--- v6.6.18: Pale chest release. General Auto Chest is hard-filtered to chest candidates spatially inside workspace.Map.Maze["PALE AREAS"], rejects Chestplate false positives, and validates LocalPlayer.CurrentArea contains "Pale" again before OpenChest. Adds lightweight Highlight/Billboard Pale Chest ESP using the same eligibility filter. Preserves v6.6.17 Cell boss Monster Lock stability, permanent NO-FINISHER policy for The Cell Of Life, target-loot pre/post-sell guards, fail-safe lifecycle cleanup, selectable Same Server / Server Hop, and DIRECT custom-IY bridge.
+-- v6.6.19: Sanity Lock freezes the local character Values.Sanity NumberValue at the value captured when enabled, blocks UpdateInsanity:FireServer when executor hook support is available, rebinds after respawn, and degrades explicitly to LOCAL-only locking when the remote hook is unavailable. Preserves v6.6.18 Pale-only Auto Chest/ESP, Chestplate exclusion, v6.6.17 Cell Monster Lock stability, permanent NO-FINISHER policy for The Cell Of Life, target-loot guards, fail-safe lifecycle cleanup, selectable Same Server / Server Hop, and DIRECT custom-IY bridge.
 -- Cleaned from a corrupted multi-version export.
 -- Sidebar UI + Collapse + ESP
 --
@@ -26,7 +26,7 @@ local runtimeSource = [==============[
 --   - No Fog LOOP
 --   - FullBright LOOP
 --   - Unnamed ESP Loader
---   - UpdateInsanity FireServer blocker (executor hook, toggle-controlled)
+--   - Sanity Lock / Freeze (local Values.Sanity guard + UpdateInsanity blocker)
 --   - Low Graphics without changing the executor/game FPS cap
 --
 -- Drops
@@ -124,7 +124,7 @@ local Config = {
     MOVEMENT_LEASE_SECONDS = 0.75,
     RECOVERY_BASE_DELAY = 1,
     RECOVERY_MAX_DELAY = 30,
-    CONFIG_SCHEMA_VERSION = 14,
+    CONFIG_SCHEMA_VERSION = 15,
     AUTO_FARM_INTERVAL = 0.07,
     AUTO_SELL_CHECK_INTERVAL = 1.00,
     INVENTORY_MAX_CAPACITY = 150,
@@ -456,8 +456,8 @@ local Config = {
     CELL_MENU_PROTOCOL_ATTEMPTS = 5,
     CELL_MENU_PROTOCOL_INTERVAL = 1.35,
     CELL_WEAPON_WAIT_TIMEOUT = 12,
-    CELL_RUNTIME_FILE = "TheVeilHub_v6_6_18_Runtime.lua",
-    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_6_18_CellResume.flag",
+    CELL_RUNTIME_FILE = "TheVeilHub_v6_6_19_Runtime.lua",
+    CELL_RESUME_FLAG_FILE = "TheVeilHub_v6_6_19_CellResume.flag",
     CELL_DEFAULT_FIGHT_HEIGHT = 20,
     CELL_DEFAULT_TRAVEL_SPEED = 2.0,
 
@@ -480,7 +480,7 @@ local Config = {
     FARM_CONFIG_FILE = "TheVeilHub_AutoFarm.json",
 
     HUB_NAME = "The Veil Hub",
-    HUB_VERSION = "v6.6.18 Pale Chest ESP + Pale-Only Auto Chest",
+    HUB_VERSION = "v6.6.19 Sanity Lock + Pale Chest ESP",
     TOGGLE_UI_KEY = Enum.KeyCode.RightShift,
 
     WINDOW_WIDTH = 780,
@@ -515,6 +515,11 @@ local Config = {
     MIN_FINISHER_PERCENT = 1,
     MAX_FINISHER_PERCENT = 99,
     FINISHER_SCAN_INTERVAL = 0.50,
+
+    -- v6.6.19 Sanity Lock. The value is captured when enabled and then held
+    -- locally. UpdateInsanity is blocked as a second layer when the executor
+    -- supports the existing __namecall hook.
+    SANITY_LOCK_EPSILON = 0.0001,
 
     CURRENT_HEALTH_NAMES = {
         "health",
@@ -1359,6 +1364,17 @@ local State = {
     fullBrightGuardStarted = false,
     fullBrightApplying = false,
     espLoaded = false,
+    -- v6.6.19: Sanity Lock owns the local NumberValue guard.
+    -- blockInsanityEnabled reports whether the remote-block layer is active.
+    sanityLockEnabled = false,
+    sanityLockedValue = nil,
+    sanityValueObject = nil,
+    sanityValueConnection = nil,
+    sanityApplying = false,
+    sanityLockStatus = "OFF",
+    sanityCorrections = 0,
+    sanityRebinds = 0,
+    sanityLastCorrectionAt = 0,
     blockInsanityEnabled = false,
     lowGraphicsEnabled = false,
     lowGraphicsToggle = nil,
@@ -1922,10 +1938,229 @@ function F.installInsanityBlockHook()
     return true
 end
 
--- SafeBoot: install the executor hook only when Block UpdateInsanity is enabled.
+-- SafeBoot: defer hook installation until Sanity Lock is actually enabled.
 -- Some executors can stall while installing hooks during startup.
 local insanityHookSupported =
     globalEnv.__TheVeilHub_InsanityHookSupported == true
+
+-- =========================================================
+-- V6.6.19 SANITY LOCK / FREEZE
+--
+-- Evidence from the supplied Bundle shows the local character exposes
+-- Values.Sanity as a NumberValue. This guard intentionally touches only that
+-- value and the already-known UpdateInsanity RemoteEvent. It does NOT modify
+-- InsanityMultiplier, area Insanity flags, or InsanityDeath.
+-- =========================================================
+
+function F.findLocalSanityValue(character)
+    character = character or (F.getPlayerCharacter and F.getPlayerCharacter())
+
+    if not character or not character.Parent then
+        character = workspace:FindFirstChild(tostring(LocalPlayer.Name))
+    end
+
+    if not character or not character.Parent then
+        return nil
+    end
+
+    local values = character:FindFirstChild("Values")
+    if not values then
+        return nil
+    end
+
+    local sanity = values:FindFirstChild("Sanity")
+    if sanity and sanity:IsA("NumberValue") then
+        return sanity
+    end
+
+    return nil
+end
+
+function F.disconnectSanityValueGuard(clearBinding)
+    if State.sanityValueConnection then
+        pcall(function()
+            State.sanityValueConnection:Disconnect()
+        end)
+        State.sanityValueConnection = nil
+    end
+
+    if clearBinding ~= false then
+        State.sanityValueObject = nil
+    end
+    State.sanityApplying = false
+end
+
+function F.applySanityLockedValue()
+    if not State.sanityLockEnabled then
+        return false
+    end
+
+    local sanity = State.sanityValueObject
+    local locked = tonumber(State.sanityLockedValue)
+
+    if not sanity
+        or not sanity.Parent
+        or not sanity:IsA("NumberValue")
+        or locked == nil
+    then
+        return false
+    end
+
+    local current = tonumber(sanity.Value)
+    if current == nil then
+        return false
+    end
+
+    if math.abs(current - locked)
+        <= Config.SANITY_LOCK_EPSILON
+    then
+        return true
+    end
+
+    if State.sanityApplying then
+        return true
+    end
+
+    State.sanityApplying = true
+    local ok = pcall(function()
+        sanity.Value = locked
+    end)
+    State.sanityApplying = false
+
+    if ok then
+        State.sanityCorrections =
+            (State.sanityCorrections or 0) + 1
+        State.sanityLastCorrectionAt = os.clock()
+    end
+
+    return ok
+end
+
+function F.bindSanityLock(character, captureFresh)
+    if not State.sanityLockEnabled then
+        return false, "Sanity Lock disabled"
+    end
+
+    local sanity = F.findLocalSanityValue(character)
+    if not sanity then
+        if not State.sanityValueObject
+            or not State.sanityValueObject.Parent
+        then
+            F.disconnectSanityValueGuard(true)
+        end
+        State.sanityLockStatus = "WAITING FOR Values.Sanity"
+        return false, State.sanityLockStatus
+    end
+
+    local bindingChanged =
+        State.sanityValueObject ~= sanity
+        or not State.sanityValueConnection
+
+    if bindingChanged then
+        F.disconnectSanityValueGuard(true)
+        State.sanityValueObject = sanity
+        State.sanityRebinds = (State.sanityRebinds or 0) + 1
+    end
+
+    -- Preserve the same locked value if only the Sanity NumberValue is
+    -- recreated during the same life. A fresh value is captured only on first
+    -- enable or when respawn explicitly requests captureFresh.
+    if captureFresh
+        or State.sanityLockedValue == nil
+    then
+        State.sanityLockedValue = tonumber(sanity.Value)
+    end
+
+    if not State.sanityValueConnection then
+        State.sanityValueConnection =
+            sanity:GetPropertyChangedSignal("Value"):Connect(function()
+                if State.sanityApplying
+                    or not State.sanityLockEnabled
+                    or State.sanityValueObject ~= sanity
+                then
+                    return
+                end
+
+                F.applySanityLockedValue()
+            end)
+    end
+
+    F.applySanityLockedValue()
+    return true, "BOUND"
+end
+
+function F.refreshSanityRemoteBlocker(tryInstall)
+    if not State.sanityLockEnabled then
+        State.blockInsanityEnabled = false
+        insanityBlockState.Enabled = false
+        return false
+    end
+
+    local remote = F.refreshUpdateInsanityRemote()
+
+    if tryInstall == true
+        and not insanityHookSupported
+    then
+        insanityHookSupported =
+            F.installInsanityBlockHook()
+    end
+
+    local enabled =
+        insanityHookSupported == true
+        and remote ~= nil
+
+    State.blockInsanityEnabled = enabled
+    insanityBlockState.Enabled = enabled
+
+    return enabled
+end
+
+function F.ensureSanityLockBound(captureFresh)
+    if not State.sanityLockEnabled then
+        return false
+    end
+
+    if not State.sanityValueObject
+        or not State.sanityValueObject.Parent
+        or not State.sanityValueConnection
+    then
+        return F.bindSanityLock(nil, captureFresh == true)
+    end
+
+    F.applySanityLockedValue()
+    return true
+end
+
+function F.setSanityLock(enabled, captureFresh)
+    State.sanityLockEnabled = enabled == true
+
+    if not State.sanityLockEnabled then
+        State.blockInsanityEnabled = false
+        insanityBlockState.Enabled = false
+        State.sanityLockStatus = "OFF"
+        State.sanityLockedValue = nil
+        F.disconnectSanityValueGuard(true)
+        return true, "OFF"
+    end
+
+    local remoteBlocked =
+        F.refreshSanityRemoteBlocker(true)
+
+    local bound =
+        F.bindSanityLock(nil, captureFresh ~= false)
+
+    if bound and remoteBlocked then
+        State.sanityLockStatus = "FULL LOCK"
+    elseif bound then
+        State.sanityLockStatus = "LOCAL LOCK / REMOTE BLOCK UNAVAILABLE"
+    elseif remoteBlocked then
+        State.sanityLockStatus = "REMOTE BLOCK / WAITING SANITY VALUE"
+    else
+        State.sanityLockStatus = "WAITING SANITY VALUE / LOCAL MODE"
+    end
+
+    return bound or remoteBlocked, State.sanityLockStatus
+end
 
 if not globalEnv.__TheVeilHub_CradleTraceState then
     globalEnv.__TheVeilHub_CradleTraceState = {
@@ -2474,6 +2709,10 @@ State.runtime.Stop = function()
 
     if insanityBlockState then
         insanityBlockState.Enabled = false
+    end
+    State.blockInsanityEnabled = false
+    if F.disconnectSanityValueGuard then
+        pcall(F.disconnectSanityValueGuard, true)
     end
 
     if F.saveFarmConfig then
@@ -4769,8 +5008,8 @@ State.lowGraphicsToggle = F.createToggle(
 
 local insanityBlockToggle = F.createToggle(
     visualsSection,
-    "Block UpdateInsanity",
-    "Blocks UpdateInsanity:FireServer while enabled"
+    "Sanity Lock / Freeze",
+    "Locks the current character Values.Sanity value and also blocks UpdateInsanity:FireServer when the executor hook is supported."
 )
 
 local _, espLoadBtn = F.createSingleButtonRow(
@@ -4783,7 +5022,7 @@ local _, espLoadBtn = F.createSingleButtonRow(
 local visualStatusCard = F.createCard(visualsSection, 132)
 local visualStatusLabel = F.createTextLabel(
     visualStatusCard,
-    "No Fog: OFF\nFullBright: OFF\nLow Graphics: OFF\nInsanity Block: OFF\nESP: NOT LOADED",
+    "No Fog: OFF\nFullBright: OFF\nLow Graphics: OFF\nSanity Lock: OFF\nESP: NOT LOADED",
     UDim2.new(1, -24, 1, -20),
     UDim2.new(0, 16, 0, 10),
     Enum.Font.GothamSemibold,
@@ -16441,6 +16680,7 @@ function F.captureProfileSettings()
         },
         UI = {
             lowGraphics = State.lowGraphicsEnabled,
+            sanityLock = State.sanityLockEnabled == true,
             scale = State.userUiScale,
             reduceMotion = State.reduceMotion,
             backgroundDim = State.backgroundDimEnabled,
@@ -16624,6 +16864,7 @@ function F.applyProfileSettings(profile)
     State.persistentHopEnabled = serverHop.persistent ~= false
     State.hubReloadUrl = F.trimText(serverHop.reloadUrl)
     State.lowGraphicsEnabled = ui.lowGraphics == true
+    State.sanityLockEnabled = ui.sanityLock == true
     State.userUiScale = math.clamp(tonumber(ui.scale) or 1, 0.75, 1.25)
     State.reduceMotion = ui.reduceMotion == true
     State.backgroundDimEnabled = ui.backgroundDim == true
@@ -16649,6 +16890,7 @@ function F.applyProfileSettings(profile)
     end
 
     F.applyFarmConfigToUI()
+    F.setSanityLock(State.sanityLockEnabled, true)
     F.setAntiAFKEnabled(State.antiAFK.enabled)
     F.bindMovementSafety()
 
@@ -17481,7 +17723,7 @@ function F.getConfigData()
     local grouped = F.captureProfileSettings()
 
     return {
-        version = 14,
+        version = 15,
         schemaVersion = Config.CONFIG_SCHEMA_VERSION,
         Automation = {farm = grouped.Farm.enabled, sell = State.sellEnabled},
         Farm = grouped.Farm,
@@ -17549,6 +17791,8 @@ function F.getConfigData()
             State.hubReloadUrl,
         lowGraphicsEnabled =
             State.lowGraphicsEnabled,
+        sanityLockEnabled =
+            State.sanityLockEnabled == true,
         cellServerHopEnabled =
             grouped.Cell.serverHopEnabled == true,
         cellLootNames =
@@ -17694,6 +17938,7 @@ function F.loadFarmConfig()
         decoded.persistentHopEnabled = serverHop.persistent
         decoded.hubReloadUrl = serverHop.reloadUrl
         decoded.lowGraphicsEnabled = ui.lowGraphics
+        decoded.sanityLockEnabled = ui.sanityLock
         decoded.movementPreset = movement.preset
         decoded.adaptiveMovementEnabled = movement.adaptive
         decoded.monsterFlightSpeed = movement.monsterSpeed
@@ -18030,6 +18275,9 @@ function F.loadFarmConfig()
     State.lowGraphicsEnabled =
         decoded.lowGraphicsEnabled == true
 
+    State.sanityLockEnabled =
+        decoded.sanityLockEnabled == true
+
     State.antiAFK.enabled =
         decoded.antiAFKEnabled == true
 
@@ -18331,6 +18579,12 @@ function F.applyFarmConfigToUI()
     if State.lowGraphicsToggle then
         State.lowGraphicsToggle:SetSilent(
             State.lowGraphicsEnabled
+        )
+    end
+
+    if insanityBlockToggle then
+        insanityBlockToggle:SetSilent(
+            State.sanityLockEnabled == true
         )
     end
 
@@ -34688,16 +34942,26 @@ State.updateVisualStatus = function()
     local espText =
         State.espLoaded and "LOADED" or "NOT LOADED"
 
-    local insanityText = "OFF"
+    local sanityText = "OFF"
 
-    if State.blockInsanityEnabled then
-        if not insanityHookSupported then
-            insanityText = "UNSUPPORTED"
-        elseif not F.refreshUpdateInsanityRemote() then
-            insanityText = "REMOTE NOT FOUND"
-        else
-            insanityText = "ON"
-        end
+    if State.sanityLockEnabled then
+        local locked = tonumber(State.sanityLockedValue)
+        local valueText =
+            locked ~= nil
+            and string.format("%.2f", locked)
+            or "WAITING"
+
+        local modeText =
+            State.blockInsanityEnabled
+            and "FULL"
+            or "LOCAL"
+
+        sanityText =
+            valueText
+            .. " | "
+            .. modeText
+            .. " | fixes="
+            .. tostring(State.sanityCorrections or 0)
     end
 
     visualStatusLabel.Text =
@@ -34707,15 +34971,15 @@ State.updateVisualStatus = function()
         .. fullBrightText
         .. "\nLow Graphics: "
         .. lowGraphicsText
-        .. "\nInsanity Block: "
-        .. insanityText
+        .. "\nSanity Lock: "
+        .. sanityText
         .. "\nESP: "
         .. espText
 
     if State.noFogEnabled
         or State.fullBrightEnabled
         or State.lowGraphicsEnabled
-        or State.blockInsanityEnabled
+        or State.sanityLockEnabled
         or State.espLoaded then
 
         visualStatusLabel.TextColor3 =
@@ -36939,47 +37203,35 @@ State.manualHopButton.MouseButton1Click:Connect(function()
 end)
 
 insanityBlockToggle:OnChanged(function(state)
-    if state then
-        F.refreshUpdateInsanityRemote()
-        insanityHookSupported =
-            F.installInsanityBlockHook()
+    local enabled = state == true
+    local active, status =
+        F.setSanityLock(
+            enabled,
+            true
+        )
 
-        if not insanityHookSupported then
-            State.blockInsanityEnabled = false
-            insanityBlockState.Enabled = false
-            insanityBlockToggle:SetSilent(false)
+    F.markConfigDirty()
 
-            F.notify(
-                "Insanity Block",
-                "This executor does not support hookmetamethod/getnamecallmethod.",
-                "warning",
-                3.0
-            )
-        elseif not insanityBlockState.Remote then
-            State.blockInsanityEnabled = false
-            insanityBlockState.Enabled = false
-            insanityBlockToggle:SetSilent(false)
+    if enabled then
+        local locked = tonumber(State.sanityLockedValue)
+        local valueText =
+            locked ~= nil
+            and string.format("%.2f", locked)
+            or "waiting for Values.Sanity"
 
-            F.notify(
-                "Insanity Block",
-                "UpdateInsanity remote was not found.",
-                "warning",
-                3.0
-            )
-        else
-            State.blockInsanityEnabled = true
-            insanityBlockState.Enabled = true
-
-            F.notify(
-                "Insanity Block",
-                "UpdateInsanity:FireServer is now blocked.",
-                "success",
-                2.2
-            )
-        end
+        F.notify(
+            "Sanity Lock",
+            "Locked at " .. valueText .. " | " .. tostring(status),
+            active and "success" or "warning",
+            3.0
+        )
     else
-        State.blockInsanityEnabled = false
-        insanityBlockState.Enabled = false
+        F.notify(
+            "Sanity Lock",
+            "Sanity is no longer frozen.",
+            "info",
+            2.2
+        )
     end
 
     State.updateVisualStatus()
@@ -37421,9 +37673,12 @@ F.schedulerRegister("VisualWatchdog", Config.VISUAL_LOOP_INTERVAL, function()
         F.runBoundary("FullBrightWatchdog", F.applyFullBright)
     end
 
-    if State.blockInsanityEnabled then
-        F.runBoundary("InsanityRemoteRefresh", F.refreshUpdateInsanityRemote)
-        insanityBlockState.Enabled = true
+    if State.sanityLockEnabled then
+        F.runBoundary("SanityRemoteRefresh", F.refreshSanityRemoteBlocker, false)
+        F.runBoundary("SanityValueGuard", F.ensureSanityLockBound, false)
+    else
+        State.blockInsanityEnabled = false
+        insanityBlockState.Enabled = false
     end
 end)
 
@@ -37615,6 +37870,16 @@ State.characterAddedConnection = LocalPlayer.CharacterAdded:Connect(function(cha
     State.isSpectating = false
     State.spectatingTarget = nil
 
+    if State.sanityLockEnabled then
+        -- A fresh character owns a fresh Values.Sanity NumberValue. Capture that
+        -- character's current value instead of carrying a stale value from the
+        -- previous life.
+        State.sanityLockedValue = nil
+        F.disconnectSanityValueGuard(true)
+        F.bindSanityLock(character, true)
+        F.refreshSanityRemoteBlocker(false)
+    end
+
     if State.monsterLockEnabled then
         task.wait(0.4)
 
@@ -37695,6 +37960,9 @@ function F.shutdown()
     State.gachaRequestInFlight = false
     State.blockInsanityEnabled = false
     insanityBlockState.Enabled = false
+    if F.disconnectSanityValueGuard then
+        pcall(F.disconnectSanityValueGuard, true)
+    end
 
     if cradleTraceState then
         cradleTraceState.Enabled = false
@@ -37833,6 +38101,12 @@ State.serversVisitedCount =
     )
 
 F.applyFarmConfigToUI()
+if State.sanityLockEnabled then
+    task.defer(function()
+        F.setSanityLock(true, true)
+        State.updateVisualStatus()
+    end)
+end
 F.setAntiAFKEnabled(State.antiAFK.enabled)
 F.bindMovementSafety()
 if State.chestEnabled or State.chestESPEnabled then
@@ -37949,9 +38223,9 @@ print("Cell Farm v6.4.8: hop resume waits for menu boot before Endure/Slot 1/Cur
 print("Goal Farm: Bestiary targets / live monster drop intelligence / coordinated combat + loot")
 print("Modern Obsidian UI Loaded - SafeBoot + RegisterFix")
 print("RightShift UI Toggle / Responsive Sidebar / Settings")
-print("No Fog / FullBright / Low Graphics (FPS untouched) / ESP / Insanity Block")
+print("No Fog / FullBright / Low Graphics (FPS untouched) / ESP / Sanity Lock")
 print("Movement: Presets / per-system speed / adaptive correction / Waypoints / Route Recorder")
-print("The Veil Hub v6.6.18: PALE-ONLY Auto Chest / Pale Chest ESP / Chestplate excluded / Cell Monster Lock stability / NO FINISHER on The Cell Of Life / target-loot guards / selectable SAME-SERVER or SERVER-HOP / DIRECT custom-IY bridge")
+print("The Veil Hub v6.6.19: SANITY LOCK / UpdateInsanity block + local Values.Sanity freeze / PALE-ONLY Auto Chest + ESP / Chestplate excluded / Cell Monster Lock stability / NO FINISHER on The Cell Of Life / target-loot guards / selectable SAME-SERVER or SERVER-HOP / DIRECT custom-IY bridge")
 print("Auto Farm: Smart planner / adaptive loot flight / direct PickupDrop / E fallback / confirmation")
 print("Auto Sell: flight to Merchant + flight return / protected targets / 150-capacity recovery / town-reset fallback")
 print("Auto Silver Gacha: anywhere / server cooldown probe / 20-minute accepted cycle")
@@ -37967,7 +38241,7 @@ print("==========================================")
 if type(writefile) == "function" then
     local saved, saveError = pcall(
         writefile,
-        "TheVeilHub_v6_6_18_Runtime.lua",
+        "TheVeilHub_v6_6_19_Runtime.lua",
         runtimeSource
     )
 
@@ -37977,19 +38251,19 @@ if type(writefile) == "function" then
 end
 
 if type(loadstring) ~= "function" then
-    warn("[The Veil Hub] loadstring is required to launch v6.6.18.")
+    warn("[The Veil Hub] loadstring is required to launch v6.6.19.")
     return
 end
 
 local chunk, compileError = loadstring(runtimeSource)
 
 if not chunk then
-    warn("[The Veil Hub] v6.6.18 compile failed:", compileError)
+    warn("[The Veil Hub] v6.6.19 compile failed:", compileError)
     return
 end
 
 local launched, runtimeError = pcall(chunk)
 
 if not launched then
-    warn("[The Veil Hub] v6.6.18 runtime failed:", runtimeError)
+    warn("[The Veil Hub] v6.6.19 runtime failed:", runtimeError)
 end
